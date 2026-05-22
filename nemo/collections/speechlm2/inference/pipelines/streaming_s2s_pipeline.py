@@ -322,6 +322,21 @@ class StreamingS2SPipeline(S2SPipelineInterface):
                     )
                     timing_by_stream[stream_id] = ctx.timing
 
+        # Abort engine-side per-stream resources BEFORE the context manager
+        # destroys the context. For ``engine_type='vllm_omni'`` the
+        # ``OmniStreamingSession`` is attached to the context, and
+        # ``_abort_stream_request`` reaches it via
+        # ``context_manager.get_context(...)`` to call ``session.finish()``
+        # (which sends end-of-input to the async consumer so its task can
+        # exit cleanly). If we do this after ``reset_streams``, the context
+        # is already gone and the consumer task leaks until process exit,
+        # producing "Task was destroyed but it is pending" asyncio warnings
+        # from both ``OmniStreamingSession._run_consumer`` and vllm-omni's
+        # internal ``handle_inputs``.
+        for stream_id, eos_flag in zip(stream_ids, eos_flags):
+            if eos_flag:
+                self._abort_stream_request(stream_id)
+
         self.context_manager.reset_streams(stream_ids, eos_flags)
 
         # Log summary and clean up finished streams
@@ -349,7 +364,6 @@ class StreamingS2SPipeline(S2SPipelineInterface):
                 )
 
                 self.bufferer.rm_bufferer(stream_id)
-                self._abort_stream_request(stream_id)
 
         # Split the batch-level InferenceStepResult into per-frame outputs.
         # Each frame's incremental audio/text is:
@@ -733,58 +747,44 @@ class StreamingS2SPipeline(S2SPipelineInterface):
     def _prefill_system_prompt(self, stream_id: int, system_prompt: str | None = None) -> torch.Tensor | None:
         """Prefill the system prompt for a new stream.
 
-        This prepares the system prompt embeddings and processes them through
-        the LLM to update the KV cache before audio streaming begins.
-        Also prefills the TTS model with speaker embeddings when using vLLM EarTTS.
+        Behavior depends on the engine in use:
+
+        * ``engine_type = "native"`` — runs the system prompt through the
+          native LLM to warm up the KV cache (or, when the cache is
+          unavailable, stages it into ``input_embeds_history``). Returns
+          ``None``.
+        * ``engine_type = "vllm_omni"`` — creates a per-stream
+          :class:`OmniStreamingSession`; the session enqueues the prefill
+          chunk (system prompt + speaker latent) lazily, so the actual
+          stage-0 prefill runs on demand when the first ``step()`` call
+          arrives. Returns ``None``.
 
         Args:
             stream_id: The stream identifier.
-            system_prompt: The system prompt text for this stream. If *None*,
-                TTS prefill still runs (for vLLM EarTTS) but no LLM prompt
-                is injected.
-
-        Note on TTS prefill codes:
-            The TTS prefill generates output codes, but these should NOT be used
-            to initialize context.tts_code for inference. The batch approach uses
-            first_tts_code_input (INPUT codes from speaker reference) instead.
-            Using prefill OUTPUT codes causes audio quality issues (mumbling).
-
-        Returns:
-            torch.Tensor | None: The TTS prefill output codes if vLLM EarTTS prefill
-            happened, None otherwise. These are returned for logging/debugging but
-            should NOT be used to update context.tts_code.
+            system_prompt: The system prompt text for this stream. May be
+                ``None``/empty (treated as no system prompt).
         """
         request_id = self._request_id_for_stream(stream_id)
-        engine_type = getattr(self.s2s_model, "engine_type", "native")
-        tts_output_code = None
+        engine_type = getattr(self.s2s_model, "engine_type", "native").lower()
 
-        # Prefill TTS with speaker embedding via model_eartts_interface
-        use_vllm_eartts = "vllm_eartts" in engine_type.lower()
-        if use_vllm_eartts:
-            eartts = self.s2s_model.model_eartts_interface
-            tts_init_inputs = getattr(self.s2s_model, "tts_init_inputs", None)
-            tts_prompt_token_ids = getattr(self.s2s_model, "tts_prompt_token_ids", None)
-            if tts_init_inputs is not None and tts_prompt_token_ids is not None:
-                logging.info(f"Prefilling TTS speaker embedding for stream {stream_id}...")
-                start_tts_prefill = time.time()
-                with torch.no_grad():
-                    tts_result = eartts.prefill_prompt(
-                        tts_init_inputs,
-                        prompt_token_ids=tts_prompt_token_ids,
-                        request_id=request_id,
-                    )
-                    # Capture the generated codes to sync context with vLLM state
-                    if hasattr(tts_result, 'codes') and tts_result.codes is not None:
-                        tts_output_code = tts_result.codes.detach().clone()
-                        logging.debug(f"TTS prefill generated codes shape: {tts_output_code.shape}")
-                logging.info(f"TTS speaker embedding prefilled in {time.time() - start_tts_prefill:.3f}s")
-            else:
-                logging.warning("TTS init inputs not available, skipping TTS prefill")
+        if engine_type == "vllm_omni":
+            context = self.context_manager.get_context([stream_id])
+            max_len = context.gen_text.shape[-1]
+            self.s2s_model.start_vllm_omni_session(
+                context,
+                system_prompt=system_prompt or "",
+                max_len=max_len,
+                request_id=request_id,
+            )
+            logging.info(
+                f"vllm_omni: started OmniStreamingSession for stream {stream_id} "
+                f"(request_id='{request_id}', max_decode_steps={max_len})."
+            )
+            return None
 
         if not system_prompt:
-            return tts_output_code
+            return None
 
-        # Prefill LLM with system prompt via model_llm_interface
         logging.info(f"Prefilling system prompt for stream {stream_id}...")
         start_get_prompt_embeddings = time.time()
         prompt_embedded, prompt_len = self.s2s_model._prepare_system_prompt_embeddings(system_prompt)
@@ -792,43 +792,60 @@ class StreamingS2SPipeline(S2SPipelineInterface):
 
         if prompt_embedded is None:
             logging.warning("System prompt embedding returned None, skipping prefill")
-            return tts_output_code
+            return None
 
-        use_vllm_llm = "vllm_llm" in engine_type.lower()
         llm = self.s2s_model.model_llm_interface
-
-        if use_vllm_llm:
-            logging.info(f"Prefilling {prompt_len} prompt embeddings for vLLM LLM...")
-            start_prefill = time.time()
+        context = self.context_manager.get_context([stream_id])
+        if context.llm_cache is not None:
             with torch.no_grad():
-                llm.prefill_prompt(prompt_embedded, request_id=request_id)
-            logging.info(f"System prompt prefilled ({prompt_len} tokens) in {time.time() - start_prefill:.3f}s")
+                cache_pos = torch.arange(prompt_len, device=self.s2s_model.device)
+                ans = llm.prefill_prompt(
+                    prompt_embedded,
+                    cache=context.llm_cache,
+                    cache_position=cache_pos,
+                )
+                context.llm_cache = ans.get("cache", context.llm_cache)
+            context.llm_cache_position_offset = prompt_len
+            logging.info(f"System prompt processed, cache updated ({prompt_len} tokens, offset={prompt_len})")
         else:
-            context = self.context_manager.get_context([stream_id])
-            if context.llm_cache is not None:
-                # Native cache mode: process prompt through LLM to warm up KV cache
-                with torch.no_grad():
-                    cache_pos = torch.arange(prompt_len, device=self.s2s_model.device)
-                    ans = llm.prefill_prompt(
-                        prompt_embedded,
-                        cache=context.llm_cache,
-                        cache_position=cache_pos,
-                    )
-                    context.llm_cache = ans.get("cache", context.llm_cache)
-                context.llm_cache_position_offset = prompt_len
-                logging.info(f"System prompt processed, cache updated ({prompt_len} tokens, offset={prompt_len})")
-            else:
-                for t in range(prompt_len):
-                    context.input_embeds_history.append(prompt_embedded[:, t : t + 1, :])
-                logging.info(f"Added {prompt_len} prompt embeddings to input_embeds_history")
+            for t in range(prompt_len):
+                context.input_embeds_history.append(prompt_embedded[:, t : t + 1, :])
+            logging.info(f"Added {prompt_len} prompt embeddings to input_embeds_history")
 
-        return tts_output_code
+        return None
 
     def _request_id_for_stream(self, stream_id: int) -> str:
         return str(stream_id)
 
     def _abort_stream_request(self, stream_id: int) -> None:
         request_id = self._request_id_for_stream(stream_id)
+        engine_type = getattr(self.s2s_model, "engine_type", "native").lower()
+
+        if engine_type == "vllm_omni":
+            try:
+                context = self.context_manager.get_context([stream_id])
+            except Exception:
+                context = None
+            session = getattr(context, "omni_session", None) if context is not None else None
+            if session is not None:
+                # ``finish`` drains pending stage-1 outputs before tearing the
+                # consumer down; on error we fall back to a hard ``abort``.
+                try:
+                    session.finish()
+                except Exception as exc:
+                    logging.warning(
+                        f"vllm_omni session.finish() failed for stream {stream_id}: {exc}; "
+                        "falling back to abort()."
+                    )
+                    try:
+                        session.abort()
+                    except Exception as exc2:
+                        logging.warning(
+                            f"vllm_omni session.abort() also failed for stream {stream_id}: {exc2}"
+                        )
+                context.omni_session = None
+            return
+
         try:
             self.s2s_model.model_llm_interface.abort_request(request_id)
         except Exception as exc:

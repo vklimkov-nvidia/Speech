@@ -11,3 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+from nemo.collections.speechlm2.inference.vllm_omni.eartts.configuration_eartts import EarTTSConfig
+
+__all__ = ["EarTTSConfig"]

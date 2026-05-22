@@ -16,7 +16,7 @@
 Native PyTorch backend for the TTS (EarTTS) component of NemotronVoiceChat.
 
 Wraps the DuplexEARTTS model for direct PyTorch inference, providing the
-same ``ModelInterface`` API as ``VLLMEarTTS`` so the inference wrapper can
+same ``ModelInterface`` API as the other native backends so the inference wrapper can
 treat both backends uniformly.
 
 Used as ``model_eartts_interface`` in the inference wrapper when

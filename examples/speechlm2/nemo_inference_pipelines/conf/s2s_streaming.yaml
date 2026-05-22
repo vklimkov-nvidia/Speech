@@ -34,25 +34,31 @@ s2s:
   decode_audio: true                          # Whether to conduct the TTS portion of inference, or just the STT portion
   speaker_reference: null
   speaker_name: null
-  engine_type: ??? # Engine type: 'native' or 'vllm_llm' or 'vllm_eartts' or 'vllm_llm_vllm_eartts'
-  vllm_llm_config:
-    model_path: ${s2s.model_path}             # Inherits from s2s.model_path
-    max_model_len: 8192                       # Maximum sequence length for vLLM
-    max_num_batched_tokens: 768               # Max tokens per forward pass (prefill chunk size)
-    gpu_memory_utilization: 0.35               # GPU memory utilization (0.0-1.0)
-    dtype: bfloat16                           # Data type for vLLM inference
-    engine_path: null                         # Path to vLLM engine (null = auto-convert if needed)
-    pretrained_llm: ${s2s.model_path}
-  
-  vllm_tts_config:
-    model_path: ${s2s.vllm_llm_config.model_path}             # Inherits from s2s.model_path
-    max_model_len: ${s2s.vllm_llm_config.max_model_len}
-    max_num_batched_tokens: ${s2s.vllm_llm_config.max_num_batched_tokens}
-    gpu_memory_utilization: ${s2s.vllm_llm_config.gpu_memory_utilization}
-    dtype: float32                              # EarTTS requires float32 for proper audio quality (bfloat16 causes hallucinations)
-    engine_path: null
-    pretrained_llm: null
-    skip_tokenizer_init: true
+  engine_type: ???                              # Engine type: 'native' or 'vllm_omni'.
+
+  # vllm_omni engine configuration (ignored when engine_type='native').
+  #
+  # On the first run we lazily build a wrapper directory under
+  # ``/tmp/<model_basename>_vllm_omni_wrapper`` containing
+  #   * ``config.json``  (just ``{"model_type": "nemotron_voicechat"}``)
+  #   * ``nemotron/``    converted NemotronDuplexH checkpoint
+  #   * ``eartts/``      converted EarTTS checkpoint + speaker_latents/
+  # Subsequent runs reuse the existing wrapper directory.
+  #
+  # ``stage_overrides`` lets you override per-stage AsyncOmni settings from the
+  # bundled ``nemotron_voicechat.yaml`` deploy file. Use ``common`` for keys
+  # that apply to every stage, or ``stage_0`` / ``stage_1`` for stage-specific
+  # overrides (e.g. ``max_model_len``, ``gpu_memory_utilization``).
+  vllm_omni_config:
+    wrapper_dir: null                            # null -> /tmp/<model_basename>_vllm_omni_wrapper
+    stage_configs_path: null                     # null -> bundled nemotron_voicechat.yaml inside NeMo
+    nemotron_dtype: float32                      # dtype for the converted Nemotron LLM checkpoint
+    eartts_precompute_batch_size: 256
+    log_stats: false
+    stage_init_timeout: 600                      # seconds to wait for both stage children to come up
+    step_timeout: 60.0                           # per-step timeout on the sync side (seconds)
+    speaker_name: null                           # override s2s.speaker_name when populated
+    stage_overrides: null                        # e.g. {common: {gpu_memory_utilization: 0.4}}
 
   device: cuda 
   # ========================

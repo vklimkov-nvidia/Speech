@@ -66,6 +66,20 @@ py-modules = ["nemo"]
 [project.entry-points."nemo_run.cli"]
 llm = "nemo.collections.llm"
 
+# vllm-omni uses ``multiprocessing`` with start method ``spawn`` for its
+# stage children; spawned children do NOT inherit Python state from the
+# parent, so registering the NemotronDuplexH + EarTTS models / pipeline
+# in the parent alone is not enough. Declare the registration function
+# as a ``vllm_omni.general_plugins`` entry point so vllm-omni's plugin
+# loader invokes it automatically in every process.
+#
+# NOTE: This MUST live in pyproject.toml (not setup.py): the project uses
+# the PEP 621 ``[project]`` table, which makes setuptools' build backend
+# ignore ``entry_points=`` kwargs in setup.py. Mirror any new general
+# plugin entries here.
+[project.entry-points."vllm_omni.general_plugins"]
+nemo_voicechat = "nemo.collections.speechlm2.inference.vllm_omni.register:register_nemo_voicechat"
+
 [project.urls]
 Download = "https://github.com/NVIDIA/NeMo/releases"
 Homepage = "https://github.com/nvidia/nemo"

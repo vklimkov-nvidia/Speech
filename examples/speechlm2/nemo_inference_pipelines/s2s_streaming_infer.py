@@ -54,6 +54,7 @@ def main(cfg: DictConfig):
     logging.info(f"Found {len(audio_filepaths)} audio files to generate")
 
     pipeline = S2SPipelineBuilder.build_pipeline(cfg)
+    pipeline.warmup(system_prompt=default_system_prompt)
 
     progress_bar = StepProgressBar.from_audio_filepaths(
         audio_filepaths,

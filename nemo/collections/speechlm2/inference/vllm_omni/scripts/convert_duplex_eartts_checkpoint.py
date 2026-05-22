@@ -17,11 +17,19 @@
 The converter expects the HuggingFace-format NemotronVoiceChat checkpoint layout:
 ``config.json`` contains ``model.speech_generation`` and ``model.stt`` entries,
 and ``model.safetensors`` contains nested ``tts_model.tts_model.*`` weights.
+
+Compared to the original converter, the character-aware subword encoder
+(``embed_subword``) is collapsed into a single pre-computed lookup table
+mapping ``token_id -> hidden_size`` embedding. The character/transformer
+weights of that encoder are dropped, since the lookup fully captures their
+deterministic per-token output (including the additive subword-flag and
+BOS/EOS contributions).
 """
 
 import argparse
 import json
 import os
+import tqdm
 
 import torch
 from omegaconf import DictConfig, OmegaConf
@@ -37,16 +45,65 @@ def parse_args():
     parser.add_argument("--config", type=str, required=True)
     parser.add_argument("--model", type=str, required=True)
     parser.add_argument("--outdir", type=str, required=True)
+    parser.add_argument(
+        "--precompute-batch-size",
+        type=int,
+        default=256,
+        help="Batch size for pre-computing per-token embeddings.",
+    )
     return parser.parse_args()
 
 
-def convert_to_vllm_format(outdir: str, config: str, model_path: str) -> None:
+def _precompute_subword_embeddings(model: DuplexEARTTS, batch_size: int) -> torch.Tensor:
+    """Run ``embed_subword`` over the entire vocabulary to bake out a lookup table.
+
+    The character-aware subword encoder is fully deterministic per token id
+    (it takes ``subword_ids`` only and adds id-conditioned flag/BOS-EOS
+    embeddings). Running it once per id and storing the result lets vLLM
+    replace the whole encoder with a single ``nn.Embedding`` lookup.
+
+    Returns:
+        Tensor of shape ``[vocab_size, hidden_size]`` matching the dtype of the
+        encoder's parameters.
+    """
+    embed_subword = model.tts_model.embed_subword
+    embed_subword.eval()
+
+    # Run the precomputation on GPU when available; the encoder is small but
+    # the vocabulary loop is long, so this is a meaningful speedup. Only the
+    # subword encoder is moved (not the full model) to keep peak memory low.
+    device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+    embed_subword.to(device)
+    logging.info(f"Precomputing subword embeddings on {device}")
+
+    dtype = next(embed_subword.parameters()).dtype
+
+    subword_ids_map = embed_subword.subword_id_to_char_ids
+    vocab_size = max(int(k) for k in subword_ids_map.keys()) + 1
+    hidden_size = embed_subword.proj_embedding.out_features
+
+    table = torch.zeros((vocab_size, hidden_size), dtype=dtype, device=device)
+
+    with torch.no_grad():
+        for start in tqdm.tqdm(range(0, vocab_size, batch_size), desc="Precomputing subword embeddings"):
+            end = min(start + batch_size, vocab_size)
+            ids = torch.arange(start, end, dtype=torch.long, device=device).unsqueeze(0)
+            mask = torch.ones_like(ids, dtype=torch.bool)
+            embeds = embed_subword(ids, mask)
+            table[start:end] = embeds.squeeze(0).to(dtype)
+
+    return table.cpu()
+
+
+def convert_to_vllm_format(outdir: str, config: str, model_path: str, precompute_batch_size: int = 256) -> None:
     """Convert DuplexEARTTS weights from a NemotronVoiceChat HF checkpoint for vLLM.
 
     Args:
         outdir: Directory where the vLLM-compatible checkpoint will be written.
         config: Path to the NemotronVoiceChat ``config.json`` file.
         model_path: Path to the NemotronVoiceChat ``model.safetensors`` file.
+        precompute_batch_size: Batch size used while running the subword encoder
+            once per token id to construct the lookup table.
     """
     os.makedirs(outdir, exist_ok=True)
 
@@ -69,70 +126,73 @@ def convert_to_vllm_format(outdir: str, config: str, model_path: str) -> None:
     cfg.data.target_sample_rate = 22050
     cfg.model.pretrained_model = None
 
-    # Resolve tokenizer name from the STT config (same tokenizer is shared by TTS).
-    _pretrained_tokenizer_name = (
-        full_config.get("model", {}).get("stt", {}).get("model", {}).get("pretrained_llm", None)
-    )
-    if _pretrained_tokenizer_name is None:
-        raise ValueError(
-            "Cannot determine tokenizer: 'pretrained_llm' not found in "
-            "config.json -> model -> stt -> model. Check the checkpoint."
-        )
-
     model = DuplexEARTTS(OmegaConf.to_container(cfg, resolve=True)).eval()
-    # get subword encoder vocabs and config
-    subword_id_to_char_ids = model.tts_model.embed_subword.subword_id_to_char_ids
-    char_vocab = model.tts_model.embed_subword.char_vocab
-    # create weights for the embedding layers that convert subword ids to char ids
-    vocab_size = len(subword_id_to_char_ids)
-    max_char_len = max(len(char_ids) for char_ids in subword_id_to_char_ids.values())
     hidden_size = cfg.model.tts_config.backbone_config.hidden_size
 
     # Load the HuggingFace-format NemotronVoiceChat safetensors checkpoint.
-    weights = load_file(model_path)
-    # select tts model weights, strip off one nested layer
-    weights = {k[len("tts_model.") :]: v for k, v in weights.items() if "tts_model." in k}
+    raw_weights = load_file(model_path)
+    # The checkpoint is wrapped by an outer module (NemotronVoiceChat) whose TTS
+    # attribute is also called ``tts_model``. Strip a single ``tts_model.`` prefix
+    # to land in the DuplexEARTTS state-dict namespace.
+    weights = {k[len("tts_model.") :]: v for k, v in raw_weights.items() if k.startswith("tts_model.")}
+
+    # Load the real weights into the DuplexEARTTS model so that running
+    # ``embed_subword`` produces the trained per-token outputs (otherwise we
+    # would just bake out random init values).
+    missing, unexpected = model.load_state_dict(weights, strict=False)
+    # Some keys (e.g. the unused language model / audio codec heads) may be
+    # missing or unexpected; that is fine for the embedding sub-tree we care
+    # about. Surface the diagnostics anyway.
+    if missing:
+        logging.info(f"load_state_dict missing keys (expected for unused submodules): {len(missing)}")
+    if unexpected:
+        logging.info(f"load_state_dict unexpected keys: {len(unexpected)}")
+
+    # Pre-compute the subword lookup table once per token id. This collapses
+    # the entire char-aware encoder (char embedding + transformer + projection
+    # + subword/BOS-EOS flag adds) into a single ``nn.Embedding`` lookup that
+    # vLLM can use directly.
+    precomputed_subword_emb = _precompute_subword_embeddings(model, precompute_batch_size)
+    vocab_size, _ = precomputed_subword_emb.shape
+
+    # Codec silence tokens are produced once at training time by encoding a
+    # zero waveform with the audio codec and picking the most common frame.
+    # Bake the resulting per-codebook ids into the vLLM checkpoint so the
+    # runtime does not need to load / run the codec to know what "silence"
+    # looks like (used e.g. when forcing silence on EOS).
+    codec_silence_tokens = model.codec_silence_tokens.detach().clone().cpu().to(torch.int32)
+
+    # Strip the original ``tts_model.`` prefix so the remaining renaming below
+    # operates on RVQEARTTSModel state-dict keys (matches the original layout).
+    weights = {k[len("tts_model.") :]: v for k, v in weights.items() if k.startswith("tts_model.")}
 
     # duplicate weights for rvq embeddings and embed code
-    rvq_embs_weight = weights["tts_model.rvq_embs"].clone()  # 31 x codebook_size x latent_size
+    rvq_embs_weight = weights["rvq_embs"].clone()  # 31 x codebook_size x latent_size
     rvq_embs_weight_pad = torch.nn.functional.pad(
         rvq_embs_weight, [0, 0, 0, 1]
     )  # 31 x (codebook_size + 1) x latent_size
-    embed_code_weight = weights["tts_model.embed_code.weight"].clone()  # latent_size x hidden_size
+    embed_code_weight = weights["embed_code.weight"].clone()  # latent_size x hidden_size
 
     # ======================
     # embedding module weights
-    bos_emb = weights["tts_model.bos_emb"]
-    null_emb = weights["tts_model.null_emb"]
-    embed_subwords_weight = torch.zeros((vocab_size, max_char_len), dtype=bos_emb.dtype, device=bos_emb.device)
-    embed_subwords_mask_weight = torch.zeros((vocab_size, max_char_len), dtype=bos_emb.dtype, device=bos_emb.device)
-    for subword_id_str, char_ids_lst in subword_id_to_char_ids.items():
-        subword_id = int(subword_id_str)
-        char_ids = torch.tensor(char_ids_lst, dtype=bos_emb.dtype, device=bos_emb.device)
-        embed_subwords_weight[subword_id, : len(char_ids)] = char_ids
-        embed_subwords_mask_weight[subword_id, : len(char_ids)] = 1
+    bos_emb = weights["bos_emb"]
+    null_emb = weights["null_emb"]
 
-    # create weights for the embedding model that runs outside of the eartts
     embedding_module_weights = {}
     embedding_module_weights["bos_emb"] = bos_emb
     embedding_module_weights["null_emb"] = null_emb
 
-    # embedding transformer has a lot of weights
+    # Single pre-computed lookup replacing the entire char-aware encoder.
+    embedding_module_weights["embed_subword.embed_subwords.weight"] = precomputed_subword_emb
+
+    # Keep gated fusion + audio prompt projection: these depend on runtime
+    # tensors, not on token id, so they cannot be pre-computed.
     for key, weight in weights.items():
-        if "tts_model.embed_subword" in key:
-            key = key[len("tts_model.") :]
-            # bos_eos_emb and subword_flag_emb are moved outside embed_subword
-            if key.startswith("embed_subword.bos_eos_emb.") or key.startswith("embed_subword.subword_flag_emb."):
-                key = key[len("embed_subword.") :]
+        if key.startswith("gated_fusion_audio_text."):
             embedding_module_weights[key] = weight
-    for key, weight in weights.items():
-        if "tts_model.gated_fusion_audio_text" in key:
-            key = key[len("tts_model.") :]
-            embedding_module_weights[key] = weight
-    if "tts_model.audio_prompt_projection_W" in weights:
-        embedding_module_weights["audio_prompt_projection_W"] = weights["tts_model.audio_prompt_projection_W"]
-    embedding_module_weights["embed_subword.embed_subwords.weight"] = embed_subwords_weight
-    embedding_module_weights["embed_subword.embed_subwords_mask.weight"] = embed_subwords_mask_weight
+    if "audio_prompt_projection_W" in weights:
+        embedding_module_weights["audio_prompt_projection_W"] = weights["audio_prompt_projection_W"]
+
     for i in range(rvq_embs_weight_pad.shape[0]):
         embedding_module_weights[f"rvq_embs.{i}.weight"] = rvq_embs_weight_pad[i]
     embedding_module_weights["embed_code.weight"] = embed_code_weight
@@ -140,26 +200,24 @@ def convert_to_vllm_format(outdir: str, config: str, model_path: str) -> None:
 
     # ======================
     # gemma backbone weights
-    backbone_module_weights = {
-        k[len("tts_model.") :]: v for k, v in weights.items() if k.startswith("tts_model.backbone.")
-    }
+    backbone_module_weights = {k: v for k, v in weights.items() if k.startswith("backbone.")}
     backbone_module_weights["backbone.embed_tokens.weight"] = torch.randn(
         1, hidden_size, dtype=bos_emb.dtype, device=bos_emb.device
     )
 
     # ======================
     # sampler weights
-    used_keys = ["rvq_embs", "embed_code", "mog_head"]
-    sampler_weights = {
-        k[len("tts_model.") :]: v
-        for k, v in weights.items()
-        if any(k.startswith(f"tts_model.{key}") for key in used_keys)
-    }
-    sampler_weights = {"sampler." + k: v for k, v in sampler_weights.items()}
+    used_keys = ("rvq_embs", "embed_code", "mog_head")
+    sampler_weights = {"sampler." + k: v for k, v in weights.items() if k.startswith(used_keys)}
 
     # combine embedding module and backbone module weights
     weights = {**embedding_module_weights, **backbone_module_weights, **sampler_weights}
     weights = {"model." + k: v for k, v in weights.items()}
+
+    # Top-level silence token buffer (int32 tensor of shape [num_quantizers]).
+    # Stored under ``model.sil_tokens`` so the vLLM model can register it as a
+    # plain buffer at the top of its module tree.
+    weights["model.sil_tokens"] = codec_silence_tokens
 
     # save weights
     safetensors_path = os.path.join(outdir, "model.safetensors")
@@ -226,26 +284,13 @@ def convert_to_vllm_format(outdir: str, config: str, model_path: str) -> None:
     flat_config["num_iter"] = 8
     flat_config["noise_scale"] = cfg.model.get("inference_noise_scale", 0.8)
     flat_config["top_p_or_k"] = cfg.model.get("inference_top_p_or_k", 0.8)
-    flat_config["guidance_scale"] = cfg.model.get("inference_guidance_scale", 0.5)
 
-    # configuration of the embedding module
-    flat_config["emb_backbone_config"] = OmegaConf.to_container(
-        cfg.model.tts_config.cas_config.backbone_config, resolve=True
-    )
-    flat_config["emb_backbone_type"] = cfg.model.tts_config.cas_config.backbone_type
+    # Embedding module configuration. The char-aware encoder is gone; vLLM only
+    # needs to know the size of the pre-computed lookup table.
     flat_config["emb_vocab_size"] = vocab_size
-    flat_config["emb_char_vocab_size"] = len(char_vocab)
-    flat_config["max_char_len"] = max_char_len
 
-    # configuration of flag embeddings
-    flat_config["pretrained_tokenizer_name"] = _pretrained_tokenizer_name
-    flat_config["use_subword_flag_emb"] = cfg.model.tts_config.use_subword_flag_emb
-    flat_config["use_bos_eos_emb"] = cfg.model.tts_config.use_bos_eos_emb
     flat_config["use_gated_fusion_for_text_audio"] = cfg.model.tts_config.use_gated_fusion_for_text_audio
     flat_config["use_audio_prompt_frozen_projection"] = cfg.model.tts_config.use_audio_prompt_frozen_projection
-    # hardcode enabling guidance so emb is created and application
-    # of cfg is captured into a cuda graph
-    flat_config["enable_guidance"] = True
 
     # configuring custom inputs/outputs
     flat_config["custom_input_specs"] = [
@@ -268,9 +313,8 @@ def convert_to_vllm_format(outdir: str, config: str, model_path: str) -> None:
     # Extract and save pre-computed speaker latents (audio_prompt_latents.*)
     # from the NeMo checkpoint so they can be used at inference time.
     speaker_latents_dir = os.path.join(outdir, "speaker_latents")
-    all_weights = load_file(model_path)
     found_latents = False
-    for key, tensor in all_weights.items():
+    for key, tensor in raw_weights.items():
         if "audio_prompt_latents." in key:
             speaker_name = key.split("audio_prompt_latents.")[-1]
             os.makedirs(speaker_latents_dir, exist_ok=True)
@@ -286,4 +330,4 @@ def convert_to_vllm_format(outdir: str, config: str, model_path: str) -> None:
 
 if __name__ == "__main__":
     args = parse_args()
-    convert_to_vllm_format(args.outdir, args.config, args.model)
+    convert_to_vllm_format(args.outdir, args.config, args.model, args.precompute_batch_size)

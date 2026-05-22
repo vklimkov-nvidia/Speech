@@ -79,20 +79,34 @@ class NemotronVoicechatInferenceWrapper:
         matmul_precision = str(model_cfg.get("matmul_precision", "medium"))
         torch.set_float32_matmul_precision(matmul_precision)
 
-        # Deterministic mode: guarantees identical *text* outputs (from the STT/LLM
-        # heads) across runs for the same inputs, even when sampling is enabled
-        # (top_p < 1, temperature != 1, repetition_penalty != 1).  This works
-        # because we fix the global PyTorch RNG seeds and force all CUDA ops
-        # to use deterministic algorithm implementations.
-        # Not compatible with vLLM engines (raises an error below).
+        # Engine selection (one of: ``native``, ``vllm_omni``).
+        #   "native"    -- pure PyTorch path: native_llm + native_eartts
+        #                  + native audio codec, all driven from this process.
+        #   "vllm_omni" -- replaces the LLM (DuplexSTT backbone) and the
+        #                  EarTTS backbone with a vLLM-Omni AsyncOmni
+        #                  streaming pipeline. Perception, the audio codec,
+        #                  and tokenization stay native.
+        self.engine_type = str(model_cfg.get("engine_type", "native")).lower()
+        if self.engine_type not in ("native", "vllm_omni"):
+            raise ValueError(
+                f"Unknown engine_type='{self.engine_type}'. Supported values: 'native', 'vllm_omni'."
+            )
+        self.use_vllm_omni = self.engine_type == "vllm_omni"
+
+        # Deterministic mode: guarantees identical *text* outputs (from the
+        # STT/LLM heads) across runs for the same inputs, even when sampling
+        # is enabled (top_p < 1, temperature != 1, repetition_penalty != 1).
+        # Works by fixing the global PyTorch RNG seeds and forcing
+        # deterministic CUDA algorithm implementations. Not compatible with
+        # vLLM-Omni because vLLM uses custom CUDA kernels (PagedAttention,
+        # FlashAttention) that don't support deterministic mode.
         self._deterministic = bool(model_cfg.get("deterministic", False))
         if self._deterministic:
-            engine_type = model_cfg.get("engine_type", "native")
-            if "vllm" in engine_type.lower():
+            if self.use_vllm_omni:
                 raise ValueError(
-                    "`deterministic` is not compatible with vLLM engines because vLLM uses custom "
-                    "CUDA kernels (PagedAttention, FlashAttention) that do not support deterministic mode. "
-                    f"Got engine_type='{engine_type}'. Use engine_type='native' for deterministic inference."
+                    "`deterministic` is not compatible with engine_type='vllm_omni' (vLLM uses "
+                    "PagedAttention/FlashAttention kernels that have no deterministic mode). "
+                    "Use engine_type='native' for deterministic inference."
                 )
             os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
             torch.manual_seed(0)
@@ -161,6 +175,7 @@ class NemotronVoicechatInferenceWrapper:
         self._profile_timing = bool(model_cfg.get("profile_timing", False))
 
         # Cached TTS helpers populated during initialization/warmup
+        # (native engine only).
         self.first_context_subword_id = None
         self.generation_config = None
         self.first_tts_code_input = None
@@ -168,23 +183,15 @@ class NemotronVoicechatInferenceWrapper:
 
         self.model = None
         self.model_llm_interface = None
+        self.model_eartts_interface = None
         self.tokenizer = None
 
-        # Engine configuration.
-        # engine_type is a user-facing config value that selects which combination
-        # of backends to use for the LLM and TTS components:
-        #   "native"                 -> native_llm  + native_eartts
-        #   "vllm_llm"              -> vllm_llm    + native_eartts
-        #   "vllm_eartts"           -> native_llm  + vllm_eartts
-        #   "vllm_llm_vllm_eartts"  -> vllm_llm    + vllm_eartts
-        # The factory (create_model) uses the specific {backend}_{component}
-        # names: native_llm, native_eartts, vllm_llm, vllm_eartts.
-        self.engine_type = model_cfg.get("engine_type", "native")
-        self.use_vllm_llm = "vllm_llm" in self.engine_type.lower()
-        self.use_vllm_eartts = "vllm_eartts" in self.engine_type.lower()
-        self.vllm_llm_config = model_cfg.get("vllm_llm_config", None)
-        self.vllm_tts_config = model_cfg.get("vllm_tts_config", None)
-        self.request_id = "streaming_request_0"  # For vLLM streaming
+        # vLLM-Omni runtime + speaker latent (vllm_omni engine only).
+        self.vllm_omni_config = model_cfg.get("vllm_omni_config", None)
+        self.omni_runtime = None
+        self.omni_wrapper_dir: str | None = None
+        self.omni_speaker_latent: torch.Tensor | None = None
+        self.request_id = "streaming_request_0"
 
         # Sampling parameters
         self.top_p = float(model_cfg.get("top_p", 1.0))
@@ -207,16 +214,20 @@ class NemotronVoicechatInferenceWrapper:
         logging.info("NemotronVoicechatInferenceWrapper initialized successfully.")
 
     def _initialize_model(self):
-        """Initialize the NemotronVoiceChat model from an HF checkpoint."""
+        """Initialize the NemotronVoiceChat model from an HF checkpoint.
+
+        For ``engine_type='vllm_omni'`` the LLM (``stt_model.llm``) and TTS
+        backbone (``tts_model.tts_model``) weights are skipped at load time
+        (vLLM-Omni provides those) and the corresponding modules are dropped
+        immediately afterwards. Perception, embeddings, control codes, the
+        audio codec, and tokenization remain native.
+        """
         logging.info("Initializing model structure...")
         start_model_init = time.time()
 
-        # Tell from_pretrained to skip loading checkpoint weights for
-        # submodules that vLLM will replace — avoids wasted I/O and memory.
-        skip_prefixes = set()
-        if self.use_vllm_llm:
+        skip_prefixes: set[str] = set()
+        if self.use_vllm_omni:
             skip_prefixes.add("stt_model.llm.")
-        if self.use_vllm_eartts:
             skip_prefixes.add("tts_model.tts_model.")
 
         self.model = NemotronVoiceChat.from_pretrained(
@@ -226,21 +237,20 @@ class NemotronVoicechatInferenceWrapper:
         )
         logging.info(f"NemotronVoiceChat initialized in {time.time() - start_model_init:.1f}s")
 
-        # Remove skipped submodules (still on meta device / uninitialized)
-        if self.use_vllm_llm:
+        if self.use_vllm_omni:
+            # Modules whose weights we just skipped are still attached as
+            # uninitialized submodules — drop them so no one accidentally
+            # calls into them.
             del self.model.stt_model.llm
             self.model.stt_model.llm = None
-        if self.use_vllm_eartts:
             del self.model.tts_model.tts_model
 
-        # Setup model on device and cast to configured dtype
         self.model.to(self.device)
         self.model.safe_cast_to(self.dtype)
         self.model.eval()
 
         self.tokenizer = self.model.stt_model.tokenizer
 
-        # Allow runtime wrapper overrides into the STT config used by shared inference helpers.
         _BOOST_KEYS = (
             "inference_pad_boost",
             "inference_bos_boost",
@@ -258,84 +268,28 @@ class NemotronVoicechatInferenceWrapper:
             val = self.model_cfg.get(key, None)
             if val is not None:
                 OmegaConf.update(self.model.stt_model.cfg, key, val, force_add=True)
-        boost_values = {k: self.model.stt_model.cfg.get(k, None) for k in _BOOST_KEYS}
-        logging.info(f"Inference logit boosts: {boost_values}")
-        force_turn_taking_values = {k: self.model.stt_model.cfg.get(k, None) for k in _FORCE_TURN_TAKING_KEYS}
-        logging.info(f"Forced turn-taking config: {force_turn_taking_values}")
+        if not self.use_vllm_omni:
+            boost_values = {k: self.model.stt_model.cfg.get(k, None) for k in _BOOST_KEYS}
+            logging.info(f"Inference logit boosts: {boost_values}")
+            force_turn_taking_values = {k: self.model.stt_model.cfg.get(k, None) for k in _FORCE_TURN_TAKING_KEYS}
+            logging.info(f"Forced turn-taking config: {force_turn_taking_values}")
 
-        # Create LLM backend
-        if self.use_vllm_llm:
-            logging.info("Creating VLLMLLM backend...")
-            if self.vllm_llm_config is None:
-                raise ValueError("vllm_llm_config must be provided when engine_type contains 'vllm_llm'")
+        if self.use_vllm_omni:
+            self._initialize_vllm_omni_backend()
+        else:
+            self._initialize_native_backend()
 
-            # Set logit boosts as env vars BEFORE creating the vLLM engine,
-            # so they are inherited by the forked worker process.  The modified
-            # nemotron_h.py reads VLLM_ASR_BOOST_<token_id> and
-            # VLLM_TEXT_BOOST_<token_id> in __init__.
-            stt = self.model.stt_model
-            asr_boost_map = {
-                "inference_user_pad_boost": stt.text_pad_id,
-                "inference_user_bos_boost": stt.text_bos_id,
-                "inference_user_eos_boost": stt.text_eos_id,
-            }
-            for cfg_key, token_id in asr_boost_map.items():
-                val = self.model_cfg.get(cfg_key, None)
-                if val is not None and float(val) != 0.0:
-                    env_key = f"VLLM_ASR_BOOST_{token_id}"
-                    os.environ[env_key] = str(float(val))
-                    logging.info(f"Set env {env_key}={val} (from {cfg_key})")
-
-            text_boost_map = {
-                "inference_pad_boost": stt.text_pad_id,
-                "inference_bos_boost": stt.text_bos_id,
-                "inference_eos_boost": stt.text_eos_id,
-            }
-            for cfg_key, token_id in text_boost_map.items():
-                val = self.model_cfg.get(cfg_key, None)
-                if val is not None and float(val) != 0.0:
-                    env_key = f"VLLM_TEXT_BOOST_{token_id}"
-                    os.environ[env_key] = str(float(val))
-                    logging.info(f"Set env {env_key}={val} (from {cfg_key})")
-
-        stt = self.model.stt_model
-        special_ids = get_special_token_ids(stt.tokenizer, stt.text_pad_id, model_cfg=stt.cfg)
-        self.model_llm_interface = create_model(
-            model=self.model_path if self.use_vllm_llm else self.model,
-            engine_type="vllm_llm" if self.use_vllm_llm else "native_llm",
-            vllm_config=self.vllm_llm_config if self.use_vllm_llm else None,
-            special_token_ids=special_ids,
-            top_p=self.top_p,
-            repetition_penalty=self.repetition_penalty,
-            temperature=self.temperature,
-        )
-        logging.info(f"LLM backend: {type(self.model_llm_interface).__name__}")
-
-        # Create TTS backend
-        self.model_eartts_interface = create_model(
-            model=self.model_path if self.use_vllm_eartts else self.model.tts_model,
-            engine_type="vllm_eartts" if self.use_vllm_eartts else "native_eartts",
-            vllm_config=self.vllm_tts_config if self.use_vllm_eartts else None,
-            special_token_ids=special_ids,
-        )
-        logging.info(f"TTS backend: {type(self.model_eartts_interface).__name__}")
-
-        # torch.compile and subword cache (no-ops for vLLM, delegated to TTS backend)
-        if bool(self.model_cfg.get("use_tts_torch_compile", False)):
-            self.model_eartts_interface.compile()
-        self.model_eartts_interface.setup_subword_cache(self.model_cfg)
-
-        # Get TTS info
         if hasattr(self.model, 'tts_model'):
             self.target_fps = self.model.tts_model.target_fps
             self.target_sample_rate = self.model.tts_model.target_sample_rate
-            logging.info(f"TTS model initialized: target_fps={self.target_fps}, sample_rate={self.target_sample_rate}")
-            if self.decode_audio:
+            logging.info(
+                f"TTS model initialized: target_fps={self.target_fps}, sample_rate={self.target_sample_rate}"
+            )
+            if not self.use_vllm_omni and self.decode_audio:
                 self._prepare_tts_initial_state()
         else:
             logging.warning("Warning: TTS model not found in the model")
 
-        # Setup perception cache if enabled
         if self.use_perception_cache:
             self.perception_cache_mgr = PerceptionCacheManager(
                 model=self.model,
@@ -346,6 +300,74 @@ class NemotronVoicechatInferenceWrapper:
             if not self.perception_cache_mgr.setup():
                 self.use_perception_cache = False
                 self.perception_cache_mgr = None
+
+    def _initialize_native_backend(self):
+        """Wire up the native PyTorch LLM + EarTTS backends."""
+        stt = self.model.stt_model
+        special_ids = get_special_token_ids(stt.tokenizer, stt.text_pad_id, model_cfg=stt.cfg)
+        self.model_llm_interface = create_model(
+            model=self.model,
+            engine_type="native_llm",
+            special_token_ids=special_ids,
+            top_p=self.top_p,
+            repetition_penalty=self.repetition_penalty,
+            temperature=self.temperature,
+        )
+        logging.info(f"LLM backend: {type(self.model_llm_interface).__name__}")
+
+        self.model_eartts_interface = create_model(
+            model=self.model.tts_model,
+            engine_type="native_eartts",
+            special_token_ids=special_ids,
+        )
+        logging.info(f"TTS backend: {type(self.model_eartts_interface).__name__}")
+
+        if bool(self.model_cfg.get("use_tts_torch_compile", False)):
+            self.model_eartts_interface.compile()
+        self.model_eartts_interface.setup_subword_cache(self.model_cfg)
+
+    def _initialize_vllm_omni_backend(self):
+        """Build the wrapper checkpoint, start the AsyncOmni runtime, and
+        pre-load the speaker latent.
+
+        The wrapper checkpoint is built lazily under
+        ``/tmp/<basename>_vllm_omni_wrapper`` and reused on subsequent runs.
+        """
+        from nemo.collections.speechlm2.inference.vllm_omni.streaming_session import (
+            OmniRuntime,
+            build_wrapper_checkpoint,
+            load_speaker_latent,
+        )
+
+        cfg = self.vllm_omni_config or {}
+
+        wrapper_dir = build_wrapper_checkpoint(
+            self.model_path,
+            wrapper_dir=cfg.get("wrapper_dir", None),
+            nemotron_dtype=cfg.get("nemotron_dtype", "float32"),
+            eartts_precompute_batch_size=int(cfg.get("eartts_precompute_batch_size", 256)),
+        )
+        self.omni_wrapper_dir = wrapper_dir
+
+        self.omni_runtime = OmniRuntime(
+            wrapper_dir,
+            stage_configs_path=cfg.get("stage_configs_path", None),
+            stage_overrides=cfg.get("stage_overrides", None),
+            log_stats=bool(cfg.get("log_stats", False)),
+            stage_init_timeout=int(cfg.get("stage_init_timeout", 600)),
+        )
+
+        eartts_dir = os.path.join(wrapper_dir, "eartts")
+        speaker_name = self.speaker_name or cfg.get("speaker_name")
+        if speaker_name is None:
+            raise ValueError(
+                "engine_type='vllm_omni' requires a speaker_name (set "
+                "s2s.speaker_name or s2s.vllm_omni_config.speaker_name)."
+            )
+        self.omni_speaker_latent = load_speaker_latent(eartts_dir, speaker_name)
+        logging.info(
+            f"vllm_omni speaker_latent: name='{speaker_name}', shape={tuple(self.omni_speaker_latent.shape)}"
+        )
 
     def _prepare_system_prompt_embeddings(
         self,
@@ -432,12 +454,8 @@ class NemotronVoicechatInferenceWrapper:
         init_inputs.update({"use_cache": True, "past_key_values": None, "guidance_enabled": True})
 
         with torch.no_grad():
-            if self.use_vllm_eartts:
-                self.tts_prompt_token_ids = init_inputs["subword_ids"].squeeze().cpu().numpy().tolist()
-                self.tts_init_inputs = init_inputs
             outputs = self.model_eartts_interface.prefill_prompt(
                 init_inputs,
-                prompt_token_ids=getattr(self, 'tts_prompt_token_ids', None),
                 request_id="tts_warmup",
             )
             self.model_eartts_interface.abort_request("tts_warmup")
@@ -452,6 +470,34 @@ class NemotronVoicechatInferenceWrapper:
 
     def create_decode_state(self, max_len: int) -> StreamingDecodeState:
         gen_text, gen_asr_text = self._init_token_buffers(max_len)
+
+        if self.use_vllm_omni:
+            # vLLM-Omni manages LLM KV cache + TTS state internally; only
+            # the audio codec cache (run natively in this process) is set
+            # up here.
+            llm_cache = None
+            tts_past_key_values = None
+            tts_code = None
+            subword_mask, tts_codec_cache = self._create_native_codec_cache(max_len)
+            perception_cache = None
+            if self.use_perception_cache and self.perception_cache_mgr is not None:
+                perception_cache = self.perception_cache_mgr.get_initial_state(batch_size=1)
+            return StreamingDecodeState(
+                frame_idx=0,
+                gen_text=gen_text,
+                gen_asr_text=gen_asr_text,
+                input_embeds_history=[],
+                llm_cache=llm_cache,
+                tts_past_key_values=tts_past_key_values,
+                tts_code=tts_code,
+                subword_mask=subword_mask,
+                perception_cache=perception_cache,
+                tts_codec_cache=tts_codec_cache,
+                llm_cache_position_offset=0,
+                timing=TimingSummary() if self._profile_timing else NullTimingSummary(),
+                omni_session=None,
+            )
+
         llm_cache = self.model_llm_interface.create_cache()
         if self.decode_audio:
             subword_mask, tts_codec_cache = self.model_eartts_interface.create_codec_state(max_len, self.device)
@@ -482,6 +528,58 @@ class NemotronVoicechatInferenceWrapper:
             timing=TimingSummary() if self._profile_timing else NullTimingSummary(),
         )
 
+    def _create_native_codec_cache(self, max_len: int):
+        """Build the streaming audio-codec cache used by ``_decode_audio``.
+
+        The codec runs natively in both engine modes; on the vllm_omni path
+        we still need the same ``CausalConv1dCache`` + ``subword_mask`` pair.
+        """
+        if not self.decode_audio:
+            return None, None
+        from nemo.collections.speechlm2.modules.ear_tts_vae_codec import CausalConv1dCache
+
+        codec_cache = CausalConv1dCache()
+        subword_mask = torch.ones((1, max_len), device=self.device, dtype=torch.bool)
+        return subword_mask, codec_cache
+
+    def start_vllm_omni_session(
+        self,
+        state: StreamingDecodeState,
+        system_prompt: str | None,
+        max_len: int,
+        *,
+        request_id: str,
+    ) -> None:
+        """Create and attach a per-stream :class:`OmniStreamingSession`.
+
+        Called by the streaming pipeline once it has the system prompt for
+        the new stream (replaces native-engine prefill).
+        """
+        if not self.use_vllm_omni:
+            return
+        if self.omni_runtime is None or self.omni_speaker_latent is None:
+            raise RuntimeError("vllm_omni backend was not initialized; call _initialize_model first.")
+        from nemo.collections.speechlm2.inference.vllm_omni.streaming_session import (
+            OmniStreamingSession,
+            compute_prefill_len,
+        )
+
+        nemotron_dir = os.path.join(self.omni_wrapper_dir, "nemotron")
+        t_prefill = compute_prefill_len(nemotron_dir, system_prompt or "")
+        state.omni_session = OmniStreamingSession(
+            self.omni_runtime,
+            request_id=request_id,
+            system_prompt=system_prompt or "",
+            speaker_latent=self.omni_speaker_latent,
+            t_prefill=t_prefill,
+            max_decode_steps=int(max_len),
+            sampling_params={
+                "temperature": float(self.temperature),
+                "top_p": float(self.top_p),
+            },
+            step_timeout=float((self.vllm_omni_config or {}).get("step_timeout", 60.0)),
+        )
+
     def infer_one_step(
         self,
         audio_input: torch.Tensor,
@@ -503,7 +601,7 @@ class NemotronVoicechatInferenceWrapper:
             audio_input (torch.Tensor): Raw audio tensor for this chunk, shape ``(1, samples)``.
             num_frames_per_chunk (int): Number of 80 ms frames in this chunk.
             state (StreamingDecodeState): Mutable decode state (KV caches, token workspaces, etc.).
-            request_id (str | None): Unique ID for this stream (used by vLLM engines).
+            request_id (str | None): Unique ID for this stream (used by vLLM-Omni).
             has_prompt (bool): Whether the LLM state already contains a prefilled
                 system prompt. Affects the first-frame embedding (PAD vs BOS).
             return_debug (bool): If True, attach per-step debug info to the result.
@@ -511,6 +609,15 @@ class NemotronVoicechatInferenceWrapper:
                 (``top_p``, ``temperature``, ``repetition_penalty``).
                 Keys that are absent fall back to the pipeline-level defaults.
         """
+        if self.use_vllm_omni:
+            return self._infer_one_step_vllm_omni(
+                audio_input,
+                num_frames_per_chunk,
+                state,
+                request_id=request_id,
+                return_debug=return_debug,
+            )
+
         effective_request_id = request_id or self.request_id
         frame_idx = state.frame_idx
 
@@ -641,6 +748,169 @@ class NemotronVoicechatInferenceWrapper:
         )
 
     # ------------------------------------------------------------------
+    # vLLM-Omni inference path
+    # ------------------------------------------------------------------
+
+    def _infer_one_step_vllm_omni(
+        self,
+        audio_input: torch.Tensor,
+        num_frames_per_chunk: int,
+        state: StreamingDecodeState,
+        *,
+        request_id: str | None,
+        return_debug: bool,
+    ) -> InferenceStepResult:
+        """vllm_omni-engine variant of :meth:`infer_one_step`.
+
+        Runs the perception encoder natively, drives the NemotronDuplexH ->
+        EarTTS pipeline frame-by-frame through ``state.omni_session``, and
+        decodes the produced audio codes natively via ``audio_codec``.
+        """
+        if state.omni_session is None:
+            raise RuntimeError(
+                "engine_type='vllm_omni' requires a per-stream OmniStreamingSession; "
+                "make sure the pipeline calls start_vllm_omni_session(...) during prefill."
+            )
+
+        frame_idx = state.frame_idx
+        B = state.gen_text.shape[0]
+        if B != 1:
+            raise ValueError(
+                f"engine_type='vllm_omni' only supports batch size 1 (got gen_text batch={B})."
+            )
+
+        state.timing.start("total_step")
+
+        predicted_tokens = torch.empty(
+            (B, num_frames_per_chunk), dtype=state.gen_text.dtype, device=state.gen_text.device
+        )
+        asr_predicted_tokens = torch.empty(
+            (B, num_frames_per_chunk), dtype=state.gen_text.dtype, device=state.gen_text.device
+        )
+
+        debug_logger = IntermediateResultLogger() if return_debug else NullIntermediateResultLogger()
+
+        state.timing.start("perception")
+        source_encoded, state.perception_cache = self._run_perception(
+            audio_input,
+            frame_idx,
+            num_frames_per_chunk,
+            state.perception_cache,
+        )
+        state.timing.stop("perception")
+
+        total_encoded_frames = source_encoded.shape[1]
+        if (
+            self.use_perception_cache
+            and state.perception_cache is not None
+            and state.perception_cache.is_initialized()
+        ):
+            base_frame_index = 0
+        else:
+            newest = total_encoded_frames - 2
+            base_frame_index = max(newest - (num_frames_per_chunk - 1), 0)
+
+        state.timing.start("omni_session")
+        for frame_offset in range(num_frames_per_chunk):
+            current_frame_idx = frame_idx + frame_offset
+            current_frame_index = min(base_frame_index + frame_offset, source_encoded.shape[1] - 1)
+            debug_logger.log_selected_frame_index(current_frame_index)
+            frame_embedding = source_encoded[:, current_frame_index : current_frame_index + 1, :]
+            debug_logger.log_input_embeds(frame_embedding)
+
+            text_tok, asr_tok = state.omni_session.step(frame_embedding.reshape(-1))
+
+            state.gen_text[:, current_frame_idx] = int(text_tok)
+            state.gen_asr_text[:, current_frame_idx] = int(asr_tok)
+            predicted_tokens[:, frame_offset] = int(text_tok)
+            asr_predicted_tokens[:, frame_offset] = int(asr_tok)
+        state.timing.stop("omni_session")
+
+        decoded_audio_new = None
+        if self.decode_audio:
+            audio_chunks = state.omni_session.drain_audio_codes()
+            if audio_chunks:
+                decoded_audio_new = self._decode_audio_vllm_omni(audio_chunks, state)
+
+        predicted_text_strs = self._tokens_to_strings(predicted_tokens)
+        asr_predicted_text_strs = self._tokens_to_strings(asr_predicted_tokens)
+
+        logging.debug(f'frame {frame_idx}: USER asr: {asr_predicted_text_strs}')
+        logging.debug(f'frame {frame_idx}: AGENT txt: {predicted_text_strs}')
+
+        state.timing.stop("total_step")
+
+        debug = debug_logger.build_debug_dict(source_encoded, state.gen_text, state.gen_asr_text)
+
+        return InferenceStepResult(
+            predicted_text_tokens=predicted_tokens,
+            asr_predicted_text_tokens=asr_predicted_tokens,
+            predicted_text_strs=predicted_text_strs,
+            asr_predicted_text_strs=asr_predicted_text_strs,
+            decoded_audio=decoded_audio_new,
+            debug=debug,
+        )
+
+    def _decode_audio_vllm_omni(
+        self,
+        audio_chunks: list[torch.Tensor],
+        state: StreamingDecodeState,
+    ) -> torch.Tensor | None:
+        """Decode audio codes produced by the EarTTS stage.
+
+        Each chunk in *audio_chunks* is shape ``[T_step, num_quantizers]`` as
+        emitted by ``EarTTSForCausalLM.make_omni_output``; we stack along
+        time and add a batch dim to get ``[1, T_total, num_quantizers]``,
+        which matches the layout expected by both
+        ``replace_control_speech_codes`` (silence tokens broadcast along
+        the last dim) and the native ``_decode_audio`` path.
+        """
+        if not audio_chunks:
+            return None
+
+        state.timing.start("audio_codec")
+        with fp32_precision(), torch.no_grad():
+            stacked = torch.cat(audio_chunks, dim=0)
+            codes = stacked.unsqueeze(0).to(self.device).to(torch.long)
+            logging.debug(
+                f"vllm_omni decode: num_chunks={len(audio_chunks)}, "
+                f"codes.shape={tuple(codes.shape)} (B, T, num_quantizers), "
+                f"min={int(codes.min())}, max={int(codes.max())}"
+            )
+            if hasattr(self.model.tts_model, '_control_codes'):
+                from nemo.collections.speechlm2.models.duplex_ear_tts import replace_control_speech_codes
+
+                codes = replace_control_speech_codes(
+                    codes,
+                    self.model.tts_model._control_codes,
+                    getattr(self.model.tts_model, 'codec_silence_tokens', None),
+                )
+            code_len = torch.tensor([codes.shape[1]], dtype=torch.long, device=self.device)
+            decoded_audio, _ = self.model.tts_model.audio_codec.decode(
+                codes,
+                code_len,
+                cache=state.tts_codec_cache,
+            )
+        state.timing.stop("audio_codec")
+
+        return decoded_audio
+
+    def shutdown(self) -> None:
+        """Tear down the AsyncOmni runtime (no-op for native engine)."""
+        if self.omni_runtime is not None:
+            try:
+                self.omni_runtime.shutdown()
+            except Exception as exc:
+                logging.warning(f"OmniRuntime.shutdown raised: {exc!r}")
+            self.omni_runtime = None
+
+    def __del__(self):
+        try:
+            self.shutdown()
+        except Exception:
+            pass
+
+    # ------------------------------------------------------------------
     # infer_one_step sub-stages
     # ------------------------------------------------------------------
 
@@ -656,32 +926,23 @@ class NemotronVoicechatInferenceWrapper:
         new_input_embeds: list,
         sampling_params: dict[str, float] | None = None,
     ) -> dict:
-        """Run one LLM forward pass (native cache, vLLM, or full-history).
+        """Run one native-LLM forward pass (cached or full-history).
 
         Updates ``state.llm_cache`` in-place for cached paths.  For the
         no-cache fallback, appends to *new_input_embeds* (list, mutated).
         """
         state.timing.start("stt_model")
 
-        if has_llm_cache or self.use_vllm_llm:
-            if self.use_vllm_llm:
-                ans = self.model_llm_interface(
-                    input_emb,
-                    request_id=request_id,
-                    generated_tokens=state.gen_text,
-                    current_step=current_frame_idx,
-                    sampling_params=sampling_params,
-                )
-            else:
-                ans = self.model_llm_interface(
-                    input_emb,
-                    cache=state.llm_cache,
-                    cache_position_offset=state.llm_cache_position_offset + frame_offset,
-                    generated_tokens=state.gen_text,
-                    current_step=current_frame_idx,
-                    return_logits=return_debug,
-                    sampling_params=sampling_params,
-                )
+        if has_llm_cache:
+            ans = self.model_llm_interface(
+                input_emb,
+                cache=state.llm_cache,
+                cache_position_offset=state.llm_cache_position_offset + frame_offset,
+                generated_tokens=state.gen_text,
+                current_step=current_frame_idx,
+                return_logits=return_debug,
+                sampling_params=sampling_params,
+            )
             state.llm_cache = ans["cache"]
         else:
             new_input_embeds.append(input_emb)
@@ -725,29 +986,16 @@ class NemotronVoicechatInferenceWrapper:
             raise RuntimeError("generation_config is not initialized. Ensure TTS warmup ran successfully.")
 
         state.timing.start("tts_model")
-        if self.use_vllm_eartts:
-            tts_inputs = {
-                "code": state.tts_code,
-                "context_hidden_state": None,
-                "subword_ids": current_subword_id,
-                "subword_mask": current_subword_mask,
-                "past_key_values": state.tts_past_key_values,
-                "use_cache": True,
-                "guidance_enabled": True,
-                "generation_config": self.generation_config,
-                "ignore_eos_flag_stop": True,
-            }
-        else:
-            tts_inputs = {
-                "current_subword_id": current_subword_id,
-                "prev_subword_id": prev_subword_id,
-                "current_subword_mask": current_subword_mask,
-                "prev_audio_tokens": state.tts_code,
-                "past_key_values": state.tts_past_key_values,
-                "guidance_enabled": True,
-                "generation_config": self.generation_config,
-                "ignore_eos_flag_stop": True,
-            }
+        tts_inputs = {
+            "current_subword_id": current_subword_id,
+            "prev_subword_id": prev_subword_id,
+            "current_subword_mask": current_subword_mask,
+            "prev_audio_tokens": state.tts_code,
+            "past_key_values": state.tts_past_key_values,
+            "guidance_enabled": True,
+            "generation_config": self.generation_config,
+            "ignore_eos_flag_stop": True,
+        }
         result = self.model_eartts_interface(tts_inputs, request_id=request_id)
         state.tts_code = result.codes
         state.tts_past_key_values = result.past_key_values

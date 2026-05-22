@@ -12,9 +12,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from nemo.collections.speechlm2.inference.model_wrappers.backend.interface import ModelInterface
-from nemo.collections.speechlm2.inference.model_wrappers.backend.pytorch.eartts import (
-    PyTorchEarTTS,
-    TTSGenerationResult,
+"""``nemotron_voicechat`` Omni pipeline (NemotronDuplexH → EarTTS).
+
+See :mod:`.pipeline` for full details on the pipeline contract and the
+expected wrapper-checkpoint directory layout.
+"""
+
+from nemo.collections.speechlm2.inference.vllm_omni.nemotron_voicechat.pipeline import (
+    EARTTS_SUBDIR,
+    NEMOTRON_SUBDIR,
+    NEMOTRON_VOICECHAT_PIPELINE,
 )
-from nemo.collections.speechlm2.inference.model_wrappers.backend.pytorch.model import PyTorchLLM
+
+__all__ = [
+    "EARTTS_SUBDIR",
+    "NEMOTRON_SUBDIR",
+    "NEMOTRON_VOICECHAT_PIPELINE",
+]

@@ -13,19 +13,19 @@
 # limitations under the License.
 
 """
-Base interface for S2S model inference backends.
+Base interface for the native S2S model inference backends.
 
-NemotronVoiceChat has two main inference components that can each run on
-either native PyTorch or vLLM:
+NemotronVoiceChat has two main native inference components:
 
 - **LLM** (inside DuplexSTT): takes audio embeddings, produces text and ASR
-  tokens.  Wrapped as ``model_llm_interface`` in the inference wrapper.
+  tokens.  Wrapped as ``model_llm_interface`` in the native inference path.
 - **TTS** (EarTTS): takes text tokens, produces audio codec codes.
-  Wrapped as ``model_eartts_interface`` in the inference wrapper.
+  Wrapped as ``model_eartts_interface`` in the native inference path.
 
-This module defines the abstract ``ModelInterface`` that both backends
+This module defines the abstract ``ModelInterface`` that both native backends
 implement, with shared sampling utilities (top-p, repetition penalty,
-temperature).
+temperature). The vLLM-Omni engine path bypasses this interface entirely and
+drives a multi-stage AsyncOmni pipeline directly.
 """
 
 import math
@@ -39,16 +39,15 @@ from nemo.utils import logging
 
 class ModelInterface(ABC):
     """
-    Abstract base class for LLM and TTS inference backends.
+    Abstract base class for native LLM and TTS inference backends.
 
     Concrete implementations wrap either the LLM component (DuplexSTT backbone
     that predicts text/ASR tokens from audio embeddings) or the TTS component
-    (EarTTS that generates audio codec codes from text tokens).  Each component
-    can run on native PyTorch or vLLM.
+    (EarTTS that generates audio codec codes from text tokens).
 
     Provides shared sampling utilities (top-p, repetition penalty, temperature)
     and lifecycle methods (compile, prefill, subword cache) so the inference
-    wrapper can treat all backends uniformly.
+    wrapper can treat both backends uniformly.
     """
 
     def __init__(
@@ -250,8 +249,7 @@ class ModelInterface(ABC):
         """Create inference cache for this backend. Returns None by default.
 
         Override in LLM backends that manage their own cache (e.g. PyTorchLLM
-        creates a DynamicCache for standard transformer models).  vLLM backends
-        manage cache internally and inherit the default.
+        creates a DynamicCache for standard transformer models).
         """
         return None
 
@@ -265,7 +263,7 @@ class ModelInterface(ABC):
     def abort_request(self, request_id: str) -> bool:
         """Abort an in-flight streaming request.
 
-        No-op for backends without request lifecycle management (e.g. native
-        PyTorch).  vLLM backends override this to cancel engine-side requests.
+        No-op for native PyTorch backends, which have no request lifecycle
+        outside of the wrapper's own state machine.
         """
         return False

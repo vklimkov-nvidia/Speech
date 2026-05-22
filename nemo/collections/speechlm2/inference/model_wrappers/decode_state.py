@@ -104,6 +104,11 @@ class StreamingDecodeState:
 
     Holds KV caches, token workspaces, perception cache, and codec state
     that persist across inference steps within a single stream.
+
+    The ``llm_cache`` / ``tts_*`` / ``input_embeds_history`` fields are only
+    used by the native engine; the ``vllm_omni`` engine drives stage 0
+    (NemotronDuplexH) + stage 1 (EarTTS) through ``omni_session`` instead and
+    leaves those fields unused.
     """
 
     frame_idx: int
@@ -118,6 +123,10 @@ class StreamingDecodeState:
     tts_codec_cache: Any = None
     llm_cache_position_offset: int = 0
     timing: TimingSummary | NullTimingSummary = field(default_factory=NullTimingSummary)
+    # vllm_omni engine only: per-stream streaming session that bridges the
+    # NemotronDuplexH -> EarTTS AsyncOmni pipeline into the wrapper's
+    # synchronous per-frame loop.
+    omni_session: Any = None
 
 
 @dataclass
