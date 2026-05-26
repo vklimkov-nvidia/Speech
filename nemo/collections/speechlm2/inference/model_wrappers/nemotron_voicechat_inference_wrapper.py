@@ -566,6 +566,22 @@ class NemotronVoicechatInferenceWrapper:
 
         nemotron_dir = os.path.join(self.omni_wrapper_dir, "nemotron")
         t_prefill = compute_prefill_len(nemotron_dir, system_prompt or "")
+
+        # Mirror the native engine's text-sampling contract so the same
+        # `s2s.top_p / repetition_penalty / temperature` config produces
+        # equivalent decoding behavior on both backends:
+        #   * forward all three values to vLLM (vLLM's SamplingParams supports
+        #     repetition_penalty natively; the old wrapper silently dropped it),
+        #   * honor the documented "all 1.0 -> greedy" short-circuit in
+        #     `_sample_text_token` (see s2s_streaming.yaml). At temperature=1.0
+        #     vLLM would sample from the unnormalized softmax, which diverges
+        #     from native's argmax in that no-op-sampling regime.
+        top_p = float(self.top_p)
+        repetition_penalty = float(self.repetition_penalty)
+        temperature = float(self.temperature)
+        if top_p >= 1.0 and repetition_penalty == 1.0 and temperature in (0.0, 1.0):
+            temperature = 0.0
+
         state.omni_session = OmniStreamingSession(
             self.omni_runtime,
             request_id=request_id,
@@ -574,8 +590,9 @@ class NemotronVoicechatInferenceWrapper:
             t_prefill=t_prefill,
             max_decode_steps=int(max_len),
             sampling_params={
-                "temperature": float(self.temperature),
-                "top_p": float(self.top_p),
+                "temperature": temperature,
+                "top_p": top_p,
+                "repetition_penalty": repetition_penalty,
             },
             step_timeout=float((self.vllm_omni_config or {}).get("step_timeout", 60.0)),
         )

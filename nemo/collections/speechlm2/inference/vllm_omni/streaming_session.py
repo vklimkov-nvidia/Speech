@@ -423,9 +423,18 @@ class OmniStreamingSession:
             from vllm.engine.protocol import StreamingInput
             from vllm.sampling_params import RequestOutputKind
 
+            # Stage 0 (NemotronDuplexH) drives the text token; mirror the
+            # native engine's text-sampling knobs (top_p / temperature /
+            # repetition_penalty). Defaults match the native "no sampling"
+            # state: temperature=0.0 (greedy), top_p=1.0, repetition_penalty=1.0.
+            # Note: vLLM applies repetition_penalty uniformly across the
+            # vocabulary, while native excludes special tokens (pad/eos/bos)
+            # from the penalty. Behavior is identical when repetition_penalty
+            # is 1.0; small divergences may appear otherwise.
             stage0_params = SamplingParams(
                 temperature=float(self._sampling_overrides.get("temperature", 0.0)),
                 top_p=float(self._sampling_overrides.get("top_p", 1.0)),
+                repetition_penalty=float(self._sampling_overrides.get("repetition_penalty", 1.0)),
                 max_tokens=1,
                 detokenize=False,
                 ignore_eos=True,

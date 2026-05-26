@@ -235,8 +235,8 @@ def convert_to_vllm_format(outdir: str, config: str, model_path: str, precompute
 
     # save config.json
     flat_config = {"architectures": ["EarTTSForCausalLM"], "model_type": "eartts"}
-    # not using vocab size of the backbone model
-    flat_config["vocab_size"] = 1
+    # not using vocab size of the backbone model, but need 2 for dummy sampling to work
+    flat_config["vocab_size"] = 2
 
     # Parse backbone config exactly as NeMo does to get all defaults from transformers
     backbone_type = cfg.model.tts_config.get("backbone_type", None)
