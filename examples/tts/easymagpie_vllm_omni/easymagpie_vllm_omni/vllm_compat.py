@@ -713,6 +713,7 @@ def _reset_easy_magpie_runner_state_after_refit(model_runner: Any) -> dict[str, 
 
 _EASYMAGPIE_REFIT_RPC_COMPAT_VERSION = 5
 _EASYMAGPIE_TEXT_ROW_REFIT_RPC_COMPAT_VERSION = 1
+_EASYMAGPIE_RUNTIME_RESET_RPC_COMPAT_VERSION = 1
 
 
 def _install_easy_magpie_refit_rpc_compat() -> None:
@@ -1153,19 +1154,60 @@ def _install_easy_magpie_refit_rpc_compat() -> None:
                     "error": f"{type(exc).__name__}: {exc}",
                 }
 
+        def easymagpie_reset_runtime_state(self):
+            model_runner = getattr(self, "model_runner", None)
+            if model_runner is None:
+                return {
+                    "ok": False,
+                    "runtime_reset_rpc_compat_version": _EASYMAGPIE_RUNTIME_RESET_RPC_COMPAT_VERSION,
+                    "error": "EasyMagpie runtime reset RPC could not find worker.model_runner",
+                }
+            try:
+                runtime_state_reset = _reset_easy_magpie_runner_state_after_refit(model_runner)
+                try:
+                    import torch
+
+                    if torch.cuda.is_available():
+                        torch.cuda.synchronize()
+                except Exception:
+                    pass
+                reset_ok = not runtime_state_reset.get("errors")
+                return {
+                    "ok": bool(reset_ok),
+                    "runtime_state_reset": runtime_state_reset,
+                    "runtime_reset_rpc_compat_version": _EASYMAGPIE_RUNTIME_RESET_RPC_COMPAT_VERSION,
+                    **(
+                        {"error": "EasyMagpie runtime-state reset reported errors"}
+                        if not reset_ok
+                        else {}
+                    ),
+                }
+            except Exception as exc:
+                logger.exception("EasyMagpie runtime-state reset RPC failed")
+                return {
+                    "ok": False,
+                    "runtime_reset_rpc_compat_version": _EASYMAGPIE_RUNTIME_RESET_RPC_COMPAT_VERSION,
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+
         easymagpie_load_weights._easymagpie_refit_rpc_compat = True  # type: ignore[attr-defined]
         easymagpie_load_weights._easymagpie_refit_rpc_compat_version = _EASYMAGPIE_REFIT_RPC_COMPAT_VERSION  # type: ignore[attr-defined]
         easymagpie_load_non_text_weights._easymagpie_refit_rpc_compat = True  # type: ignore[attr-defined]
         easymagpie_load_non_text_weights._easymagpie_refit_rpc_compat_version = _EASYMAGPIE_REFIT_RPC_COMPAT_VERSION  # type: ignore[attr-defined]
         easymagpie_update_text_embedding_rows._easymagpie_text_row_refit_rpc_compat = True  # type: ignore[attr-defined]
         easymagpie_update_text_embedding_rows._easymagpie_text_row_refit_rpc_compat_version = _EASYMAGPIE_TEXT_ROW_REFIT_RPC_COMPAT_VERSION  # type: ignore[attr-defined]
+        easymagpie_reset_runtime_state._easymagpie_runtime_reset_rpc_compat = True  # type: ignore[attr-defined]
+        easymagpie_reset_runtime_state._easymagpie_runtime_reset_rpc_compat_version = _EASYMAGPIE_RUNTIME_RESET_RPC_COMPAT_VERSION  # type: ignore[attr-defined]
         worker_cls.easymagpie_load_weights = easymagpie_load_weights
         worker_cls.easymagpie_load_non_text_weights = easymagpie_load_non_text_weights
         worker_cls.easymagpie_update_text_embedding_rows = easymagpie_update_text_embedding_rows
+        worker_cls.easymagpie_reset_runtime_state = easymagpie_reset_runtime_state
         worker_cls._easymagpie_refit_rpc_compat = True
         worker_cls._easymagpie_refit_rpc_compat_version = _EASYMAGPIE_REFIT_RPC_COMPAT_VERSION
         worker_cls._easymagpie_text_row_refit_rpc_compat = True
         worker_cls._easymagpie_text_row_refit_rpc_compat_version = _EASYMAGPIE_TEXT_ROW_REFIT_RPC_COMPAT_VERSION
+        worker_cls._easymagpie_runtime_reset_rpc_compat = True
+        worker_cls._easymagpie_runtime_reset_rpc_compat_version = _EASYMAGPIE_RUNTIME_RESET_RPC_COMPAT_VERSION
 
 
 def install_easy_magpie_refit_rpc_compat() -> None:

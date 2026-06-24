@@ -19,6 +19,7 @@ import json
 import os
 import subprocess
 import sys
+import types
 from pathlib import Path
 
 
@@ -87,3 +88,45 @@ def test_compat_mode_full_is_not_part_of_review_branch() -> None:
     )
     assert proc.returncode != 0
     assert "not included in the review-friendly EasyMagpie RL branch" in proc.stderr
+
+
+def test_refit_compat_installs_named_runtime_reset_rpc(monkeypatch) -> None:
+    from easymagpie_vllm_omni.vllm_compat import install_easy_magpie_refit_rpc_compat
+
+    class FakeWorker:
+        pass
+
+    worker_module = types.ModuleType("vllm_omni.worker.gpu_ar_worker")
+    worker_module.GPUARWorker = FakeWorker
+    monkeypatch.setitem(sys.modules, "vllm_omni", types.ModuleType("vllm_omni"))
+    monkeypatch.setitem(sys.modules, "vllm_omni.worker", types.ModuleType("vllm_omni.worker"))
+    monkeypatch.setitem(sys.modules, "vllm_omni.worker.gpu_ar_worker", worker_module)
+    monkeypatch.delitem(sys.modules, "vllm_omni.worker.gpu_generation_worker", raising=False)
+
+    install_easy_magpie_refit_rpc_compat()
+
+    worker = FakeWorker()
+    worker.model_runner = types.SimpleNamespace(
+        _easymagpie_active_mamba_request_ids={"req"},
+        _easymagpie_mamba_request_cache_kwargs={"req": {}},
+        _easymagpie_mamba_request_cache_state={"req": {}},
+        _easymagpie_mamba_cache_batch_size=1,
+        requests={"req": object()},
+        encoder_cache={"req": object()},
+        input_batch=None,
+    )
+
+    result = worker.easymagpie_reset_runtime_state()
+
+    assert result["ok"] is True
+    assert result["runtime_reset_rpc_compat_version"] >= 1
+    assert set(result["runtime_state_reset"]["cleared_attrs"]) == {
+        "_easymagpie_active_mamba_request_ids",
+        "_easymagpie_mamba_request_cache_kwargs",
+        "_easymagpie_mamba_request_cache_state",
+        "_easymagpie_mamba_cache_batch_size",
+    }
+    assert result["runtime_state_reset"]["cleared_mappings"] == [
+        {"name": "requests", "size_before": 1},
+        {"name": "encoder_cache", "size_before": 1},
+    ]
