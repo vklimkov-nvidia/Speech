@@ -74,7 +74,6 @@ def test_code_predictor_pads_local_transformer_to_stable_graph_tokens(monkeypatc
     cp._out_codes = torch.zeros(8, cp.num_codebooks, dtype=torch.long)
     cp._out_code_logprobs = torch.zeros(8, cp.num_codebooks, dtype=torch.float32)
     cp._out_code_sampling_logprobs = torch.zeros(8, cp.num_codebooks, dtype=torch.float32)
-    cp.debug_collect_logits = False
     cp.forbidden_mask = torch.zeros(cp.num_tokens_per_codebook, dtype=torch.bool)
     cp._local_transformer_graph_tokens = EasyMagpieCodePredictor._resolve_local_transformer_graph_tokens(8)
     cp.local_transformer_in_projection = nn.Identity()

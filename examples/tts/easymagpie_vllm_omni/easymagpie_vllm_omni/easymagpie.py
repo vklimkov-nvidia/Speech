@@ -335,30 +335,7 @@ class EasyMagpieTTSForConditionalGeneration(
         dtype = vllm_config.model_config.dtype
         # Combined per-token input embedding fed into the backbone.
         self._combined_embeddings = torch.zeros(max_num_tokens, self.embedding_dim, dtype=dtype)
-        self._debug_combined_input_norm = torch.zeros(max_num_tokens, dtype=torch.float32)
-        self._debug_combined_input_vector = torch.zeros(max_num_tokens, self.embedding_dim, dtype=dtype)
-        self._debug_text_emb_norm = torch.zeros(max_num_tokens, dtype=torch.float32)
-        self._debug_phoneme_emb_norm = torch.zeros(max_num_tokens, dtype=torch.float32)
-        self._debug_audio_emb_norm = torch.zeros(max_num_tokens, dtype=torch.float32)
-        self._debug_positions = torch.full((max_num_tokens,), -1, dtype=torch.long)
-        self._debug_input_ids = torch.full((max_num_tokens,), -1, dtype=torch.long)
-        self._debug_decode_dispatch_index = torch.full((max_num_tokens,), -1, dtype=torch.long)
-        self._debug_decode_dispatch_count = torch.full((max_num_tokens,), -1, dtype=torch.long)
-        self._debug_decode_offset = torch.full((max_num_tokens,), -1, dtype=torch.long)
-        self._debug_mamba_num_prefills = torch.full((max_num_tokens,), -1, dtype=torch.long)
-        self._debug_mamba_num_decodes = torch.full((max_num_tokens,), -1, dtype=torch.long)
-        self._debug_mamba_state_indices = torch.full((max_num_tokens,), -1, dtype=torch.long)
-        self._debug_mamba_cache_state_indices = torch.full((max_num_tokens,), -1, dtype=torch.long)
-        self._debug_mamba_exec_state_indices = torch.full((max_num_tokens,), -1, dtype=torch.long)
-        self._debug_attn_num_actual_tokens = torch.full((max_num_tokens,), -1, dtype=torch.long)
-        self._debug_attn_max_query_len = torch.full((max_num_tokens,), -1, dtype=torch.long)
-        self._debug_attn_max_seq_len = torch.full((max_num_tokens,), -1, dtype=torch.long)
-        self._debug_attn_seq_lens = torch.full((max_num_tokens,), -1, dtype=torch.long)
-        self._debug_attn_slot_mapping = torch.full((max_num_tokens,), -1, dtype=torch.long)
-        self._debug_audio_feedback_missing = torch.zeros(max_num_tokens, dtype=torch.long)
-        self._debug_audio_input_code0 = torch.full((max_num_tokens,), -1, dtype=torch.long)
-        self._debug_phoneme_input_valid = torch.full((max_num_tokens,), -1, dtype=torch.long)
-        self._debug_phoneme_input_token0 = torch.full((max_num_tokens,), -1, dtype=torch.long)
+        self._decode_offsets = torch.full((max_num_tokens,), -1, dtype=torch.long)
         # Per-token decode inputs assembled by ``preprocess``.
         self._dec_text_tokens = torch.zeros(max_num_tokens, dtype=torch.long)
         self._dec_text_mask = torch.zeros(max_num_tokens, dtype=torch.long)
@@ -374,9 +351,6 @@ class EasyMagpieTTSForConditionalGeneration(
         self._out_code_logprobs = torch.zeros(max_num_tokens, self.num_codebooks, dtype=torch.float32)
         self._out_code_sampling_logprobs = torch.zeros(max_num_tokens, self.num_codebooks, dtype=torch.float32)
         self._out_frame_logprobs = torch.zeros(max_num_tokens, dtype=torch.float32)
-        self._debug_lt_top_ids = torch.full((max_num_tokens, self.num_codebooks, 5), -1, dtype=torch.long)
-        self._debug_lt_top_values = torch.zeros(max_num_tokens, self.num_codebooks, 5, dtype=torch.float32)
-        self._debug_outputs_enabled = False
         self._last_output_row_indices: Optional[torch.Tensor] = None
 
         # ── Audio-EOS → engine stop ─────────────────────────────────────
@@ -657,211 +631,6 @@ class EasyMagpieTTSForConditionalGeneration(
         elif value is not None:
             yield value
 
-    @staticmethod
-    def _metadata_int(metadata: Any, *names: str) -> Optional[int]:
-        for name in names:
-            value = getattr(metadata, name, None)
-            if value is None:
-                continue
-            if isinstance(value, torch.Tensor):
-                if value.numel() == 0:
-                    continue
-                return int(value.detach().reshape(-1)[0].item())
-            try:
-                return int(value)
-            except Exception:
-                continue
-        return None
-
-    @staticmethod
-    def _metadata_tensor(metadata: Any, *names: str) -> Optional[torch.Tensor]:
-        for name in names:
-            value = getattr(metadata, name, None)
-            if isinstance(value, torch.Tensor) and value.numel() > 0:
-                return value.detach().reshape(-1).to(dtype=torch.long)
-        return None
-
-    @staticmethod
-    def _metadata_list_tensor(metadata: Any, *names: str, device: torch.device) -> Optional[torch.Tensor]:
-        tensor = EasyMagpieTTSForConditionalGeneration._metadata_tensor(metadata, *names)
-        if tensor is not None:
-            return tensor.to(device=device)
-        for name in names:
-            value = getattr(metadata, name, None)
-            if value is None:
-                continue
-            try:
-                items = list(value)
-            except TypeError:
-                continue
-            if items:
-                return torch.tensor([int(item) for item in items], dtype=torch.long, device=device)
-        return None
-
-    def _record_state_indices_debug(
-        self,
-        target: torch.Tensor,
-        state_indices: torch.Tensor,
-        *,
-        num_tokens: int,
-        decode_idx: Optional[torch.Tensor] = None,
-        num_req: int = 0,
-    ) -> None:
-        device = target.device
-        state_indices = state_indices.detach().reshape(-1).to(device=device, dtype=torch.long)
-        if decode_idx is not None and num_req > 0 and state_indices.numel() >= num_req:
-            valid = decode_idx[:num_req].detach().to(device=device, dtype=torch.long).reshape(-1)
-            target[valid].copy_(state_indices[:num_req])
-        else:
-            n = min(num_tokens, int(state_indices.numel()))
-            target[:n].copy_(state_indices[:n])
-
-    def _record_mamba_metadata_debug(
-        self,
-        num_tokens: int,
-        *,
-        decode_idx: Optional[torch.Tensor] = None,
-        num_req: int = 0,
-        mamba_cache_params: Any = None,
-    ) -> None:
-        try:
-            attn_metadata = get_forward_context().attn_metadata
-        except Exception:
-            attn_metadata = None
-
-        metas = list(self._iter_metadata(attn_metadata))
-        mamba_metas = [
-            meta for meta in metas if getattr(meta, "state_indices_tensor", None) is not None
-        ]
-        counter_metas = mamba_metas or metas
-        rows = slice(0, num_tokens)
-
-        for metadata in counter_metas:
-            num_prefills = self._metadata_int(metadata, "num_prefills", "num_prefill_tokens")
-            if num_prefills is not None:
-                self._debug_mamba_num_prefills[rows].fill_(num_prefills)
-                break
-        for metadata in counter_metas:
-            num_decodes = self._metadata_int(metadata, "num_decodes", "num_decode_tokens")
-            if num_decodes is not None:
-                self._debug_mamba_num_decodes[rows].fill_(num_decodes)
-                break
-
-        cache_state_indices = None
-        for name in ("state_indices_tensor_d", "state_indices_tensor", "state_indices_tensor_p"):
-            value = getattr(mamba_cache_params, name, None)
-            if isinstance(value, torch.Tensor) and value.numel() > 0:
-                cache_state_indices = value
-                break
-        if cache_state_indices is not None:
-            self._record_state_indices_debug(
-                self._debug_mamba_cache_state_indices,
-                cache_state_indices,
-                num_tokens=num_tokens,
-                decode_idx=decode_idx,
-                num_req=num_req,
-            )
-
-        exec_state_indices = None
-        for metadata in mamba_metas:
-            exec_state_indices = self._metadata_tensor(metadata, "state_indices_tensor")
-            if exec_state_indices is not None:
-                break
-        if exec_state_indices is None:
-            for metadata in metas:
-                block_table = getattr(metadata, "block_table_tensor", None)
-                if isinstance(block_table, torch.Tensor) and block_table.numel() > 0:
-                    exec_state_indices = block_table[:, 0].detach().reshape(-1).to(dtype=torch.long)
-                    break
-
-        if exec_state_indices is not None:
-            self._record_state_indices_debug(
-                self._debug_mamba_exec_state_indices,
-                exec_state_indices,
-                num_tokens=num_tokens,
-                decode_idx=decode_idx,
-                num_req=num_req,
-            )
-            self._record_state_indices_debug(
-                self._debug_mamba_state_indices,
-                exec_state_indices,
-                num_tokens=num_tokens,
-                decode_idx=decode_idx,
-                num_req=num_req,
-            )
-        elif cache_state_indices is not None:
-            self._record_state_indices_debug(
-                self._debug_mamba_state_indices,
-                cache_state_indices,
-                num_tokens=num_tokens,
-                decode_idx=decode_idx,
-                num_req=num_req,
-            )
-
-    def _record_debug_forward_metadata(
-        self,
-        *,
-        input_ids: torch.Tensor,
-        positions: torch.Tensor,
-        decode_idx: Optional[torch.Tensor],
-        num_req: int,
-        mamba_cache_params: Any,
-    ) -> None:
-        if not self._debug_outputs_enabled:
-            return
-
-        num_tokens = int(input_ids.shape[0])
-        rows = slice(0, num_tokens)
-        device = self._debug_positions.device
-        self._debug_positions[rows].copy_(positions.detach().to(device=device, dtype=torch.long).reshape(-1)[:num_tokens])
-        self._debug_input_ids[rows].copy_(input_ids.detach().to(device=device, dtype=torch.long).reshape(-1)[:num_tokens])
-        self._debug_decode_dispatch_count[rows].fill_(int(num_req))
-        if decode_idx is None:
-            self._debug_decode_dispatch_index[rows].copy_(torch.arange(num_tokens, dtype=torch.long, device=device))
-        elif num_req > 0:
-            valid = decode_idx[:num_req].detach().to(device=device, dtype=torch.long).reshape(-1)
-            self._debug_decode_dispatch_index[valid].copy_(valid)
-
-        try:
-            attn_metadata = get_forward_context().attn_metadata
-        except Exception:
-            attn_metadata = None
-        metas = list(self._iter_metadata(attn_metadata))
-        self._record_mamba_metadata_debug(
-            num_tokens,
-            decode_idx=decode_idx,
-            num_req=num_req,
-            mamba_cache_params=mamba_cache_params,
-        )
-        for metadata in metas:
-            num_actual = self._metadata_int(metadata, "num_actual_tokens")
-            if num_actual is not None:
-                self._debug_attn_num_actual_tokens[rows].fill_(num_actual)
-                break
-        for metadata in metas:
-            max_query_len = self._metadata_int(metadata, "max_query_len")
-            if max_query_len is not None:
-                self._debug_attn_max_query_len[rows].fill_(max_query_len)
-                break
-        for metadata in metas:
-            max_seq_len = self._metadata_int(metadata, "max_seq_len", "max_seq_len_q")
-            if max_seq_len is not None:
-                self._debug_attn_max_seq_len[rows].fill_(max_seq_len)
-                break
-        for metadata in metas:
-            seq_lens = self._metadata_list_tensor(metadata, "seq_lens", "seq_lens_tensor", device=device)
-            if seq_lens is not None:
-                n = min(num_tokens, int(seq_lens.numel()))
-                self._debug_attn_seq_lens[:n].copy_(seq_lens[:n])
-                break
-        for metadata in metas:
-            slot_mapping = self._metadata_tensor(metadata, "slot_mapping")
-            if slot_mapping is not None:
-                slot_mapping = slot_mapping.to(device=device)
-                n = min(num_tokens, int(slot_mapping.numel()))
-                self._debug_attn_slot_mapping[:n].copy_(slot_mapping[:n])
-                break
-
     # ------------------------------------------------------------------
     # forward
     # ------------------------------------------------------------------
@@ -911,12 +680,6 @@ class EasyMagpieTTSForConditionalGeneration(
             valid = decode_idx[:num_req]
             self._assemble_decode_embeddings(combined, valid)
 
-        if self._debug_outputs_enabled:
-            debug_rows = slice(0, num_tokens)
-            self._debug_combined_input_vector[debug_rows].copy_(combined.detach())
-            self._debug_combined_input_norm[debug_rows] = combined.detach().float().norm(dim=-1)
-        self.code_predictor.debug_collect_logits = bool(self._debug_outputs_enabled)
-
         backbone_kwargs = {
             "input_ids": input_ids,
             "positions": positions,
@@ -928,14 +691,6 @@ class EasyMagpieTTSForConditionalGeneration(
             mamba_cache_params = self._current_mamba_cache_params(**kwargs)
             backbone_kwargs["mamba_cache_params"] = mamba_cache_params
 
-        self._record_debug_forward_metadata(
-            input_ids=input_ids,
-            positions=positions,
-            decode_idx=decode_idx,
-            num_req=int(num_req),
-            mamba_cache_params=mamba_cache_params,
-        )
-
         hidden_states = self.backbone(**backbone_kwargs)
 
         # Sample codes (local transformer) only where needed.
@@ -945,9 +700,6 @@ class EasyMagpieTTSForConditionalGeneration(
             self._out_code_logprobs[:num_tokens].copy_(code_logprobs)
             self._out_code_sampling_logprobs[:num_tokens].copy_(sampling_logprobs)
             self._out_frame_logprobs[:num_tokens].copy_(code_logprobs.sum(dim=-1))
-            if self._debug_outputs_enabled:
-                self._debug_lt_top_ids[:num_tokens].copy_(self.code_predictor._debug_top_ids[:num_tokens])
-                self._debug_lt_top_values[:num_tokens].copy_(self.code_predictor._debug_top_values[:num_tokens])
             self._flag_audio_eos(codes, slice(0, num_tokens))
             if self.has_phoneme:
                 self._predict_phonemes(hidden_states, slice(0, num_tokens))
@@ -964,9 +716,6 @@ class EasyMagpieTTSForConditionalGeneration(
             self._out_code_logprobs[valid] = code_logprobs[:num_req]
             self._out_code_sampling_logprobs[valid] = sampling_logprobs[:num_req]
             self._out_frame_logprobs[valid] = code_logprobs[:num_req].sum(dim=-1)
-            if self._debug_outputs_enabled:
-                self._debug_lt_top_ids[valid] = self.code_predictor._debug_top_ids[:num_req]
-                self._debug_lt_top_values[valid] = self.code_predictor._debug_top_values[:num_req]
             self._flag_audio_eos(codes[:num_req], valid)
             if self.has_phoneme:
                 self._predict_phonemes(hidden_states, valid)
@@ -991,7 +740,7 @@ class EasyMagpieTTSForConditionalGeneration(
         eos = (codes == self.audio_eos_id).any(dim=1) & (self._dec_audio_valid[idx] == 1)
         min_content_frames = int(getattr(self, "min_content_audio_frames_before_eos", 0) or 0)
         if min_content_frames > 0:
-            decode_offset = self._debug_decode_offset[idx].to(device=eos.device)
+            decode_offset = self._decode_offsets[idx].to(device=eos.device)
             previous_content_frames = decode_offset - int(self.speech_delay)
             eos = eos & (previous_content_frames >= min_content_frames)
         self._token_stop[idx] = eos
@@ -1010,23 +759,18 @@ class EasyMagpieTTSForConditionalGeneration(
         audio_codes = self._dec_audio_codes[idx]
         audio_emb = self.code_predictor.embed_audio_frame(audio_codes)
         audio_emb = audio_emb * self._dec_audio_valid[idx].unsqueeze(-1).to(audio_emb.dtype)
-        self._debug_audio_emb_norm[idx] = audio_emb.float().norm(dim=-1)
         assembled += audio_emb
 
         # Text: current subword token (gated by validity).
         text_emb = self.text_embedding(self._dec_text_tokens[idx])
         text_emb = text_emb * self._dec_text_mask[idx].unsqueeze(-1).to(text_emb.dtype)
-        self._debug_text_emb_norm[idx] = text_emb.float().norm(dim=-1)
         assembled += text_emb
 
         # Phoneme: previous predicted phoneme (gated by validity).
         if self.has_phoneme:
             phon_emb = self._embed_phoneme(self._dec_phoneme_tokens[idx])
             phon_emb = phon_emb * self._dec_phoneme_valid[idx].unsqueeze(-1).to(phon_emb.dtype)
-            self._debug_phoneme_emb_norm[idx] = phon_emb.float().norm(dim=-1)
             assembled += phon_emb
-        else:
-            self._debug_phoneme_emb_norm[idx].zero_()
         combined[idx] = assembled
 
     @torch.no_grad()
@@ -1118,148 +862,6 @@ class EasyMagpieTTSForConditionalGeneration(
                 0,
                 row_indices.to(self._dec_phoneme_tokens.device),
             ).clone()
-        if self._debug_outputs_enabled:
-            combined = self._combined_embeddings.index_select(
-                0,
-                row_indices.to(self._combined_embeddings.device),
-            ).clone()
-            hidden_debug = hidden[:num_tokens].clone()
-            multimodal_outputs.update(
-                {
-                    "debug_text_mask": self._dec_text_mask.index_select(
-                        0,
-                        row_indices.to(self._dec_text_mask.device),
-                    ).clone(),
-                    "debug_text_tokens": self._dec_text_tokens.index_select(
-                        0,
-                        row_indices.to(self._dec_text_tokens.device),
-                    ).clone(),
-                    "debug_audio_valid": self._dec_audio_valid.index_select(
-                        0,
-                        row_indices.to(self._dec_audio_valid.device),
-                    ).clone(),
-                    "debug_text_emb_norm": self._debug_text_emb_norm.index_select(
-                        0,
-                        row_indices.to(self._debug_text_emb_norm.device),
-                    ).clone(),
-                    "debug_phoneme_emb_norm": self._debug_phoneme_emb_norm.index_select(
-                        0,
-                        row_indices.to(self._debug_phoneme_emb_norm.device),
-                    ).clone(),
-                    "debug_audio_emb_norm": self._debug_audio_emb_norm.index_select(
-                        0,
-                        row_indices.to(self._debug_audio_emb_norm.device),
-                    ).clone(),
-                    "debug_positions": self._debug_positions.index_select(
-                        0,
-                        row_indices.to(self._debug_positions.device),
-                    ).clone(),
-                    "debug_input_ids": self._debug_input_ids.index_select(
-                        0,
-                        row_indices.to(self._debug_input_ids.device),
-                    ).clone(),
-                    "debug_decode_dispatch_index": self._debug_decode_dispatch_index.index_select(
-                        0,
-                        row_indices.to(self._debug_decode_dispatch_index.device),
-                    ).clone(),
-                    "debug_decode_dispatch_count": self._debug_decode_dispatch_count.index_select(
-                        0,
-                        row_indices.to(self._debug_decode_dispatch_count.device),
-                    ).clone(),
-                    "debug_combined_input_norm": self._debug_combined_input_norm.index_select(
-                        0,
-                        row_indices.to(self._debug_combined_input_norm.device),
-                    ).clone(),
-                    "debug_combined_input_vector": self._debug_combined_input_vector.index_select(
-                        0,
-                        row_indices.to(self._debug_combined_input_vector.device),
-                    ).clone(),
-                    "debug_combined_norm": combined.float().norm(dim=-1),
-                    "debug_combined_vector": combined,
-                    "debug_hidden_norm": hidden_debug.float().norm(dim=-1),
-                    "debug_hidden_vector": hidden_debug,
-                    "debug_audio_input_code0": self._debug_audio_input_code0.index_select(
-                        0,
-                        row_indices.to(self._debug_audio_input_code0.device),
-                    ).clone(),
-                    "debug_audio_output_code0": audio_codes[:, 0].clone(),
-                    "debug_decode_offset": self._debug_decode_offset.index_select(
-                        0,
-                        row_indices.to(self._debug_decode_offset.device),
-                    ).clone(),
-                    "debug_audio_feedback_missing": self._debug_audio_feedback_missing.index_select(
-                        0,
-                        row_indices.to(self._debug_audio_feedback_missing.device),
-                    ).clone(),
-                    "debug_phoneme_input_valid": self._debug_phoneme_input_valid.index_select(
-                        0,
-                        row_indices.to(self._debug_phoneme_input_valid.device),
-                    ).clone(),
-                    "debug_phoneme_input_token0": self._debug_phoneme_input_token0.index_select(
-                        0,
-                        row_indices.to(self._debug_phoneme_input_token0.device),
-                    ).clone(),
-                    "debug_mamba_num_prefills": self._debug_mamba_num_prefills.index_select(
-                        0,
-                        row_indices.to(self._debug_mamba_num_prefills.device),
-                    ).clone(),
-                    "debug_mamba_num_decodes": self._debug_mamba_num_decodes.index_select(
-                        0,
-                        row_indices.to(self._debug_mamba_num_decodes.device),
-                    ).clone(),
-                    "debug_mamba_state_indices": self._debug_mamba_state_indices.index_select(
-                        0,
-                        row_indices.to(self._debug_mamba_state_indices.device),
-                    ).clone(),
-                    "debug_mamba_cache_state_indices": self._debug_mamba_cache_state_indices.index_select(
-                        0,
-                        row_indices.to(self._debug_mamba_cache_state_indices.device),
-                    ).clone(),
-                    "debug_mamba_exec_state_indices": self._debug_mamba_exec_state_indices.index_select(
-                        0,
-                        row_indices.to(self._debug_mamba_exec_state_indices.device),
-                    ).clone(),
-                    "debug_attn_num_actual_tokens": self._debug_attn_num_actual_tokens.index_select(
-                        0,
-                        row_indices.to(self._debug_attn_num_actual_tokens.device),
-                    ).clone(),
-                    "debug_attn_max_query_len": self._debug_attn_max_query_len.index_select(
-                        0,
-                        row_indices.to(self._debug_attn_max_query_len.device),
-                    ).clone(),
-                    "debug_attn_max_seq_len": self._debug_attn_max_seq_len.index_select(
-                        0,
-                        row_indices.to(self._debug_attn_max_seq_len.device),
-                    ).clone(),
-                    "debug_attn_seq_lens": self._debug_attn_seq_lens.index_select(
-                        0,
-                        row_indices.to(self._debug_attn_seq_lens.device),
-                    ).clone(),
-                    "debug_attn_slot_mapping": self._debug_attn_slot_mapping.index_select(
-                        0,
-                        row_indices.to(self._debug_attn_slot_mapping.device),
-                    ).clone(),
-                    "debug_lt_top_ids": self._debug_lt_top_ids.index_select(
-                        0,
-                        row_indices.to(self._debug_lt_top_ids.device),
-                    ).clone(),
-                    "debug_lt_top_values": self._debug_lt_top_values.index_select(
-                        0,
-                        row_indices.to(self._debug_lt_top_values.device),
-                    ).clone(),
-                }
-            )
-            if self.has_phoneme:
-                phoneme_indices = row_indices.to(self._dec_phoneme_valid.device)
-                multimodal_outputs.update(
-                    {
-                        "debug_phoneme_valid": self._dec_phoneme_valid.index_select(0, phoneme_indices).clone(),
-                        "debug_phoneme_input_token0": self._dec_phoneme_tokens.index_select(
-                            0,
-                            row_indices.to(self._dec_phoneme_tokens.device),
-                        )[:, 0].clone(),
-                    }
-                )
         multimodal_outputs = {
             name: tensor.contiguous() if isinstance(tensor, torch.Tensor) else tensor
             for name, tensor in multimodal_outputs.items()
@@ -1416,48 +1018,11 @@ class EasyMagpieTTSForConditionalGeneration(
             "_out_code_logprobs",
             "_out_code_sampling_logprobs",
             "_out_frame_logprobs",
-            "_debug_lt_top_ids",
-            "_debug_lt_top_values",
             "_token_stop",
             "_sample_stop",
-            "_debug_combined_input_norm",
-            "_debug_combined_input_vector",
-            "_debug_text_emb_norm",
-            "_debug_phoneme_emb_norm",
-            "_debug_audio_emb_norm",
-            "_debug_combined_pre_norm",
-            "_debug_hidden_norm",
-            "_debug_backbone_last_layer_norm",
-            "_debug_backbone_last_residual_norm",
-            "_debug_final_norm_input_norm",
-            "_debug_final_norm_residual_norm",
-            "_debug_final_norm_output_norm",
-            "_debug_attn_qkv_norm",
-            "_debug_attn_core_norm",
-            "_debug_attn_output_norm",
-            "_debug_audio_feedback_missing",
         )
         minus_one_names = (
-            "_debug_positions",
-            "_debug_input_ids",
-            "_debug_decode_dispatch_index",
-            "_debug_decode_dispatch_count",
-            "_debug_backbone_first_bad_layer",
-            "_debug_backbone_first_bad_residual_layer",
-            "_debug_mamba_num_prefills",
-            "_debug_mamba_num_decodes",
-            "_debug_mamba_state_indices",
-            "_debug_mamba_cache_state_indices",
-            "_debug_mamba_exec_state_indices",
-            "_debug_attn_num_actual_tokens",
-            "_debug_attn_max_query_len",
-            "_debug_attn_max_seq_len",
-            "_debug_attn_seq_lens",
-            "_debug_attn_slot_mapping",
-            "_debug_decode_offset",
-            "_debug_audio_input_code0",
-            "_debug_phoneme_input_valid",
-            "_debug_phoneme_input_token0",
+            "_decode_offsets",
         )
         for name in zero_names:
             value = getattr(self, name, None)
@@ -1531,7 +1096,6 @@ class EasyMagpieTTSForConditionalGeneration(
         # ``additional_information`` and applied to the code predictor here (once,
         # at prefill — they are scalars that persist across decode steps).
         self._maybe_set_lt_sampling_params(info_dict)
-        self._debug_outputs_enabled = bool(info_dict.get("debug_outputs", False))
 
         prefill_embeds = self._build_prefill_embeds(device, info_dict)
 
@@ -1736,9 +1300,7 @@ class EasyMagpieTTSForConditionalGeneration(
         decode_offset = int(info_dict.get("decode_offset", 0) or 0)
         info_update: dict[str, Any] = {"decode_offset": decode_offset + 1}
         self._clear_runtime_rows(start, start + 1)
-        debug_decode_offset = getattr(self, "_debug_decode_offset", None)
-        if isinstance(debug_decode_offset, torch.Tensor):
-            debug_decode_offset[start] = decode_offset
+        self._decode_offsets[start] = decode_offset
 
         # ── Text channel ── (delay 0: one subword per step from step 0). The text
         # stream leads the phoneme/audio streams by their respective delays. Two
@@ -1820,16 +1382,6 @@ class EasyMagpieTTSForConditionalGeneration(
                     self._dec_phoneme_valid[start] = 0
             if phoneme_ended or feed_eos:
                 info_update["phoneme_ended"] = True
-            debug_phoneme_valid = getattr(self, "_debug_phoneme_input_valid", None)
-            if isinstance(debug_phoneme_valid, torch.Tensor):
-                debug_phoneme_valid[start] = int(self._dec_phoneme_valid[start].item())
-            debug_phoneme_token = getattr(self, "_debug_phoneme_input_token0", None)
-            if isinstance(debug_phoneme_token, torch.Tensor):
-                debug_phoneme_token[start] = (
-                    int(self._dec_phoneme_tokens[start, 0].item())
-                    if int(self._dec_phoneme_valid[start].item()) and self._dec_phoneme_tokens.ndim == 2
-                    else -1
-                )
 
         # ── Audio channel ── opens at decode step == ``speech_delay`` (seeded with
         # audio BOS), then feeds back the previous frame's codes. For the leading
@@ -1845,26 +1397,14 @@ class EasyMagpieTTSForConditionalGeneration(
             self._dec_audio_valid[start] = 1
         else:
             last_codes = info_dict.get("last_audio_codes")
-            missing_feedback = True
             if isinstance(last_codes, torch.Tensor) and last_codes.numel() > 0:
                 c = last_codes.to(device=device, dtype=torch.long).reshape(-1)[: self.num_codebooks]
                 self._dec_audio_codes[start, : c.shape[0]].copy_(c)
                 self._dec_audio_valid[start] = 1
-                missing_feedback = False
             else:
                 # Fallback (should not happen once audio has started): seed BOS.
                 self._dec_audio_codes[start].fill_(self.arch.audio_bos_id)
                 self._dec_audio_valid[start] = 1
-            debug_missing = getattr(self, "_debug_audio_feedback_missing", None)
-            if isinstance(debug_missing, torch.Tensor):
-                debug_missing[start] = int(missing_feedback)
-        debug_audio_input = getattr(self, "_debug_audio_input_code0", None)
-        if isinstance(debug_audio_input, torch.Tensor):
-            debug_audio_input[start] = (
-                int(self._dec_audio_codes[start, 0].item())
-                if int(self._dec_audio_valid[start].item())
-                else -1
-            )
 
         inputs_embeds_out = torch.zeros((1, self.embedding_dim), device=device, dtype=self._combined_embeddings.dtype)
         return input_ids, inputs_embeds_out, info_update
@@ -1911,7 +1451,6 @@ class EasyMagpieTTSForConditionalGeneration(
         """Clear mutable generation state after initial load or live refit."""
 
         self.mamba_cache = None
-        self._debug_outputs_enabled = False
         self._last_output_row_indices = None
         for name in (
             "_combined_embeddings",
@@ -1925,15 +1464,14 @@ class EasyMagpieTTSForConditionalGeneration(
             "_out_frame_logprobs",
             "_token_stop",
             "_sample_stop",
-            "_debug_text_emb_norm",
-            "_debug_phoneme_emb_norm",
-            "_debug_audio_emb_norm",
             "_dec_phoneme_tokens",
             "_dec_phoneme_valid",
         ):
             value = getattr(self, name, None)
             if isinstance(value, torch.Tensor):
                 value.zero_()
+        if isinstance(getattr(self, "_decode_offsets", None), torch.Tensor):
+            self._decode_offsets.fill_(-1)
 
     # Checkpoint prefixes (EasyMagpieTTS state dict) → in-model paths.
     # ``decoder.*`` is fed to the vLLM backbone loader separately (it understands

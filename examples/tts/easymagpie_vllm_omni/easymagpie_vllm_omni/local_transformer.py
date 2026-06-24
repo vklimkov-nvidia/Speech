@@ -369,10 +369,6 @@ class EasyMagpieCodePredictor(nn.Module):
         self._out_codes = torch.zeros(max_num_tokens, self.num_codebooks, dtype=torch.long)
         self._out_code_logprobs = torch.zeros(max_num_tokens, self.num_codebooks, dtype=torch.float32)
         self._out_code_sampling_logprobs = torch.zeros(max_num_tokens, self.num_codebooks, dtype=torch.float32)
-        self.debug_collect_logits: bool = False
-        self.debug_logits_top_k: int = 5
-        self._debug_top_ids = torch.full((max_num_tokens, self.num_codebooks, 5), -1, dtype=torch.long)
-        self._debug_top_values = torch.zeros(max_num_tokens, self.num_codebooks, 5, dtype=torch.float32)
         self._max_num_tokens = int(max_num_tokens)
         self._local_transformer_graph_tokens = self._resolve_local_transformer_graph_tokens(max_num_tokens)
 
@@ -481,9 +477,6 @@ class EasyMagpieCodePredictor(nn.Module):
         buf_run.zero_()
         out_logprobs.zero_()
         out_sampling_logprobs.zero_()
-        if self.debug_collect_logits:
-            self._debug_top_ids[:num_tokens].fill_(-1)
-            self._debug_top_values[:num_tokens].zero_()
 
         # Row 0: projected backbone hidden state (the AR "prompt").
         buf[:, 0, :] = self.local_transformer_in_projection(dec_hidden)
@@ -497,14 +490,6 @@ class EasyMagpieCodePredictor(nn.Module):
             hidden = self(buf_run)  # compiled transformer over the stable-shape buffer
             row = self.local_transformer_audio_out_projection(hidden[:num_tokens, k, :])
             logits = self.local_transformer_out_projections[k](row)
-            if self.debug_collect_logits:
-                debug_logits = logits
-                if forbidden is not None:
-                    debug_logits = debug_logits.masked_fill(forbidden, float("-inf"))
-                debug_k = min(int(self.debug_logits_top_k or 5), int(self._debug_top_ids.shape[-1]), int(debug_logits.shape[-1]))
-                vals, ids = torch.topk(debug_logits.detach().float(), k=debug_k, dim=-1)
-                self._debug_top_ids[:num_tokens, k, :debug_k].copy_(ids)
-                self._debug_top_values[:num_tokens, k, :debug_k].copy_(vals)
             code_k, model_lp, sampling_lp = sample_codebook_with_logprobs(
                 logits,
                 temperature=self.temperature,

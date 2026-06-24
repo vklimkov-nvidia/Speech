@@ -116,12 +116,7 @@ def _minimal_model(backbone: torch.nn.Module) -> EasyMagpieTTSForConditionalGene
     model._out_code_logprobs = torch.zeros(max_tokens, num_codebooks)
     model._out_code_sampling_logprobs = torch.zeros(max_tokens, num_codebooks)
     model._out_frame_logprobs = torch.zeros(max_tokens)
-    model._debug_combined_pre_norm = torch.zeros(max_tokens)
-    model._debug_hidden_norm = torch.zeros(max_tokens)
-    model._debug_outputs_enabled = False
-    model._debug_backbone_layers_enabled = False
-    model._debug_backbone_active_tokens = 0
-    model.code_predictor = SimpleNamespace(debug_collect_logits=False)
+    model.code_predictor = SimpleNamespace()
     model._get_decode_idxs = lambda: (torch.empty(0, dtype=torch.long), 0)
     return model
 
