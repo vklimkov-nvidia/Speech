@@ -52,7 +52,22 @@ Example usage:
         --run_evaluation \\
         --num_repeats 3
 """
+
 from __future__ import annotations
+
+import os
+os.environ["NUMBA_DISABLE_CUDA"] = "1"
+
+from pathlib import Path
+import re
+import subprocess
+import sys
+
+import spaces
+import gradio as gr
+from omegaconf import open_dict
+from nemo.collections.tts.models import EasyMagpieTTSModel
+
 
 import argparse
 import json
@@ -567,6 +582,12 @@ def _add_common_args(parser: argparse.ArgumentParser) -> None:
             'Hugging Face model id or local path to the EoU wav2vec2 model directory. '
             'For offline use, download the model locally and pass the directory path here.'
         ),
+    )
+    eval_group.add_argument(
+        '--default_language',
+        type=str,
+        default="en",
+        help='Language config to use when not specified in dataset config'
     )
     eval_group.add_argument('--num_repeats', type=int, default=1)
     eval_group.add_argument('--confidence_level', type=float, default=0.95)

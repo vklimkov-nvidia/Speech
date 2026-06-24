@@ -87,10 +87,12 @@ class EnergyAudioTrimmer(AudioTrimmer):
     def trim_audio(self, audio: np.array, sample_rate: int, audio_id: str = "") -> Tuple[np.array, int, int]:
         if self.volume_norm:
             # Normalize volume so we have a fixed scale relative to the reference amplitude
-            audio = normalize_volume(audio=audio, volume_level=1.0)
+            trim_input = normalize_volume(audio=audio, volume_level=1.0)
+        else:
+            trim_input = audio
 
         speech_frames = librosa.effects._signal_to_frame_nonsilent(
-            audio,
+            trim_input,
             ref=self.ref_amplitude,
             frame_length=self.trim_win_length,
             hop_length=self.trim_hop_length,
@@ -111,7 +113,7 @@ class EnergyAudioTrimmer(AudioTrimmer):
         start_sample, end_sample = pad_sample_indices(
             start_sample=start_sample,
             end_sample=end_sample,
-            max_sample=audio.shape[0],
+            max_sample=trim_input.shape[0],
             sample_rate=sample_rate,
             pad_seconds=self.pad_seconds,
         )

@@ -43,6 +43,24 @@ class Snake(nn.Module):
         return snake(x, self.alpha)
 
 
+class HalfSnake(nn.Module):
+    """
+    """
+
+    def __init__(self, channels: int):
+        super().__init__()
+        self.snake_channels = channels // 2
+        self.snake_act = Snake(self.snake_channels)
+        self.lrelu = torch.nn.LeakyReLU()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        snake_out = self.snake_act(x[:, :self.snake_channels, :])
+        lrelu_out = self.lrelu(x[:, self.snake_channels:, :])
+        out = torch.cat([snake_out, lrelu_out], dim=1)
+        return out
+
+
+
 class Swish(nn.SiLU):
     """
     Swish activation function introduced in 'https://arxiv.org/abs/1710.05941'

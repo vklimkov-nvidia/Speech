@@ -1,0 +1,244 @@
+name: AcousticDecoder
+
+batch_size: 1000
+
+max_epochs: ???
+
+feature_name: ???
+audio_codec_name: null
+audio_codec_path: null
+
+train_ds_type: ???
+train_ds_meta: ???
+val_ds_meta: ???
+log_ds_meta: ???
+
+phoneme_dict_path: ???
+heteronyms_path: ???
+
+log_dir: ???
+
+codebook_num: 7
+codebook_levels: [4, 4, 4, 4, 4, 4]
+codebook_dim: 42
+codebook_size: 4096
+
+semantic_codebook_num: 1
+semantic_codebook_dim: 6
+
+acoustic_codebook_num: 6
+acoustic_codebook_dim: 36
+
+feature_readers:
+  audio_codec:
+    _target_: nemo.collections.tts.parts.preprocessing.features.AudioCodecFeatureReader
+    feature_filename: ${feature_name}
+
+cond_hidden_dim: 384
+cond_filters: 1536
+
+model_hidden_dim: 512
+model_filters: 2048
+
+model:
+  semantic_codebook_num: ${semantic_codebook_num}
+  semantic_codebook_dim: ${semantic_codebook_dim}
+  acoustic_codebook_num: ${acoustic_codebook_num}
+  acoustic_codebook_dim: ${acoustic_codebook_dim}
+
+  vector_quantizer:
+    _target_: nemo.collections.tts.modules.audio_codec_modules.GroupFiniteScalarQuantizer
+    num_groups: ${codebook_num}
+    num_levels_per_group: ${codebook_levels}
+
+  text_tokenizer:
+    _target_: nemo.collections.common.tokenizers.text_to_speech.tts_tokenizers.IPATokenizer
+    punct: false
+    apostrophe: false
+    pad_with_space: true
+    skip_oov: true
+    add_boundaries: false
+    g2p:
+      _target_: nemo.collections.tts.g2p.models.i18n_ipa.IpaG2p
+      phoneme_dict: ${phoneme_dict_path}
+      heteronyms: ${heteronyms_path}
+      phoneme_probability: 0.8
+      use_chars: true
+      use_stresses: false
+
+  train_ds:
+    dataset:
+      dataset_type: ${train_ds_type}
+      dataset_args:
+        dataset_meta: ${train_ds_meta}
+        feature_readers: ${feature_readers}
+        batch_duration: ${batch_size}
+        min_words: 2
+        min_duration: 1.0
+        max_duration: 20.1
+
+    dataloader_params:
+      batch_size: 1
+      num_workers: 4
+      persistent_workers: true
+
+  validation_ds:
+    dataset:
+      dataset_type: default
+      dataset_args:
+        dataset_meta: ${val_ds_meta}
+        feature_readers: ${feature_readers}
+        min_words: 2
+        min_duration: 1.0
+        max_duration: 20.1
+
+    dataloader_params:
+      batch_size: 8
+      num_workers: 1
+
+  log_config:
+    log_dir: ${log_dir}
+    log_epochs: [1, 10]
+    epoch_frequency: 20
+    log_tensorboard: false
+    log_wandb: false
+    max_filename_len: 100
+
+    generators:
+      - _target_: nemo.collections.tts.parts.utils.callbacks.AcousticModelWithContextArtifactGenerator
+        audio_codec_name: ${audio_codec_name}
+        audio_codec_path: ${audio_codec_path}
+        log_audio: true
+        log_semantic: false
+
+    dataset:
+      dataset_type: default
+      dataset_args:
+        dataset_meta: ${log_ds_meta}
+        feature_readers: ${feature_readers}
+
+    dataloader_params:
+      batch_size: 8
+      num_workers: 1
+
+  semantic_layer:
+    _target_: nemo.collections.tts.modules.acoustic_model_modules.SemanticInputLayer
+    input_dim: ${semantic_codebook_dim}
+    output_dim: ${model_hidden_dim}
+
+  encoder:
+    _target_: nemo.collections.tts.modules.acoustic_model_transformer_2501.AudioEncoderWithContext
+    transformer:
+      _target_: nemo.collections.tts.modules.transformer_2501.Transformer
+      n_layers: 6
+      d_model: ${model_hidden_dim}
+      d_ffn: ${model_filters}
+      sa_n_heads: 8
+      xa_n_heads: 4
+      xa_d_memory: ${cond_hidden_dim}
+      kernel_size: 3
+      p_dropout: 0.1
+      use_swiglu: true
+      has_xattn: true
+      is_causal: false
+
+  decoder:
+    _target_: nemo.collections.tts.modules.acoustic_model_transformer_2501.AudioDecoderDiffusion
+    d_model: ${model_hidden_dim}
+    num_codebooks: ${acoustic_codebook_num}
+    codebook_size: ${codebook_size}
+    codebook_dim: ${acoustic_codebook_dim}
+    transformer:
+      _target_: nemo.collections.tts.modules.transformer_2501.Transformer
+      n_layers: 4
+      d_model: ${model_hidden_dim}
+      d_ffn: ${model_filters}
+      sa_n_heads: 8
+      kernel_size: 3
+      p_dropout: 0.1
+      use_swiglu: true
+      has_xattn: false
+      is_causal: false
+
+  aligner:
+    _target_: nemo.collections.tts.modules.acoustic_model_modules.Aligner
+    text_emb_dim: 256
+    alignment_encoder:
+      _target_: nemo.collections.tts.modules.aligner.AlignmentEncoder
+      n_mel_channels: ${codebook_dim}
+      n_text_channels: 256
+      dist_type: cosine
+      temperature: 20.0
+      n_att_channels: 128
+      n_mel_filters: 256
+
+  text_encoder:
+    _target_: nemo.collections.tts.modules.acoustic_model_transformer_2501.TextEncoder
+    d_model: ${cond_hidden_dim}
+    transformer:
+      _target_: nemo.collections.tts.modules.transformer_2501.Transformer
+      n_layers: 6
+      d_model: ${cond_hidden_dim}
+      d_ffn: ${cond_filters}
+      sa_n_heads: 8
+      kernel_size: 3
+      p_dropout: 0.1
+      use_swiglu: true
+      has_xattn: false
+      is_causal: false
+
+  context_encoder:
+    _target_: nemo.collections.tts.modules.acoustic_model_transformer_2501.ContextEncoder
+    input_dim: ${codebook_dim}
+    d_model: ${cond_hidden_dim}
+    transformer:
+      _target_: nemo.collections.tts.modules.transformer_2501.Transformer
+      n_layers: 6
+      d_model: ${cond_hidden_dim}
+      d_ffn: ${cond_filters}
+      sa_n_heads: 8
+      kernel_size: 3
+      p_dropout: 0.1
+      use_swiglu: true
+      has_xattn: false
+      is_causal: false
+
+  optim:
+    name: adamw
+    lr: 2e-2
+    betas: [0.9, 0.999]
+    weight_decay: 1e-6
+
+    sched:
+      name: NoamAnnealing
+      warmup_steps: 40000
+      last_epoch: -1
+      d_model: 1  # Disable scaling based on model dim
+
+trainer:
+  num_nodes: 1
+  devices: 1
+  accelerator: gpu
+  strategy: ddp
+  precision: 16
+  max_epochs: ${max_epochs}
+  accumulate_grad_batches: 1
+  gradient_clip_val: 10.0
+  enable_checkpointing: false # Provided by exp_manager
+  logger: false # Provided by exp_manager
+  log_every_n_steps: 1000
+  check_val_every_n_epoch: 1
+  benchmark: false
+  use_distributed_sampler: false
+
+exp_manager:
+  exp_dir: null
+  name: ${name}
+  create_tensorboard_logger: false
+  create_checkpoint_callback: true
+  checkpoint_callback_params:
+    monitor: val_loss
+    always_save_nemo: True
+    save_top_k: 3
+  resume_if_exists: false
+  resume_ignore_no_checkpoint: false

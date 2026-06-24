@@ -232,6 +232,7 @@ class EasyMagpieTTSModel(EasyMagpieTTSInferenceModel):
             codes=pred_audio_codes,
             codes_len=audio_codes_lens_target,
         )
+        pred_audio_codes = torch.clamp_max(pred_audio_codes, max=self.codebook_size - 1)
         pred_audio_codes, pred_audio_codes_lens = self._prepare_codes_for_decode(
             pred_audio_codes, audio_codes_lens_target - 1
         )
@@ -580,7 +581,7 @@ class EasyMagpieTTSModel(EasyMagpieTTSInferenceModel):
         audio_codes_input = audio_codes[:, :, :-1]  # (B, C, T'-1)
 
         # Embed audio tokens
-        audio_embedded = self.embed_audio_tokens(audio_codes_input)  # (B, T'-1, E)
+        audio_embedded = self.embed_audio_tokens(audio_codes_input, num_codebooks=self.num_audio_codebooks_train)  # (B, T'-1, E)
 
         # Create zero tensor for delay padding
         max_delay = delay.max().item()

@@ -143,3 +143,105 @@ class PositionwiseConvFF(torch.nn.Module):
         x = self.non_linearity(self.proj(x.transpose(1, 2), x_mask))
         x = self.dropout(self.o_net(x, x_mask).transpose(1, 2))
         return x
+
+
+class ConvNeXtFF(torch.nn.Module):
+    def __init__(
+        self,
+        d_model: int,
+        d_ffn: int,
+        p_dropout: float,
+        kernel_size: int = 1,
+        is_causal: bool = True,
+    ):
+        """
+        Positionwise Convolutional Feed-Forward layer to replace the MLP layer in transformers.
+
+        Module will take the input with d_model hidden state, project it to d_ffn hidden dimension, perform nonlinear
+        transformation, and project the state back into d_model hidden dimension. Finally, it applied dropout.
+
+        Args:
+            d_model (int): Input and output dimension of the model.
+            d_ffn (int): Hidden dimension of the feed-forward network (usually 4 * d_model).
+            p_dropout (float): Dropout probability.
+            kernel_size (int): Size of the convolving kernel.
+            bias (bool): If True, adds a learnable bias to the convolution layers.
+            is_causal (bool): If True, uses causal convolution.
+            non_linearity (Callable): Activation function to use (default: GELU).
+        """
+        super().__init__()
+        # d_ffn is usually 4*d_model
+        self.d_model = d_model
+        self.swish = torch.nn.SiLU()
+
+        self.conv = ConvolutionLayer(d_model, d_model, kernel_size=kernel_size, is_causal=is_causal)
+        self.layer_norm = torch.nn.LayerNorm(d_model, bias=False)
+        self.proj_1 = torch.nn.Linear(in_features=d_model, out_features=d_ffn)
+        self.proj_2 = torch.nn.Linear(in_features=d_model, out_features=d_ffn)
+        self.o_net = torch.nn.Linear(in_features=d_ffn, out_features=d_model)
+        self.dropout = torch.nn.Dropout(p_dropout)
+
+    def forward(self, x, x_mask):
+        """
+        x (B, T, C)
+        """
+        x = x.transpose(1, 2)
+        x = self.conv(x, x_mask)
+        x = x.transpose(1, 2)
+        x = self.layer_norm(x)
+        x = self.swish(self.proj_1(x)) * self.proj_2(x)
+        x = self.o_net(x)
+        x = self.dropout(x)
+        if x_mask is not None:
+            x = x * x_mask.unsqueeze(2)
+
+        return x
+
+
+class SwiGLUFF(torch.nn.Module):
+    def __init__(
+        self,
+        d_model: int,
+        d_ffn: int,
+        p_dropout: float,
+        kernel_size: int = 1,
+        is_causal: bool = True,
+    ):
+        """
+        Positionwise Convolutional Feed-Forward layer to replace the MLP layer in transformers.
+
+        Module will take the input with d_model hidden state, project it to d_ffn hidden dimension, perform nonlinear
+        transformation, and project the state back into d_model hidden dimension. Finally, it applied dropout.
+
+        Args:
+            d_model (int): Input and output dimension of the model.
+            d_ffn (int): Hidden dimension of the feed-forward network (usually 4 * d_model).
+            p_dropout (float): Dropout probability.
+            kernel_size (int): Size of the convolving kernel.
+            bias (bool): If True, adds a learnable bias to the convolution layers.
+            is_causal (bool): If True, uses causal convolution.
+            non_linearity (Callable): Activation function to use (default: GELU).
+        """
+        super().__init__()
+        # d_ffn is usually 4*d_model
+        self.d_model = d_model
+        self.swish = torch.nn.SiLU()
+
+        self.proj_1 = ConvolutionLayer(d_model, d_ffn, kernel_size=kernel_size, is_causal=is_causal)
+        self.proj_2 = ConvolutionLayer(d_model, d_ffn, kernel_size=kernel_size, is_causal=is_causal)
+        self.o_net = ConvolutionLayer(d_ffn, d_model, kernel_size=kernel_size, is_causal=is_causal)
+        self.dropout = torch.nn.Dropout(p_dropout)
+
+    def forward(self, x, x_mask):
+        """
+        x (B, T, C)
+        """
+        x = x.transpose(1, 2)
+        x = self.swish(self.proj_1(x, x_mask)) * self.proj_2(x, x_mask)
+        x = self.o_net(x, x_mask)
+        x = self.dropout(x)
+        x = x.transpose(1, 2)
+        if x_mask is not None:
+            x = x * x_mask.unsqueeze(2)
+
+        return x

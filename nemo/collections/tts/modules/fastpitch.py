@@ -190,7 +190,7 @@ class FastPitchModule(NeuralModule, adapter_mixins.AdapterModuleMixin):
         # TODO: combine self.speaker_emb with self.speaker_encoder
         # cfg: remove `n_speakers`, create `speaker_encoder.lookup_module`
         # state_dict: move `speaker_emb.weight` to `speaker_encoder.lookup_module.table.weight`
-        if n_speakers > 1 and speaker_encoder is None:
+        if n_speakers >= 1 and speaker_encoder is None:
             self.speaker_emb = torch.nn.Embedding(n_speakers, symbols_embedding_dim)
         else:
             self.speaker_emb = None
@@ -240,7 +240,7 @@ class FastPitchModule(NeuralModule, adapter_mixins.AdapterModuleMixin):
     def output_types(self):
         return {
             "spect": NeuralType(('B', 'D', 'T_spec'), MelSpectrogramType()),
-            "num_frames": NeuralType(('B'), TokenDurationType()),
+            "num_frames": NeuralType(tuple('B'), LengthsType()),
             "durs_predicted": NeuralType(('B', 'T_text'), TokenDurationType()),
             "log_durs_predicted": NeuralType(('B', 'T_text'), TokenLogDurationType()),
             "pitch_predicted": NeuralType(('B', 'T_text'), RegressionValuesType()),

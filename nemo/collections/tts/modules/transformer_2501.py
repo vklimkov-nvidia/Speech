@@ -18,9 +18,9 @@ from typing import Callable, Dict, List, Optional, Tuple, Union
 import torch
 import torch.nn.functional as F
 
-from nemo.collections.tts.modules.ffn_modules import PositionwiseConvFF
+from nemo.collections.tts.modules.transformer import PositionalEmbedding
+from nemo.collections.tts.modules.ffn_modules import ConvNeXtFF, PositionwiseConvFF, SwiGLUFF
 from nemo.collections.tts.modules.moe_modules import PositionwiseConvFFMoE
-from nemo.utils import logging
 
 # TODO: Move the cache implementation out of the Module class, and pass it as part of the forward so we can reset
 # as needed in the inference pipeline.
@@ -58,6 +58,7 @@ class Attention(torch.nn.Module):
         self.o_net = torch.nn.Linear(n_heads * self.d_head, d_model, bias=False)
         self.dropout = torch.nn.Dropout(p_dropout)
         self.use_cache = False
+        self.cache_frames_per_iter = 1
         self.cache = self._init_cache()
 
     @abstractmethod
@@ -81,8 +82,9 @@ class Attention(torch.nn.Module):
             'cross_v': None,
         }
 
-    def reset_cache(self, use_cache: bool = False):
+    def reset_cache(self, use_cache: bool = False, frames_per_iter=1):
         self.use_cache = use_cache
+        self.cache_frames_per_iter = frames_per_iter
         self.cache = self._init_cache()
 
     def attn_naive(
@@ -95,8 +97,8 @@ class Attention(torch.nn.Module):
     ) -> Tuple[torch.Tensor, List[torch.Tensor]]:
         if self.use_cache:
             if self.cache['is_initialized']:
-                query = query[:, -1:, :]
-                query_mask = query_mask[:, -1:] if query_mask is not None else None
+                query = query[:, -self.cache_frames_per_iter:, :]
+                query_mask = query_mask[:, -self.cache_frames_per_iter:] if query_mask is not None else None
             else:
                 self.cache['is_initialized'] = True
 
@@ -116,7 +118,10 @@ class Attention(torch.nn.Module):
             # assumes there's at least one mask
             attn_score.masked_fill_(mask == 0, float('-inf'))
         if self.is_causal:
-            attn_score.masked_fill_(self.causal_mask[..., :T, :T] == 0, float('-inf'))
+            if self.use_cache:
+                attn_score.masked_fill_(self.causal_mask[..., :T, :1] == 0, float('-inf'))
+            else:
+                attn_score.masked_fill_(self.causal_mask[..., :T, :T] == 0, float('-inf'))
 
         # attn_prior or square mask or vanilla attention
         if attn_prior is not None:
@@ -246,8 +251,11 @@ class SelfAttention(Attention):
         if query_mask is not None:
             # query_mask is a boolean mask of shape (B, T)
             # mask should be of shape (B, 1, T, T) where mask[:,0,i,:] == mask[:,0,:,i] == query_mask
-            mask = query_mask.unsqueeze(1) * query_mask.unsqueeze(2)
-            mask = mask.unsqueeze(1)
+            if self.use_cache:
+                mask = query_mask.unsqueeze(1).unsqueeze(3)  # [B, 1, T, 1]
+            else:
+                mask = query_mask.unsqueeze(1) * query_mask.unsqueeze(2)
+                mask = mask.unsqueeze(1)
 
         return q, k, v, mask
 
@@ -337,6 +345,7 @@ class TransformerLayer(torch.nn.Module):
         top_k_experts: int = 2,
         router_jitter_noise: float = 0.0,
         routing_strategy: str = "top_k",
+        ffn_type: str = "default",
     ):
         """
         One layer of the Transformer.
@@ -390,31 +399,52 @@ class TransformerLayer(torch.nn.Module):
             if apply_norm_to_cond:
                 self.norm_xattn_memory = torch.nn.LayerNorm(xa_d_memory, bias=False)
 
-        self.norm_pos_ff = torch.nn.LayerNorm(d_model, bias=False)
-
-        # Use MoE or standard FFN based on configuration
-        if use_moe:
-            self.pos_ff = PositionwiseConvFFMoE(
+        if ffn_type == "default":
+            self.norm_pos_ff = torch.nn.LayerNorm(d_model, bias=False)
+            # Use MoE or standard FFN based on configuration
+            if use_moe:
+                self.pos_ff = PositionwiseConvFFMoE(
+                    d_model=d_model,
+                    d_ffn=d_ffn,
+                    p_dropout=p_dropout,
+                    num_experts=num_experts,
+                    top_k_experts=top_k_experts,
+                    kernel_size=kernel_size,
+                    is_causal=is_causal,
+                    non_linearity=conv_non_linearity,
+                    router_jitter_noise=router_jitter_noise,
+                    routing_strategy=routing_strategy,
+                )
+            else:
+                self.pos_ff = PositionwiseConvFF(
+                    d_model,
+                    d_ffn,
+                    p_dropout,
+                    kernel_size=kernel_size,
+                    is_causal=is_causal,
+                    non_linearity=conv_non_linearity,
+                )
+        elif ffn_type == "convnext":
+            self.norm_pos_ff = torch.nn.Identity()
+            self.pos_ff = ConvNeXtFF(
                 d_model=d_model,
                 d_ffn=d_ffn,
                 p_dropout=p_dropout,
-                num_experts=num_experts,
-                top_k_experts=top_k_experts,
                 kernel_size=kernel_size,
                 is_causal=is_causal,
-                non_linearity=conv_non_linearity,
-                router_jitter_noise=router_jitter_noise,
-                routing_strategy=routing_strategy,
+            )
+        elif ffn_type == "swiglu":
+            self.norm_pos_ff = torch.nn.LayerNorm(d_model, bias=False)
+            self.pos_ff = SwiGLUFF(
+                d_model=d_model,
+                d_ffn=d_ffn,
+                p_dropout=p_dropout,
+                kernel_size=kernel_size,
+                is_causal=is_causal,
             )
         else:
-            self.pos_ff = PositionwiseConvFF(
-                d_model,
-                d_ffn,
-                p_dropout,
-                kernel_size=kernel_size,
-                is_causal=is_causal,
-                non_linearity=conv_non_linearity,
-            )
+            raise ValueError(f"Unknown ffn type {ffn_type}")
+
 
         self.use_cache = False
         self.cache = self._init_cache()
@@ -427,10 +457,10 @@ class TransformerLayer(torch.nn.Module):
             'memory': None,
         }
 
-    def reset_cache(self, use_cache=False):
+    def reset_cache(self, use_cache=False, frames_per_iter=1):
         self.use_cache = use_cache
         self.cache = self._init_cache()
-        self.self_attention.reset_cache(use_cache)
+        self.self_attention.reset_cache(use_cache=use_cache, frames_per_iter=frames_per_iter)
         if self.has_xattn:
             self.cross_attention.reset_cache(use_cache)
 
@@ -530,6 +560,7 @@ class Transformer(torch.nn.Module):
         apply_norm_out: bool = False,
         max_length_causal_mask: int = 4096,
         use_learnable_pos_emb: bool = False,
+        use_static_pos_emb: bool = False,
         conv_non_linearity: Callable = torch.nn.GELU(approximate="tanh"),
         make_prior_window_strict: bool = False,
         # MoE parameters
@@ -538,6 +569,7 @@ class Transformer(torch.nn.Module):
         top_k_experts: int = 2,
         router_jitter_noise: float = 0.0,
         routing_strategy: str = "top_k",
+        ffn_type: str = "default",
     ):
         """
         Initializes a stack of transformer layers. Can be used for both encoder and decoder.
@@ -610,13 +642,19 @@ class Transformer(torch.nn.Module):
                     top_k_experts=top_k_experts,
                     router_jitter_noise=router_jitter_noise,
                     routing_strategy=routing_strategy,
-                )
+                    ffn_type=ffn_type,
+            )
             )
 
         self.use_learnable_pos_emb = use_learnable_pos_emb
-        self.position_embeddings = None
+        self.use_static_pos_emb = use_static_pos_emb
         if self.use_learnable_pos_emb:
             self.position_embeddings = torch.nn.Embedding(max_length_causal_mask, d_model)
+        elif self.use_static_pos_emb:
+            self.position_embeddings = PositionalEmbedding(d_model)
+        else:
+            self.position_embeddings = None
+
         # Apply random uniform init for all layers, except for output layers: The second of the two layers in the MLP
         # and the last linear projection in dot product attention. The output layers are scaled depending on the
         # number of layers
@@ -625,9 +663,9 @@ class Transformer(torch.nn.Module):
             if 'o_net' in name and name.endswith('weight'):
                 torch.nn.init.normal_(param, mean=0.0, std=0.02 / math.sqrt(2 * self.n_layers))
 
-    def reset_cache(self, use_cache=False):
+    def reset_cache(self, use_cache=False, frames_per_iter=1):
         for layer in self.layers:
-            layer.reset_cache(use_cache)
+            layer.reset_cache(use_cache=use_cache, frames_per_iter=frames_per_iter)
 
     @staticmethod
     def _init_weights_gpt2(module):
@@ -704,6 +742,11 @@ class Transformer(torch.nn.Module):
         if self.use_learnable_pos_emb:
             positions = torch.arange(x.size(1), device=x.device).unsqueeze(0)
             x = x + self.position_embeddings(positions)
+            x = x * x_mask.unsqueeze(-1)
+        elif self.use_static_pos_emb:
+            positions = torch.arange(x.size(1), device=x.device).to(dtype=x.dtype)
+            x = x + self.position_embeddings(positions)
+            x = x * x_mask.unsqueeze(-1)
 
         attn_probabilities = []
         # Collect MoE routing information from all layers

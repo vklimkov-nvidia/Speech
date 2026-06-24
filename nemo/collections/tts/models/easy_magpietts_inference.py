@@ -17,6 +17,7 @@ from dataclasses import dataclass, fields
 from functools import partial
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+from einops import rearrange
 import numpy as np
 import soundfile as sf
 import torch
@@ -27,7 +28,8 @@ from transformers import AutoConfig, AutoModelForCausalLM
 
 from nemo.collections.audio.parts.utils.transforms import resample
 from nemo.collections.tts.data.text_to_speech_dataset_lhotse import setup_tokenizers
-from nemo.collections.tts.models import AudioCodecModel
+from nemo.collections.tts.parts.utils.tts_dataset_utils import stack_tensors
+from nemo.collections.tts.models import AcousticModelWithContext, AudioCodecModel, MossAudioCodecModel
 from nemo.collections.tts.modules import transformer_2501
 from nemo.collections.tts.modules.audio_codec_modules import VectorQuantizerIndexConverter
 from nemo.collections.tts.modules.magpietts_modules import (
@@ -137,6 +139,7 @@ class StreamingState:
     phoneme_eos_detected: torch.Tensor
     finished: torch.Tensor
     last_hidden: torch.Tensor
+    all_hidden: torch.Tensor
     text_finished: torch.Tensor
     last_phoneme_tokens: Optional[torch.Tensor]
     last_audio_codes: Optional[torch.Tensor]
@@ -144,6 +147,7 @@ class StreamingState:
     audio_prediction_end_idx: torch.Tensor
     phoneme_prediction_start_idx: torch.Tensor
     phoneme_prediction_end_idx: torch.Tensor
+    raw_texts: List[str]
     gt_phoneme_embeddings: Optional[torch.Tensor] = None  # (B, T', E) pre-computed GT embeddings
     gt_phoneme_lens: Optional[torch.Tensor] = None  # (B,) lengths after stacking
     gt_audio_embeddings: Optional[torch.Tensor] = None  # (B, T', E) pre-computed GT audio embeddings
@@ -217,12 +221,17 @@ class EasyMagpieTTSInferenceModel(ModelPT):
 
         # load codec
         codec_model_path = cfg.get('codecmodel_path')
-        codec_model_cfg = AudioCodecModel.restore_from(codec_model_path, return_config=True)
-        if "use_scl_loss" in codec_model_cfg:
-            codec_model_cfg.use_scl_loss = False
-        codec_model = AudioCodecModel.restore_from(
-            codec_model_path, strict=False, override_config_path=codec_model_cfg
-        )
+        if codec_model_path.startswith('nvidia/'):
+            codec_model = AudioCodecModel.from_pretrained(codec_model_path)
+        elif codec_model_path.startswith('OpenMOSS-Team/'):
+            codec_model = MossAudioCodecModel(model_name=codec_model_path)
+        else:
+            codec_model_cfg = AudioCodecModel.restore_from(codec_model_path, return_config=True)
+            if "use_scl_loss" in codec_model_cfg:
+                codec_model_cfg.use_scl_loss = False
+            codec_model = AudioCodecModel.restore_from(
+                codec_model_path, strict=False, override_config_path=codec_model_cfg
+            )
         self.sample_rate = codec_model.sample_rate
         self.output_sample_rate = codec_model.output_sample_rate
 
@@ -254,6 +263,11 @@ class EasyMagpieTTSInferenceModel(ModelPT):
         self.data_num_audio_codebooks = data_num_audio_codebooks
         self.num_audio_codebooks = num_audio_codebooks
         self.codebook_size = codebook_size
+
+        if 'num_audio_codebooks_train' in cfg:
+            self.num_audio_codebooks_train = cfg.get('num_audio_codebooks_train')
+        else:
+            self.num_audio_codebooks_train = self.num_audio_codebooks
 
         self.codec_model_samples_per_frame = codec_model.samples_per_frame
         # Our codebooks start with actual audio codec tokens, followed by special tokens.
@@ -328,7 +342,7 @@ class EasyMagpieTTSInferenceModel(ModelPT):
         self.default_inference_mode = self.training_modes[0].name
 
         self.frame_stacking_factor = cfg.get('frame_stacking_factor', 1)
-
+        logging.info(f"d100: {cfg.text_tokenizers}")
         self.tokenizer = setup_tokenizers(
             all_tokenizers_config=cfg.text_tokenizers,
             mode='train',
@@ -368,21 +382,61 @@ class EasyMagpieTTSInferenceModel(ModelPT):
         self._codec_model = codec_model
         self._codec_model.freeze()  # Lightning does requires_grad = False and self.eval()
         self._codec_converter = codec_converter
-        self._codec_helper = CodecHelper(self._codec_model, self._codec_converter)
+        self._codec_helper = CodecHelper(
+            codec_model=self._codec_model, codec_converter=self._codec_converter,
+        )
 
-        # Audio embedding dimension - can be smaller than hidden_dim to reduce parameters
-        self.audio_embedding_dim = cfg.get('audio_embedding_dim', cfg.hidden_dim)
-
-        audio_embeddings = []
-        for _ in range(self.num_audio_codebooks * self.frame_stacking_factor):
-            audio_embeddings.append(nn.Embedding(self.num_all_tokens_per_codebook, self.audio_embedding_dim))
-        self.audio_embeddings = nn.ModuleList(audio_embeddings)
-
-        # Projection from audio_embedding_dim to embedding_dim (Identity if same)
-        if self.audio_embedding_dim != cfg.embedding_dim:
-            self.audio_in_projection = nn.Linear(self.audio_embedding_dim, cfg.embedding_dim)
+        if 'acoustic_decoder' in cfg:
+            self.acoustic_decoder = safe_instantiate(cfg.acoustic_decoder)
         else:
-            self.audio_in_projection = nn.Identity()
+            self.acoustic_decoder = None
+
+        # If 'acoustic_model_path' is provided, the acoustic model will be initialized from the provided path.
+        # It will then be registered as a submodule and automatically loaded from the 'acoustic_model' field
+        if cfg.get("acoustic_model"):
+            acoustic_model_cfg = cfg.get("acoustic_model")
+            acoustic_model = AcousticModelWithContext(cfg=acoustic_model_cfg)
+        elif cfg.get("acoustic_model_path"):
+            acoustic_model_path = cfg.get("acoustic_model_path")
+            acoustic_model = AcousticModelWithContext.restore_from(acoustic_model_path)
+        else:
+            acoustic_model = None
+
+        if acoustic_model is not None:
+            acoustic_model.eval()
+            acoustic_model.freeze()
+            self.register_nemo_submodule(name="acoustic_model", config_field="acoustic_model", model=acoustic_model)
+        else:
+            self.acoustic_model = None
+
+        self.cond_type = cfg.get('cond_type', 'embedding')
+        self.audio_embedding_dim = cfg.get('audio_embedding_dim', cfg.hidden_dim)
+        if self.cond_type == 'embedding':
+            # Audio embedding dimension - can be smaller than hidden_dim to reduce parameters
+
+            audio_embeddings = []
+            for _ in range(self.num_audio_codebooks * self.frame_stacking_factor):
+                audio_embeddings.append(nn.Embedding(self.num_all_tokens_per_codebook, self.audio_embedding_dim))
+            self.audio_embeddings = nn.ModuleList(audio_embeddings)
+
+            # Projection from audio_embedding_dim to embedding_dim (Identity if same)
+            if self.audio_embedding_dim != cfg.embedding_dim:
+                self.audio_in_projection = nn.Linear(self.audio_embedding_dim, cfg.embedding_dim)
+            else:
+                self.audio_in_projection = nn.Identity()
+        elif self.cond_type == 'projection':
+            single_codebook_dim = cfg.get("single_codebook_dim", 6)
+            context_input_dim = cfg.get("codebook_dim", 42)
+            dec_input_dim = single_codebook_dim * self.num_audio_codebooks_train * self.frame_stacking_factor
+            self.context_code_proj = nn.Linear(context_input_dim, cfg.hidden_dim)
+            self.decoder_code_proj = nn.Linear(dec_input_dim, cfg.hidden_dim)
+            self.audio_bos_emb = torch.nn.Parameter(torch.zeros([1, 1, cfg.hidden_dim]))
+            self.audio_eos_emb = torch.nn.Parameter(torch.zeros([1, 1, cfg.hidden_dim]))
+            self.context_bos_emb = torch.nn.Parameter(torch.zeros([1, 1, cfg.hidden_dim]))
+            self.context_eos_emb = torch.nn.Parameter(torch.zeros([1, 1, cfg.hidden_dim]))
+        else:
+            raise ValueError(f"Unknown conditioning type {self.cond_type}")
+
 
         # Speaker/context encoder for context audio embeddings.
         # This enables keeping the zero-shot conditioning module private at release time.
@@ -534,9 +588,8 @@ class EasyMagpieTTSInferenceModel(ModelPT):
 
         self.final_proj = nn.Linear(
             self.audio_embedding_dim,
-            self.num_audio_codebooks * self.num_all_tokens_per_codebook * self.frame_stacking_factor,
+            self.num_audio_codebooks_train * self.num_all_tokens_per_codebook * self.frame_stacking_factor,
         )
-
         self.local_transformer_type = LocalTransformerType(cfg.get('local_transformer_type', 'none').lower())
         logging.info(f"Local transformer type: {self.local_transformer_type}")
         if self.local_transformer_type != LocalTransformerType.NO_LT:
@@ -643,9 +696,12 @@ class EasyMagpieTTSInferenceModel(ModelPT):
     def setup_validation_data(self, val_data_config=None):
         pass
 
-    def _prepare_codes_for_decode(self, codes, codes_len, min_len=4):
+    def _prepare_codes_for_decode(self, codes, codes_len, min_len=4, num_codebooks=None):
         """Unstack frame-stacked codes and pad short sequences before decoding."""
-        if self.frame_stacking_factor > 1 and codes.size(1) == self.num_audio_codebooks * self.frame_stacking_factor:
+        if not num_codebooks:
+            num_codebooks = self.num_audio_codebooks
+
+        if self.frame_stacking_factor > 1 and codes.size(1) == num_codebooks * self.frame_stacking_factor:
             codes, codes_len = self.unstack_codes(codes, codes_len, self.frame_stacking_factor)
         if min_len > 0 and codes_len.min() < min_len:
             codes = torch.nn.functional.pad(input=codes, pad=(0, min_len - codes_len.min()), value=0)
@@ -653,11 +709,11 @@ class EasyMagpieTTSInferenceModel(ModelPT):
             codes = codes[:, :, : codes_len.max()]
         return codes, codes_len
 
-    def embed_audio_tokens(self, audio_tokens):
+    def embed_audio_tokens(self, audio_tokens, num_codebooks):
         # audio_tokens: (B, C, T')
         # Add and average the embeddings of the audio tokens across the codebooks
         audio_embedding = None
-        for c in range(audio_tokens.size(1)):
+        for c in range(num_codebooks * self.frame_stacking_factor):
             embedding = self.audio_embeddings[c](audio_tokens[:, c, :])
             if audio_embedding is None:
                 audio_embedding = embedding
@@ -667,6 +723,26 @@ class EasyMagpieTTSInferenceModel(ModelPT):
         # Project from audio_embedding_dim to embedding_dim
         audio_embedding = self.audio_in_projection(audio_embedding)
         return audio_embedding
+
+    def embed_audio_tokens_with_projection(self, audio_tokens, audio_tokens_lens, num_codebooks, projection):
+        audio_tokens_rearrange = audio_tokens[:, :num_codebooks, :]
+        audio_tokens_rearrange = rearrange(audio_tokens_rearrange, 'B C T -> C B T')
+        # [B, D, T]
+        audio_codes = self._codec_model.vector_quantizer.decode(indices=audio_tokens_rearrange, input_len=audio_tokens_lens)
+        audio_codes = rearrange(audio_codes, 'B D T -> B T D')
+        audio_codes = projection(audio_codes)
+
+        audio_codes = torch.where(torch.any(audio_tokens == self.audio_bos_id, dim=1).unsqueeze(2), self.audio_bos_emb, audio_codes)
+        audio_codes = torch.where(torch.any(audio_tokens == self.audio_eos_id, dim=1).unsqueeze(2), self.audio_eos_emb, audio_codes)
+        audio_codes = torch.where(
+            torch.any(audio_tokens == self.context_audio_bos_id, dim=1).unsqueeze(2), self.context_bos_emb, audio_codes
+        )
+        audio_codes = torch.where(
+            torch.any(audio_tokens == self.context_audio_eos_id, dim=1).unsqueeze(2), self.context_eos_emb, audio_codes
+        )
+        mask = get_mask_from_lengths(audio_tokens_lens)
+        audio_codes = audio_codes * mask.unsqueeze(2)
+        return audio_codes
 
     def embed_text_tokens(
         self,
@@ -739,7 +815,7 @@ class EasyMagpieTTSInferenceModel(ModelPT):
         # all_code_logits: (B, T', num_codebooks * num_tokens_per_codebook)
         # audio_codes_lens: (B,)
         all_preds = []
-        for idx in range(self.num_audio_codebooks * self.frame_stacking_factor):
+        for idx in range(self.num_audio_codebooks_train * self.frame_stacking_factor):
             si = idx * self.num_all_tokens_per_codebook
             ei = si + self.num_all_tokens_per_codebook
             codebook_logits = all_code_logits[:, :, si:ei]
@@ -759,7 +835,7 @@ class EasyMagpieTTSInferenceModel(ModelPT):
     ):
         # all_code_logits_t: (B, num_codebooks * num_tokens_per_codebook), logits at a given timestep
         all_preds = []
-        for idx in range(self.num_audio_codebooks * self.frame_stacking_factor):
+        for idx in range(self.num_audio_codebooks_train * self.frame_stacking_factor):
             si = idx * self.num_all_tokens_per_codebook
             ei = si + self.num_all_tokens_per_codebook
             codebook_logits = all_code_logits_t[:, si:ei]  # (B, num_tokens_per_codebook)
@@ -885,6 +961,7 @@ class EasyMagpieTTSInferenceModel(ModelPT):
         context_audio_codes_lens: Optional[torch.Tensor] = None,
         context_audio: Optional[torch.Tensor] = None,
         context_audio_lens: Optional[torch.Tensor] = None,
+        context_sample_rate: int = None,
         training_mode: Optional[TrainingMode] = None,
         dropout_conditional_input: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -928,7 +1005,7 @@ class EasyMagpieTTSInferenceModel(ModelPT):
             if context_audio is None:
                 raise ValueError("Either context_audio_codes or context_audio must be provided")
             context_audio_codes, context_audio_codes_lens = self._codec_helper.audio_to_codes(
-                context_audio, context_audio_lens
+                context_audio, context_audio_lens, sample_rate=context_sample_rate
             )
 
         if self._codec_converter is not None:
@@ -951,7 +1028,13 @@ class EasyMagpieTTSInferenceModel(ModelPT):
             self.frame_stacking_factor,
             self.num_audio_codebooks,
         )
-        context_audio_embedded = self.embed_audio_tokens(context_audio_codes)  # (B, T', E)
+        if self.cond_type == "embedding":
+            context_audio_embedded = self.embed_audio_tokens(context_audio_codes, num_codebooks=self.num_audio_codebooks)  # (B, T', E)
+        else:
+            context_audio_embedded = self.embed_audio_tokens_with_projection(
+                context_audio_codes, context_audio_codes_lens, self.num_audio_codebooks, self.context_code_proj
+            )
+
         batch_size = context_audio_embedded.size(0)
 
         if self.use_speaker_encoder:
@@ -1171,6 +1254,7 @@ class EasyMagpieTTSInferenceModel(ModelPT):
         gt_audio_codes: Optional[torch.Tensor] = None,
         gt_audio_codes_lens: Optional[torch.Tensor] = None,
         use_inference_mode: bool = True,
+        raw_texts: Optional[List[str]] = None,
     ) -> StreamingState:
         """
         Initialize streaming TTS inference state.
@@ -1296,7 +1380,12 @@ class EasyMagpieTTSInferenceModel(ModelPT):
             gt_audio_embeddings = None
             gt_audio_lens_state = None
             if gt_audio_codes is not None and gt_audio_codes_lens is not None:
-                gt_audio_embeddings = self.embed_audio_tokens(gt_audio_codes)  # (B, T', E)
+                if self.cond_type == "embedding":
+                    gt_audio_embeddings = self.embed_audio_tokens(gt_audio_codes, num_codebooks=self.num_audio_codebooks_train)  # (B, T', E)
+                else:
+                    gt_audio_embeddings = self.embed_audio_tokens_with_projection(
+                        gt_audio_codes, gt_audio_codes_lens, self.num_audio_codebooks_train, self.decoder_code_proj
+                    )
                 gt_audio_lens_state = gt_audio_codes_lens
 
             # Initialize static config and mutable streaming state
@@ -1333,6 +1422,7 @@ class EasyMagpieTTSInferenceModel(ModelPT):
                 phoneme_eos_detected=torch.zeros(batch_size, dtype=torch.bool, device=device),
                 finished=torch.zeros(batch_size, dtype=torch.bool, device=device),
                 last_hidden=last_hidden,
+                all_hidden=last_hidden,
                 text_finished=torch.zeros(batch_size, dtype=torch.bool, device=device),
                 last_phoneme_tokens=None,
                 last_audio_codes=None,
@@ -1344,6 +1434,7 @@ class EasyMagpieTTSInferenceModel(ModelPT):
                 gt_phoneme_lens=gt_phoneme_lens,
                 gt_audio_embeddings=gt_audio_embeddings,
                 gt_audio_lens=gt_audio_lens_state,
+                raw_texts=raw_texts,
             )
 
             return state
@@ -1398,6 +1489,7 @@ class EasyMagpieTTSInferenceModel(ModelPT):
             )
 
             state.last_hidden = transformer_out.last_hidden_state
+            state.all_hidden = torch.cat([state.all_hidden, transformer_out.last_hidden_state], dim=1)
             state.past_key_values = transformer_out.past_key_values
             state.cache_seq_len += 1
 
@@ -1530,16 +1622,32 @@ class EasyMagpieTTSInferenceModel(ModelPT):
 
                 if first_audio_step.any():
                     audio_bos = torch.full(
-                        (batch_size, self.num_audio_codebooks * self.frame_stacking_factor, 1),
+                        (batch_size, self.num_audio_codebooks_train * self.frame_stacking_factor, 1),
                         self.audio_bos_id,
                         device=device,
                     ).long()
-                    audio_bos_emb = self.embed_audio_tokens(audio_bos)  # (B, 1, E)
+
+                    if self.cond_type == "embedding":
+                        audio_bos_emb = self.embed_audio_tokens(audio_bos, num_codebooks=self.num_audio_codebooks_train)  # (B, 1, E)
+
+                    else:
+                        audio_bos_len = torch.ones([batch_size], device=audio_bos.device)
+                        audio_bos_emb = self.embed_audio_tokens_with_projection(
+                            audio_bos, audio_bos_len, self.num_audio_codebooks_train, self.decoder_code_proj
+                        )
+
                     first_mask = first_audio_step.view(batch_size, 1, 1).float()
                     audio_emb = audio_emb + audio_bos_emb * first_mask
 
                 if has_last_audio.any() and state.last_audio_codes is not None:
-                    last_audio_emb = self.embed_audio_tokens(state.last_audio_codes.unsqueeze(2))  # (B, 1, E)
+                    if self.cond_type == "embedding":
+                        last_audio_emb = self.embed_audio_tokens(state.last_audio_codes.unsqueeze(2), num_codebooks=self.num_audio_codebooks_train)  # (B, 1, E)
+
+                    else:
+                        audio_eos_len = torch.ones([batch_size], device=state.last_audio_codes.device)
+                        last_audio_emb = self.embed_audio_tokens_with_projection(
+                            state.last_audio_codes.unsqueeze(2), audio_eos_len, self.num_audio_codebooks_train, self.decoder_code_proj
+                        )
                     last_mask = has_last_audio.view(batch_size, 1, 1).float()
                     audio_emb = audio_emb + last_audio_emb * last_mask
 
@@ -1639,7 +1747,7 @@ class EasyMagpieTTSInferenceModel(ModelPT):
             audio_codes_next_stacked, all_codes_next_argmax = self._predict_audio_codes(state)  # (B, C*S)
 
             S = self.frame_stacking_factor
-            C = self.num_audio_codebooks
+            C = self.num_audio_codebooks_train
             audio_codes_unstacked = audio_codes_next_stacked.view(batch_size, C, S)  # (B, C, S)
 
             if state.last_audio_codes is None:
@@ -1800,7 +1908,7 @@ class EasyMagpieTTSInferenceModel(ModelPT):
             return StreamingFinalizeOutput(
                 audio=torch.zeros(batch_size, 0, device=device),
                 audio_len=torch.zeros(batch_size, dtype=torch.long, device=device),
-                audio_codes=torch.zeros(batch_size, self.num_audio_codebooks, 0, device=device),
+                audio_codes=torch.zeros(batch_size, self.num_audio_codebooks_train, 0, device=device),
                 audio_codes_len=torch.zeros(batch_size, dtype=torch.long, device=device),
                 phoneme_tokens=phoneme_tokens_list,
                 phoneme_text=phoneme_text_list,
@@ -1811,7 +1919,8 @@ class EasyMagpieTTSInferenceModel(ModelPT):
             # Concatenate all predictions - each is (B, C, S), concat gives (B, C, T_total_frames)
             all_codes = torch.cat(state.all_predictions, dim=-1)  # (B, C, T_total_frames)
             total_frames = all_codes.size(-1)
-            num_codebooks = all_codes.size(1)
+            #num_codebooks = all_codes.size(1)
+            num_codebooks = self.num_audio_codebooks_train
 
             # Start and end indices are in frames (not steps)
             # If start_idx is -1, item never started audio predictions - use 0
@@ -1850,8 +1959,53 @@ class EasyMagpieTTSInferenceModel(ModelPT):
             # No need to remove EOS - end_indices already point to the frame before EOS
             # Decode to audio (codes are already unstacked: B, C, T)
             predicted_codes, predicted_codes_lens = self._prepare_codes_for_decode(
-                predicted_codes, predicted_codes_lens
+                predicted_codes, predicted_codes_lens, num_codebooks=self.num_audio_codebooks_train
             )
+
+            if self.acoustic_decoder is not None:
+                acoustic_input = torch.zeros(batch_size, max_len, state.all_hidden.size(2), dtype=state.all_hidden.dtype, device=device)
+                for i in range(batch_size):
+                    context_len = state.context_lens[i]
+                    codes_len = predicted_codes_lens[i]
+                    acoustic_input[i, :codes_len, :] = state.all_hidden[i, context_len + 5: context_len + codes_len + 5, :]
+
+                predicted_codes = self.acoustic_decoder.infer(
+                    inputs=acoustic_input,
+                    audio_lens=predicted_codes_lens,
+                    semantic_tokens=predicted_codes,
+                    vector_quantizer=self._codec_model.vector_quantizer,
+                )
+
+            if self.acoustic_model is not None:
+                token_list = []
+                token_len_list = []
+                for text_str in state.raw_texts:
+                    tokens = self.acoustic_model.parse(text_str)[0]
+                    token_len = tokens.shape[0]
+                    token_list.append(tokens)
+                    token_len_list.append(token_len)
+                token_lens = torch.tensor(token_len_list, dtype=torch.int32, device=self.acoustic_model.device)
+                token_max_len = int(token_lens.max().item())
+                tokens = stack_tensors(
+                    token_list, max_lens=[token_max_len], pad_value=self.acoustic_model.text_tokenizer.pad
+                ).to(self.acoustic_model.device)
+
+                acoustic_context, acoustic_context_lens = self.acoustic_model.get_context(
+                    audio_tokens=state.context_audio_codes, audio_lens=state.context_audio_codes_lens
+                )
+
+                predicted_codes = self.acoustic_model.infer(
+                    semantic_tokens=predicted_codes,
+                    semantic_lens=predicted_codes_lens,
+                    context=acoustic_context,
+                    context_lens=acoustic_context_lens,
+                    text=tokens,
+                    text_lens=token_lens,
+                    num_audio_iters=10,
+                    audio_topk=1,
+                    audio_temperature=1.0,
+                )
+
             audio, audio_len, decoded_codes = self._codec_helper.codes_to_audio(
                 predicted_codes,
                 predicted_codes_lens,
@@ -1891,6 +2045,7 @@ class EasyMagpieTTSInferenceModel(ModelPT):
             batch: Dictionary containing:
                 - text: Text token IDs (B, L)
                 - text_lens: Lengths (B,)
+                - text_strings: Raw input strings
                 - context_text_tokens: Context text tokens (B, L')
                 - context_text_tokens_lens: Lengths (B,)
                 - context_audio_codes: Context audio codes (B, C, T) OR
@@ -1932,8 +2087,9 @@ class EasyMagpieTTSInferenceModel(ModelPT):
             else:
                 context_audio = batch['context_audio']
                 context_audio_lens = batch['context_audio_lens']
+                context_sample_rate = batch.get('context_sample_rate')
                 context_audio_codes, context_audio_codes_lens = self._codec_helper.audio_to_codes(
-                    context_audio, context_audio_lens
+                    context_audio, context_audio_lens, sample_rate=context_sample_rate,
                 )
 
             # Optional GT phoneme tokens for teacher forcing
@@ -1955,7 +2111,10 @@ class EasyMagpieTTSInferenceModel(ModelPT):
                 elif 'audio' in batch:
                     gt_audio = batch['audio']
                     gt_audio_lens = batch['audio_lens']
-                    gt_audio_codes, gt_audio_codes_lens = self._codec_helper.audio_to_codes(gt_audio, gt_audio_lens)
+                    gt_sample_rate = batch['sample_rate']
+                    gt_audio_codes, gt_audio_codes_lens = self._codec_helper.audio_to_codes(
+                        gt_audio, gt_audio_lens, sample_rate=gt_sample_rate,
+                    )
                 else:
                     raise ValueError("Teacher forcing requires 'audio_codes' or 'audio' in batch")
 
@@ -1981,11 +2140,12 @@ class EasyMagpieTTSInferenceModel(ModelPT):
                 )
 
                 # Input portion: all tokens except the last (teacher forcing shift)
-                gt_audio_codes_for_init = gt_audio_codes_processed[:, :, :-1]
+                gt_audio_codes_for_init = gt_audio_codes_processed[:, :self.num_audio_codebooks_train, :-1]
                 gt_audio_codes_lens_for_init = gt_audio_codes_lens_processed - 1
 
             batch_size = text.size(0)
 
+            raw_texts = batch["raw_texts"]
             # Initialize streaming state
             state = self.streaming_init(
                 context_audio_codes=context_audio_codes,
@@ -2004,6 +2164,7 @@ class EasyMagpieTTSInferenceModel(ModelPT):
                 gt_audio_codes=gt_audio_codes_for_init,
                 gt_audio_codes_lens=gt_audio_codes_lens_for_init,
                 use_inference_mode=use_inference_mode,
+                raw_texts=raw_texts,
             )
 
             time_to_first_prediction = None
@@ -2091,6 +2252,7 @@ class EasyMagpieTTSInferenceModel(ModelPT):
                 phoneme_prediction_start_idx=phoneme_prediction_start_idx_out,
             )
 
+
     @staticmethod
     def _load_audio_for_inference(audio_path: str, target_sample_rate: int) -> torch.Tensor:
         """
@@ -2167,6 +2329,7 @@ class EasyMagpieTTSInferenceModel(ModelPT):
             )
 
         text_tokens = self.tokenizer.encode(transcript, tokenizer_name=main_tokenizer_name) + [self.eos_id]
+        logging.info(f"d101: text_tokens: {text_tokens}")
         text = torch.tensor([text_tokens], dtype=torch.long, device=device)
         text_lens = torch.tensor([len(text_tokens)], dtype=torch.long, device=device)
 
@@ -2175,10 +2338,10 @@ class EasyMagpieTTSInferenceModel(ModelPT):
         context_text_lens = torch.tensor([len(context_text_tokens)], dtype=torch.long, device=device)
 
         if context_audio_file_path is not None and context_audio_file_path.strip() != "":
-            context_audio = self._load_audio_for_inference(context_audio_file_path, self.sample_rate)
+            context_audio = self._load_audio_for_inference(context_audio_file_path, self.output_sample_rate)
             context_audio = self._adjust_audio_to_duration_for_inference(
                 context_audio,
-                self.sample_rate,
+                self.output_sample_rate,
                 context_audio_duration,
                 self.codec_model_samples_per_frame,
             )
@@ -2186,7 +2349,7 @@ class EasyMagpieTTSInferenceModel(ModelPT):
             context_audio_lens = torch.tensor([context_audio.size(1)], dtype=torch.long, device=device)
             with torch.inference_mode():
                 context_audio_codes, context_audio_codes_lens = self._codec_helper.audio_to_codes(
-                    context_audio, context_audio_lens
+                    context_audio, context_audio_lens, sample_rate=self.output_sample_rate,
                 )
         else:
             context_audio_codes = torch.zeros(
@@ -2201,10 +2364,13 @@ class EasyMagpieTTSInferenceModel(ModelPT):
         batch = {
             'text': text,
             'text_lens': text_lens,
+            'raw_texts': [transcript],
             'context_text_tokens': context_text_tensor,
             'context_text_tokens_lens': context_text_lens,
             'context_audio_codes': context_audio_codes,
             'context_audio_codes_lens': context_audio_codes_lens,
+            'sample_rate': self.sample_rate,
+            'context_sample_rate': self.sample_rate,
         }
         phoneme_input_type = 'pred'
         if gt_phoneme_text is not None:

@@ -42,3 +42,4 @@ class GaussianDropout(torch.nn.Module):
         noise = torch.normal(mean=1.0, std=self.stdev, size=inputs.shape, device=inputs.device)
         out = noise * inputs
         return out
+

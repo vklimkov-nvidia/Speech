@@ -22,7 +22,7 @@ from nemo.collections.asr.parts.preprocessing.segment import available_formats a
 from nemo.collections.asr.parts.utils.manifest_utils import read_manifest
 from nemo.collections.tts.parts.preprocessing.feature_processors import FeatureProcessor
 from nemo.collections.tts.parts.utils.tts_dataset_utils import (
-    filter_dataset_by_duration,
+    filter_dataset,
     get_weighted_sampler,
     load_audio,
     resample_batch,
@@ -92,7 +92,7 @@ def preprocess_manifest(
     max_duration: float,
 ):
     entries = read_manifest(dataset.manifest_path)
-    filtered_entries, total_hours, filtered_hours = filter_dataset_by_duration(
+    filtered_entries, total_hours, filtered_hours = filter_dataset(
         entries=entries, min_duration=min_duration, max_duration=max_duration
     )
 

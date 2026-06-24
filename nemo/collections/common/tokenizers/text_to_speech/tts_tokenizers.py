@@ -945,6 +945,8 @@ class IPATokenizer(BaseTokenizer):
         sep='|',  # To be able to distinguish between symbols
         add_blank_at=None,
         pad_with_space=False,
+        skip_oov=True,
+        add_boundaries=False,
     ):
         if not hasattr(g2p, "symbols"):
             logging.error(
@@ -994,6 +996,8 @@ class IPATokenizer(BaseTokenizer):
                 self.punct_list = sorted(list(DEFAULT_PUNCTUATION))
 
             tokens.update(self.punct_list)
+        else:
+            self.punct_list = []
 
         # Sort to ensure that vocab is in the same order every time
         tokens = sorted(list(tokens))
@@ -1006,12 +1010,18 @@ class IPATokenizer(BaseTokenizer):
         if silence is not None:
             self.silence, tokens = len(tokens), tokens + [silence]
 
+        self.add_boundaries = add_boundaries
+        if self.add_boundaries:
+            self.bos, tokens = len(tokens), tokens + ['<bos>']
+            self.eos, tokens = len(tokens), tokens + ['<eos>']
+
         super().__init__(tokens, oov=oov, sep=sep, add_blank_at=add_blank_at)
 
         self.tokens_set = set(self.tokens)  # To save some repeated work when filtering entries
 
         self.punct = punct
         self.pad_with_space = pad_with_space
+        self.skip_oov = skip_oov
 
         self.g2p = g2p
 
@@ -1054,10 +1064,13 @@ class IPATokenizer(BaseTokenizer):
                 # Add punct
                 ps.append(p)
             elif p != space:
-                message = f"Text: [{''.join(g2p_text)}] contains unknown char/phoneme: [{p}]."
-                if raw_text is not None:
-                    message += f"Original text: [{raw_text}]. Symbol will be skipped."
-                logging.warning(message)
+                if self.skip_oov:
+                    message = f"Text: [{''.join(g2p_text)}] contains unknown char/phoneme: [{p}]."
+                    if raw_text is not None:
+                        message += f"Original text: [{raw_text}]. Symbol will be skipped."
+                    logging.debug(message)
+                else:
+                    ps.append(self.OOV)
 
         # Remove trailing spaces
         if ps:
@@ -1066,6 +1079,9 @@ class IPATokenizer(BaseTokenizer):
 
         if self.pad_with_space:
             ps = [space] + ps + [space]
+
+        if self.add_boundaries:
+            ps = [self.tokens[self.bos]] + ps + [self.tokens[self.eos]]
 
         # Token index lookups
         return [self._token2id[p] for p in ps]

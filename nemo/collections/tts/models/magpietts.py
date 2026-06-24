@@ -36,7 +36,7 @@ from nemo.collections.common.data.lhotse import get_lhotse_dataloader_from_confi
 from nemo.collections.tts.data.text_to_speech_dataset_lhotse import MagpieTTSLhotseDataset, setup_tokenizers
 from nemo.collections.tts.losses.aligner_loss import ForwardSumLoss
 from nemo.collections.tts.losses.moe_loss import MoEAuxiliaryLoss, compute_expert_usage
-from nemo.collections.tts.models import AudioCodecModel
+from nemo.collections.tts.models import AudioCodecModel, MossAudioCodecModel
 from nemo.collections.tts.modules import transformer_2501
 from nemo.collections.tts.modules.aligner import AlignmentEncoder
 from nemo.collections.tts.modules.audio_codec_modules import VectorQuantizerIndexConverter
@@ -336,6 +336,8 @@ class MagpieTTSModel(ModelPT):
         codec_model_path = cfg.get('codecmodel_path')
         if codec_model_path.startswith('nvidia/'):
             codec_model = AudioCodecModel.from_pretrained(codec_model_path)
+        elif codec_model_path.startswith('OpenMOSS-Team/'):
+            codec_model = MossAudioCodecModel(model_name=codec_model_path)
         else:
             codec_model_cfg = AudioCodecModel.restore_from(codec_model_path, return_config=True)
             if "use_scl_loss" in codec_model_cfg:
@@ -346,8 +348,10 @@ class MagpieTTSModel(ModelPT):
         self.sample_rate = codec_model.sample_rate
         self.output_sample_rate = codec_model.output_sample_rate
         self.codec_model_samples_per_frame = codec_model.samples_per_frame
+
         # del codec discriminator to free memory
-        del codec_model.discriminator
+        if hasattr(codec_model, 'discriminator'):
+            del codec_model.discriminator
 
         # When using FSQ tokens, the codebook structure can be changed at any time.
         # An FSQ definition can be provided in `vector_quantizer` config to train with a codebook structure
@@ -1438,6 +1442,7 @@ class MagpieTTSModel(ModelPT):
             pred_audio_codes, pred_audio_codes_lens = remove_eos_token(
                 codes=pred_audio_codes, codes_len=audio_codes_lens
             )
+            pred_audio_codes = torch.clamp_max(pred_audio_codes, max=self.codebook_size - 1)
             pred_audio, pred_audio_lens, _ = self._codec_helper.codes_to_audio(pred_audio_codes, pred_audio_codes_lens)
 
             # Decode targets: remove EOS token, then decode to audio

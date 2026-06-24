@@ -18,6 +18,7 @@ import logging
 import os
 import random
 import re
+import string
 import traceback
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
@@ -232,14 +233,28 @@ def logbetabinom(n, a, b, x):
     return logcombinations(n, x) + logbeta(x + a, n - x + b) - logbeta(a, b)
 
 
-def beta_binomial_prior_distribution(phoneme_count: int, mel_count: int, scaling_factor: float = 1.0) -> np.array:
+def beta_binomial_prior_distribution(
+    phoneme_count: int, mel_count: int, scaling_factor: float = 1.0
+) -> np.array:
     x = rearrange(torch.arange(0, phoneme_count), "b -> 1 b")
     y = rearrange(torch.arange(1, mel_count + 1), "b -> b 1")
     a = scaling_factor * y
     b = scaling_factor * (mel_count + 1 - y)
     n = torch.FloatTensor([phoneme_count - 1])
+    prior = logbetabinom(n, a, b, x).exp()
+    return prior
 
-    return logbetabinom(n, a, b, x).exp().numpy()
+
+def beta_binomial_prior_distribution_torch(
+    phoneme_count: int, mel_count: int, scaling_factor: float, device: torch.device
+):
+    x = rearrange(torch.arange(0, phoneme_count, device=device), "b -> 1 b")
+    y = rearrange(torch.arange(1, mel_count + 1, device=device), "b -> b 1")
+    a = scaling_factor * y
+    b = scaling_factor * (mel_count + 1 - y)
+    n = torch.tensor([phoneme_count - 1], device=device)
+    prior = logbetabinom(n, a, b, x).exp()
+    return prior
 
 
 def get_base_dir(paths):
@@ -268,7 +283,12 @@ def get_base_dir(paths):
     return base_dir
 
 
-def filter_dataset_by_duration(entries: List[Dict[str, Any]], min_duration: float, max_duration: float):
+def filter_dataset(
+    entries: List[Dict[str, Any]],
+    min_duration: Optional[float],
+    max_duration: Optional[float],
+    min_words: Optional[int] = None,
+):
     """
     Filter out manifest entries based on duration.
 
@@ -276,6 +296,11 @@ def filter_dataset_by_duration(entries: List[Dict[str, Any]], min_duration: floa
         entries: List of manifest entry dictionaries.
         min_duration: Minimum duration below which entries are removed.
         max_duration: Maximum duration above which entries are removed.
+        min_words: Minimum number of words in input sentence (space delimited).
+        min_text_per_second: Minimum number of input text tokens per second of audio.
+        max_text_per_second: Maximum number of input text tokens per second of audio.
+        remove_oov: Whether to remove text containing out of vocab characters.
+        text_tokenizer: If provided, will tokenize text before applying min_text_per_second and remove_oov filters.
 
     Returns:
         filtered_entries: List of manifest entries after filtering.
@@ -285,11 +310,26 @@ def filter_dataset_by_duration(entries: List[Dict[str, Any]], min_duration: floa
     filtered_entries = []
     total_duration = 0.0
     filtered_duration = 0.0
+
     for entry in entries:
         duration = entry["duration"]
         total_duration += duration
         if (min_duration and duration < min_duration) or (max_duration and duration > max_duration):
             continue
+
+        if min_words:
+            if "normalized_text" in entry:
+                text = entry["normalized_text"].strip()
+                entry["normalized_text"] = text
+            elif "text" in entry:
+                text = entry["text"].strip()
+                entry["text"] = text
+            else:
+                raise ValueError(f"Received min_words but entry has no text field: {entry}")
+
+            num_words = len(text.split(" "))
+            if num_words < min_words:
+                continue
 
         filtered_duration += duration
         filtered_entries.append(entry)
@@ -311,6 +351,7 @@ def get_weighted_sampler(
         batch_size: Batch size to sample.
         world_size: Number of devices being used.
         num_steps: Number of steps to be considered an epoch.
+        world_size: Number of devices being trained on
 
     Returns:
         Pytorch sampler
@@ -322,7 +363,7 @@ def get_weighted_sampler(
 
 
 def _read_audio(
-    audio_filepath: Path, sample_rate: int, offset: float, duration: float, n_retries: int = 5
+    audio_filepath: Path, offset: float, duration: float, sample_rate: Optional[int] = None, n_retries: int = 5
 ) -> AudioSegment:
     # File seeking sometimes fails when reading flac files with libsndfile < 1.0.30.
     # Read audio as int32 to minimize issues, and retry read on a different segment in case of failure.
@@ -362,7 +403,7 @@ def _segment_audio(
 def load_audio(
     manifest_entry: Dict[str, Any],
     audio_dir: Path,
-    sample_rate: int,
+    sample_rate: Optional[int] = None,
     max_duration: Optional[float] = None,
     volume_norm: bool = False,
 ) -> Tuple[np.ndarray, Path, Path]:
@@ -846,6 +887,25 @@ def chunk_text_for_inference(
         tokens_len = tokens_tensor.shape[0]
 
         return [tokens_tensor], [tokens_len], [text]
+
+
+def dropout_pc(text, dropout_rate):
+    if not dropout_rate:
+        return text
+
+    output_text = ""
+    for char in text:
+        if char not in string.punctuation or random.random() > dropout_rate:
+            output_text += char
+        else:
+            output_text += " "
+
+    output_text = " ".join(output_text.split())
+
+    if random.random() < dropout_rate:
+        output_text = output_text.lower()
+
+    return output_text
 
 
 def resample_batch(audio, audio_len, input_sample_rate, output_sample_rate):

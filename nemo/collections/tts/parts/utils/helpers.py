@@ -45,6 +45,7 @@
 import string
 from collections import defaultdict
 from enum import Enum
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import librosa
@@ -55,8 +56,20 @@ from numba import jit, prange
 
 from nemo.collections.tts.parts.utils.tts_dataset_utils import stack_tensors
 from nemo.collections.tts.torch.tts_data_types import DATA_STR2DATA_CLASS, MAIN_DATA_TYPES, WithLens
+from nemo.core.classes import ModelPT
 from nemo.utils import logging
 from nemo.utils.decorators import deprecated
+
+# https://github.com/r9y9/deepvoice3_pytorch/issues/5
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pylab as plt
+
+HAVE_WANDB = True
+try:
+    import wandb
+except ModuleNotFoundError:
+    HAVE_WANDB = False
 
 try:
     from lightning.pytorch.utilities import rank_zero_only
@@ -242,7 +255,7 @@ def mas_width1(log_attn_map):
         opt[i, j] = one
         if log_p[i - 1, j - 1] >= log_p[i - 1, j]:
             j -= 1
-            if j == 0:
+            if j <= 0:
                 opt[1:i, j] = one
                 break
     opt[0, j] = one
@@ -442,13 +455,14 @@ def plot_spectrogram_to_numpy(spectrogram):
     plt.close()
     return data
 
-
-def create_plot(data, x_axis, y_axis, output_filepath=None):
-    import matplotlib.pylab as plt
-
+def create_plot(data, x_axis, y_axis, color_limit=None, output_filepath=None):
     fig, ax = plt.subplots(figsize=(12, 3))
     im = ax.imshow(data, aspect="auto", origin="lower", interpolation="none")
     plt.colorbar(im, ax=ax)
+
+    if color_limit:
+        im.set_clim(color_limit[0], color_limit[1])
+
     plt.xlabel(x_axis)
     plt.ylabel(y_axis)
     plt.tight_layout()
@@ -568,6 +582,78 @@ def plot_expert_usage_heatmap_to_numpy(
     data = save_figure_to_numpy(fig)
     plt.close(fig)
     return data
+
+
+def average_features(features, durs):
+    durs_cums_ends = torch.cumsum(durs, dim=1).long()
+    durs_cums_starts = torch.nn.functional.pad(durs_cums_ends[:, :-1], (1, 0))
+    feature_nonzero_cums = torch.nn.functional.pad(torch.cumsum(features != 0.0, dim=2), (1, 0))
+    feature_cums = torch.nn.functional.pad(torch.cumsum(features, dim=2), (1, 0))
+
+    bs, l = durs_cums_ends.size()
+    n_formants = features.size(1)
+    dcs = durs_cums_starts[:, None, :].expand(bs, n_formants, l)
+    dce = durs_cums_ends[:, None, :].expand(bs, n_formants, l)
+
+    feature_sums = (torch.gather(feature_cums, 2, dce) - torch.gather(feature_cums, 2, dcs)).float()
+    feature_nelems = (torch.gather(feature_nonzero_cums, 2, dce) - torch.gather(feature_nonzero_cums, 2, dcs)).float()
+
+    feature_avg = torch.where(feature_nelems == 0.0, feature_nelems, feature_sums / feature_nelems)
+    return feature_avg
+
+
+# features: [B, D, T_audio]
+# durs: [B, T_text]
+def average_features_with_gradient(features, durs):
+    batch_size = features.size(0)
+    max_audio_len = features.size(2)
+    max_text_len = durs.size(1)
+
+    # [B, T_text, 1]
+    cum_ends = torch.cumsum(durs, dim=1).unsqueeze(2).long()
+    cum_starts = torch.nn.functional.pad(cum_ends[:, :-1, :], (0, 0, 1, 0))
+    # [B, T_text, T_audio]
+    ids = torch.arange(0, max_audio_len, device=durs.device, dtype=durs.dtype).repeat(batch_size, max_text_len, 1)
+    mask = (cum_starts <= ids) & (ids < cum_ends)
+    # [B, 1, T_text, T_audio]
+    mask = mask.unsqueeze(1)
+
+    # [B, D, T_text, T_audio]
+    feature_repeated = features.unsqueeze(2).repeat(1, 1, max_text_len, 1)
+    masked_feats = feature_repeated * mask
+
+    # [B, D, T_text]
+    feature_avg = torch.sum(masked_feats, dim=3) / torch.clamp(durs, min=1).unsqueeze(1)
+    return feature_avg
+
+
+# features: [B, D, T_audio]
+# durs: [B, T_text]
+def average_features_nonzero(features, durs):
+    batch_size = features.size(0)
+    max_audio_len = features.size(2)
+    max_text_len = durs.size(1)
+
+    # [B, T_text, 1]
+    cum_ends = torch.cumsum(durs, dim=1).unsqueeze(2).long()
+    cum_starts = torch.nn.functional.pad(cum_ends[:, :-1, :], (0, 0, 1, 0))
+    # [B, T_text, T_audio]
+    ids = torch.arange(0, max_audio_len, device=durs.device, dtype=durs.dtype).repeat(batch_size, max_text_len, 1)
+    mask = (cum_starts <= ids) & (ids < cum_ends)
+    # [B, 1, T_text, T_audio]
+    mask = mask.unsqueeze(1)
+
+    # [B, D, T_text, T_audio]
+    feature_repeated = features.unsqueeze(2).repeat(1, 1, max_text_len, 1)
+    contains_zero = torch.logical_and(feature_repeated == 0, mask)
+    # [B, 1, T_text, 1]
+    all_nonzero = ~torch.any(contains_zero, dim=3, keepdim=True)
+    # [B, D, T_text, T_audio]
+    masked_feats = feature_repeated * mask * all_nonzero
+
+    # [B, D, T_text]
+    feature_avg = torch.sum(masked_feats, dim=3) / torch.clamp(durs, min=1).unsqueeze(1)
+    return feature_avg
 
 
 def regulate_len(
@@ -963,3 +1049,27 @@ def print_grad_weight_summary(metrics: Dict[str, float], step: int, is_global_ze
 
     summary = "\n".join(lines)
     logging.info(summary)
+
+def load_model(
+    model_type: ModelPT,
+    device: str = "cpu",
+    model_name: Optional[str] = None,
+    checkpoint_path: Optional[Union[Path, str]] = None,
+    strict: bool = True
+):
+    assert (model_name is None and checkpoint_path is not None) or \
+           (model_name is not None and checkpoint_path is None), \
+           f"Must provide exactly one of model_name or checkpoint: ({model_name}, {checkpoint_path})"
+
+    if checkpoint_path:
+        checkpoint_path = str(checkpoint_path)
+
+    if model_name is not None:
+        model = model_type.from_pretrained(model_name, strict=strict)
+    elif checkpoint_path.endswith(".nemo"):
+        model = model_type.restore_from(checkpoint_path, strict=strict)
+    else:
+        model = model_type.load_from_checkpoint(checkpoint_path, strict=strict)
+
+    model = model.to(device).eval()
+    return model

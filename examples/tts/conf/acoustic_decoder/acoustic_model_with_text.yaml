@@ -1,0 +1,199 @@
+name: AcousticModel
+
+batch_size: 1000
+
+max_epochs: ???
+feature_name: ???
+audio_codec_name: null
+audio_codec_path: null
+
+train_ds_type: ???
+train_ds_meta: ???
+val_ds_meta: ???
+log_ds_meta: ???
+
+phoneme_dict_path: ???
+heteronyms_path: ???
+
+log_dir: ???
+
+codebook_num: 4
+codebook_levels: [4, 4, 4, 4, 4, 4]
+codebook_size: 4096
+
+semantic_codebook_num: 1
+semantic_codebook_dim: 6
+
+acoustic_codebook_num: 3
+acoustic_codebook_dim: 18
+
+feature_readers:
+  audio_codec:
+    _target_: nemo.collections.tts.parts.preprocessing.features.AudioCodecFeatureReader
+    feature_filename: ${feature_name}
+
+model_hidden_dim: 512
+model_filters: 2048
+
+model:
+  inference_phoneme_probability: 1.0
+
+  semantic_codebook_num: ${semantic_codebook_num}
+  semantic_codebook_dim: ${semantic_codebook_dim}
+  acoustic_codebook_num: ${acoustic_codebook_num}
+  acoustic_codebook_dim: ${acoustic_codebook_dim}
+
+  vector_quantizer:
+    _target_: nemo.collections.tts.modules.audio_codec_modules.GroupFiniteScalarQuantizer
+    num_groups: ${codebook_num}
+    num_levels_per_group: ${codebook_levels}
+
+  text_tokenizer:
+    _target_: nemo.collections.common.tokenizers.text_to_speech.tts_tokenizers.IPATokenizer
+    punct: false
+    apostrophe: false
+    pad_with_space: true
+    skip_oov: true
+    add_boundaries: false
+    g2p:
+      _target_: nemo.collections.tts.g2p.models.i18n_ipa.IpaG2p
+      phoneme_dict: ${phoneme_dict_path}
+      heteronyms: ${heteronyms_path}
+      phoneme_probability: 0.8
+      use_chars: true
+      use_stresses: false
+
+  train_ds:
+    dataset:
+      dataset_type: ${train_ds_type}
+      dataset_args:
+        dataset_meta: ${train_ds_meta}
+        feature_readers: ${feature_readers}
+        batch_duration: ${batch_size}
+        min_duration: 0.5
+        max_duration: 20.1
+
+    dataloader_params:
+      batch_size: 1
+      num_workers: 4
+      persistent_workers: true
+
+  validation_ds:
+    dataset:
+      dataset_type: default
+      dataset_args:
+        dataset_meta: ${val_ds_meta}
+        feature_readers: ${feature_readers}
+        min_duration: 1.0
+        max_duration: 20.1
+
+    dataloader_params:
+      batch_size: 8
+      num_workers: 1
+
+  log_config:
+    log_dir: ${log_dir}
+    log_epochs: [1, 5]
+    epoch_frequency: 10
+    log_tensorboard: false
+    log_wandb: false
+    max_filename_len: 100
+
+    generators:
+      - _target_: nemo.collections.tts.parts.utils.callbacks.AcousticModelWithTextArtifactGenerator
+        audio_codec_name: ${audio_codec_name}
+        audio_codec_path: ${audio_codec_path}
+        log_audio: true
+        log_semantic: true
+        num_audio_iters: 10
+
+    dataset:
+      dataset_type: default
+      dataset_args:
+        dataset_meta: ${log_ds_meta}
+        feature_readers: ${feature_readers}
+
+    dataloader_params:
+      batch_size: 8
+      num_workers: 1
+
+  semantic_layer:
+    _target_: nemo.collections.tts.modules.acoustic_model_modules.SemanticInputLayer
+    input_dim: ${semantic_codebook_dim}
+    output_dim: ${model_hidden_dim}
+
+  encoder:
+    _target_: nemo.collections.tts.modules.acoustic_model_transformer.AudioEncoderWithText
+    input_dim: ${model_hidden_dim}
+    transformer:
+      _target_: nemo.collections.tts.modules.acoustic_model_transformer.AudioTransformerWithText
+      n_layer: 12
+      n_head_self: 8
+      n_head_text: 1
+      d_model: ${model_hidden_dim}
+      d_inner: ${model_filters}
+      d_head: 64
+      kernel_size: 7
+
+  decoder:
+    _target_: nemo.collections.tts.modules.acoustic_model_modules.AudioDecoder
+    num_codebooks: ${acoustic_codebook_num}
+    codebook_size: ${codebook_size}
+    codebook_dim: ${acoustic_codebook_dim}
+    fft:
+      _target_: nemo.collections.tts.modules.acoustic_model_transformer.AudioTransformer
+      n_layer: 6
+      n_head: 8
+      d_model: ${model_hidden_dim}
+      d_inner: ${model_filters}
+      d_head: 64
+      kernel_size: 7
+
+  text_encoder:
+    _target_: nemo.collections.tts.modules.acoustic_model_transformer.TextEncoder
+    n_layer: 6
+    n_head: 8
+    d_model: ${model_hidden_dim}
+    d_head: 64
+    d_inner: ${model_filters}
+    kernel_size: 7
+
+  optim:
+    name: adamw
+    lr: 2e-2
+    betas: [0.9, 0.999]
+    weight_decay: 1e-6
+
+    sched:
+      name: NoamAnnealing
+      warmup_steps: 40000
+      last_epoch: -1
+      d_model: 1  # Disable scaling based on model dim
+
+trainer:
+  num_nodes: 1
+  devices: 1
+  accelerator: gpu
+  strategy: ddp
+  precision: 16
+  max_epochs: ${max_epochs}
+  accumulate_grad_batches: 1
+  gradient_clip_val: 10.0
+  enable_checkpointing: false # Provided by exp_manager
+  logger: false # Provided by exp_manager
+  log_every_n_steps: 1000
+  check_val_every_n_epoch: 1
+  benchmark: false
+  use_distributed_sampler: false
+
+exp_manager:
+  exp_dir: null
+  name: ${name}
+  create_tensorboard_logger: false
+  create_checkpoint_callback: true
+  checkpoint_callback_params:
+    monitor: val_loss
+    always_save_nemo: True
+    save_top_k: 3
+  resume_if_exists: false
+  resume_ignore_no_checkpoint: false

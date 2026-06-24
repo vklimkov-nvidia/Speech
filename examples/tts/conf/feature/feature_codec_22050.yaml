@@ -1,0 +1,11 @@
+codec_name: "audio_tokens_fps25_dim36"
+
+sample_rate: 22050
+hop_length: 882
+
+feature_readers:
+  audio_codec:
+    _target_: nemo.collections.tts.parts.preprocessing.features.AudioCodecFeatureReader
+    feature_filename: ${codec_name}
+    sample_rate: ${sample_rate}
+    hop_length: ${hop_length}

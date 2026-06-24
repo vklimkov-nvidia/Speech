@@ -17,6 +17,7 @@ from __future__ import annotations
 from enum import Enum
 from typing import Dict, List, Optional
 
+from einops import rearrange
 import numpy as np
 import torch
 from torch import Tensor
@@ -404,6 +405,7 @@ class CodecHelper:
         with torch.no_grad(), torch.autocast(device_type=codes.device.type, dtype=torch.float32):
             if self.codec_converter is not None:
                 codes = self.codec_converter.convert_new_to_original(audio_tokens=codes, audio_lens=codes_len)
+
             audio, audio_len = self.codec_model.decode(tokens=codes, tokens_len=codes_len)
             return audio, audio_len, codes
 
@@ -779,3 +781,126 @@ class LocalTransformerHelper:
         if use_cfg:
             codes = codes[:actual_batch_size]
         return codes
+
+
+class AcousticDecoder(torch.nn.Module):
+    """
+    """
+
+    def __init__(
+        self,
+        input_dim,
+        d_model,
+        decoder,
+        semantic_layer,
+        acoustic_infill_min = 0.1,
+        acoustic_infill_max = 1.0,
+        semantic_mask_min = 0.0,
+        semantic_mask_max = 0.5,
+    ):
+        super(AcousticDecoder, self).__init__()
+
+        self.input_proj = torch.nn.Linear(input_dim, d_model)
+        self.decoder = decoder
+        self.semantic_layer = semantic_layer
+
+        self.acoustic_infill_min = acoustic_infill_min
+        self.acoustic_infill_max = acoustic_infill_max
+
+        self.semantic_mask_min = semantic_mask_min
+        self.semantic_mask_max = semantic_mask_max
+
+        self.infill_dist = torch.distributions.beta.Beta(concentration1=1.0, concentration0=2.0)
+
+
+    def create_infill_mask(self, input_lens, infill_min, infill_max):
+        batch_size = input_lens.shape[0]
+        len_mask = get_mask_from_lengths(input_lens)
+        max_len = len_mask.shape[1]
+
+        infill_percent = self.infill_dist.sample(sample_shape=torch.Size([batch_size])).to(input_lens.device)
+        infill_percent = infill_min + (infill_max - infill_min) * infill_percent
+        infill_len = infill_percent * input_lens.float()
+        infill_rank = torch.clamp_min(infill_len - 1, 0).long()
+        infill_rank = infill_rank.unsqueeze(1)
+
+        # [batch_size, time]
+        infill_vals = torch.rand(size=len_mask.shape, device=input_lens.device)
+        infill_vals = infill_vals * len_mask
+        infill_topk = torch.topk(infill_vals, k=max_len, dim=1, sorted=True).values
+        infill_min_val = torch.gather(infill_topk, index=infill_rank, dim=1)
+        infill_mask = infill_vals >= infill_min_val
+
+        infill_mask = infill_mask * len_mask
+
+        return infill_mask
+
+
+    def forward(self, inputs, audio_lens, semantic_tokens, acoustic_tokens, vector_quantizer):
+        audio_mask = get_mask_from_lengths(audio_lens)
+
+        if self.training:
+            audio_maskin = self.create_infill_mask(
+                input_lens=audio_lens, infill_min=self.acoustic_infill_min, infill_max=self.acoustic_infill_max
+            )
+            semantic_mask = self.create_infill_mask(
+                input_lens=audio_lens, infill_min=self.semantic_mask_min, infill_max=self.semantic_mask_max
+            )
+        else:
+            audio_maskin = None
+            semantic_mask = None
+            
+        semantic_tokens_rearrange = rearrange(semantic_tokens, 'B C T -> C B T')
+        # [batch_size, code_dim, audio_token_len]
+        semantic_codes = vector_quantizer.decode(indices=semantic_tokens_rearrange, input_len=audio_lens)
+        semantic_codes = rearrange(semantic_codes, 'B D T -> B T D')
+        
+        acoustic_tokens_rearrange = rearrange(acoustic_tokens, 'B C T -> C B T')
+        # [batch_size, code_dim, audio_token_len]
+        acoustic_codes = vector_quantizer.decode(indices=acoustic_tokens_rearrange, input_len=audio_lens)
+        acoustic_codes = rearrange(acoustic_codes, 'B D T -> B T D')
+
+        res = self.semantic_layer(
+            semantic_codes=semantic_codes,
+            audio_mask=audio_mask,
+            semantic_mask=semantic_mask
+        )
+        dec_inp = self.input_proj(inputs) + res
+        dec_inp = dec_inp * audio_mask.unsqueeze(2)
+
+        # [batch_size, num_codebook, codebook_size, time]
+        audio_tokens, audio_logits = self.decoder(
+            inputs=dec_inp,
+            audio_mask=audio_mask,
+            audio_codes=acoustic_codes,
+            audio_maskin=audio_maskin,
+        )
+        audio_logits = rearrange(audio_logits, 'B C W T -> B T (C W)')
+
+        return audio_tokens, audio_logits
+
+    def infer(self, inputs, audio_lens, semantic_tokens, vector_quantizer, frames_per_iter=1, use_cache=True):
+        audio_mask = get_mask_from_lengths(audio_lens)
+
+        semantic_tokens_rearrange = rearrange(semantic_tokens, 'B C T -> C B T')
+        # [batch_size, code_dim, audio_token_len]
+        semantic_codes = vector_quantizer.decode(indices=semantic_tokens_rearrange, input_len=audio_lens)
+        semantic_codes = rearrange(semantic_codes, 'B D T -> B T D')
+
+        res = self.semantic_layer(
+            semantic_codes=semantic_codes,
+            audio_mask=audio_mask,
+        )
+        dec_inp = self.input_proj(inputs) + res
+        dec_inp = dec_inp * rearrange(audio_mask, 'B T -> B T 1')
+
+        acoustic_tokens = self.decoder.infer(
+            inputs=dec_inp,
+            audio_lens=audio_lens,
+            frames_per_iter=frames_per_iter,
+            vector_quantizer=vector_quantizer,
+            use_cache=use_cache,
+        )
+        audio_tokens = torch.concat([semantic_tokens, acoustic_tokens], dim=1)
+
+        return audio_tokens
