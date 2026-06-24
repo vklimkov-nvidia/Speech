@@ -184,6 +184,55 @@ def _install_engine_utils_compat() -> None:
         compat_launch_core_engines._easymagpie_compat = True  # type: ignore[attr-defined]
         engine_utils.launch_core_engines = compat_launch_core_engines
 
+def _install_omni_gpu_model_runner_init_kwargs_compat() -> None:
+    """Bridge vLLM-Omni's optional ``num_tokens`` arg across vLLM versions."""
+
+    try:
+        module = importlib.import_module("vllm_omni.worker.gpu_model_runner")
+    except Exception:
+        return
+
+    runner_cls = getattr(module, "OmniGPUModelRunner", None)
+    if runner_cls is None:
+        return
+
+    current = getattr(runner_cls, "_init_model_kwargs", None)
+    if current is None or getattr(current, "_easymagpie_init_model_kwargs_compat", False):
+        return
+
+    def _base_init_model_kwargs(self: Any, num_tokens: int | None = None) -> Any:
+        if num_tokens is None:
+            num_tokens = int(getattr(self, "max_num_tokens", 0) or 0)
+        for base_cls in type(self).__mro__[1:]:
+            base_method = base_cls.__dict__.get("_init_model_kwargs")
+            if base_method is None:
+                continue
+            try:
+                signature = inspect.signature(base_method)
+            except (TypeError, ValueError):
+                return base_method(self, num_tokens)
+            positional = [
+                parameter
+                for parameter in signature.parameters.values()
+                if parameter.kind
+                in {
+                    inspect.Parameter.POSITIONAL_ONLY,
+                    inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                }
+            ]
+            accepts_varargs = any(
+                parameter.kind == inspect.Parameter.VAR_POSITIONAL
+                for parameter in signature.parameters.values()
+            )
+            if accepts_varargs or len(positional) >= 2:
+                return base_method(self, num_tokens)
+            return base_method(self)
+        return {}
+
+    _base_init_model_kwargs._easymagpie_init_model_kwargs_compat = True  # type: ignore[attr-defined]
+    _base_init_model_kwargs._easymagpie_original = current  # type: ignore[attr-defined]
+    runner_cls._init_model_kwargs = _base_init_model_kwargs
+
 def _install_v1_serial_utils_dense_tensor_compat() -> None:
     try:
         import msgspec.msgpack as msgpack
@@ -1218,6 +1267,7 @@ def install_easy_magpie_refit_rpc_compat() -> None:
     _install_vllm_inputs_data_alias()
     _install_vllm_multimodal_inputs_alias()
     _install_engine_utils_compat()
+    _install_omni_gpu_model_runner_init_kwargs_compat()
     _install_easy_magpie_refit_rpc_compat()
     _install_async_omni_client_compat()
 
@@ -1236,6 +1286,7 @@ def install_easy_magpie_runtime_compat() -> None:
     _install_vllm_inputs_data_alias()
     _install_vllm_multimodal_inputs_alias()
     _install_engine_utils_compat()
+    _install_omni_gpu_model_runner_init_kwargs_compat()
     _install_easy_magpie_refit_rpc_compat()
     _install_v1_serial_utils_dense_tensor_compat()
     _install_async_omni_client_compat()

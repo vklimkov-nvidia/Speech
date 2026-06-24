@@ -130,3 +130,63 @@ def test_refit_compat_installs_named_runtime_reset_rpc(monkeypatch) -> None:
         {"name": "requests", "size_before": 1},
         {"name": "encoder_cache", "size_before": 1},
     ]
+
+
+def test_runtime_compat_handles_new_vllm_init_model_kwargs_signature(monkeypatch) -> None:
+    from easymagpie_vllm_omni.vllm_compat import install_easy_magpie_runtime_compat
+
+    class NewParentRunner:
+        def _init_model_kwargs(self):
+            return {"source": "new-vllm"}
+
+    class OmniGPUModelRunner(NewParentRunner):
+        max_num_tokens = 17
+
+        def _init_model_kwargs(self, num_tokens=None):
+            if num_tokens is None:
+                num_tokens = int(getattr(self, "max_num_tokens", 0) or 0)
+            return super()._init_model_kwargs(num_tokens)
+
+    runner_module = types.ModuleType("vllm_omni.worker.gpu_model_runner")
+    runner_module.OmniGPUModelRunner = OmniGPUModelRunner
+    monkeypatch.setitem(sys.modules, "vllm_omni", types.ModuleType("vllm_omni"))
+    monkeypatch.setitem(sys.modules, "vllm_omni.worker", types.ModuleType("vllm_omni.worker"))
+    monkeypatch.setitem(sys.modules, "vllm_omni.worker.gpu_model_runner", runner_module)
+
+    try:
+        OmniGPUModelRunner()._init_model_kwargs()
+    except TypeError as exc:
+        assert "positional argument" in str(exc)
+    else:
+        raise AssertionError("test fixture should reproduce the vLLM 0.21 signature mismatch")
+
+    install_easy_magpie_runtime_compat()
+
+    assert OmniGPUModelRunner()._init_model_kwargs() == {"source": "new-vllm"}
+
+
+def test_runtime_compat_preserves_old_vllm_init_model_kwargs_signature(monkeypatch) -> None:
+    from easymagpie_vllm_omni.vllm_compat import install_easy_magpie_runtime_compat
+
+    class OldParentRunner:
+        def _init_model_kwargs(self, num_tokens=None):
+            return {"source": "old-vllm", "num_tokens": num_tokens}
+
+    class OmniGPUModelRunner(OldParentRunner):
+        max_num_tokens = 19
+
+        def _init_model_kwargs(self, num_tokens=None):
+            if num_tokens is None:
+                num_tokens = int(getattr(self, "max_num_tokens", 0) or 0)
+            return super()._init_model_kwargs(num_tokens)
+
+    runner_module = types.ModuleType("vllm_omni.worker.gpu_model_runner")
+    runner_module.OmniGPUModelRunner = OmniGPUModelRunner
+    monkeypatch.setitem(sys.modules, "vllm_omni", types.ModuleType("vllm_omni"))
+    monkeypatch.setitem(sys.modules, "vllm_omni.worker", types.ModuleType("vllm_omni.worker"))
+    monkeypatch.setitem(sys.modules, "vllm_omni.worker.gpu_model_runner", runner_module)
+
+    install_easy_magpie_runtime_compat()
+
+    assert OmniGPUModelRunner()._init_model_kwargs() == {"source": "old-vllm", "num_tokens": 19}
+    assert OmniGPUModelRunner()._init_model_kwargs(5) == {"source": "old-vllm", "num_tokens": 5}
