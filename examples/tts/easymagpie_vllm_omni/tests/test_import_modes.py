@@ -201,3 +201,68 @@ def test_runtime_compat_preserves_old_vllm_init_model_kwargs_signature(monkeypat
     assert OmniGPUModelRunner()._init_model_kwargs(5) == {"source": "old-vllm", "num_tokens": 5}
     assert RuntimeRunner()._init_model_kwargs() == {"source": "old-vllm", "num_tokens": 19}
     assert RuntimeRunner()._init_model_kwargs(5) == {"source": "old-vllm", "num_tokens": 5}
+
+
+def test_runtime_compat_reports_configured_cudagraph_mode_for_omni_fallback(monkeypatch) -> None:
+    from vllm.config import CUDAGraphMode
+
+    from easymagpie_vllm_omni.vllm_compat import install_easy_magpie_runtime_compat
+
+    class BatchDescriptor:
+        num_tokens = 8
+        num_reqs = 4
+
+    class OmniGPUModelRunner:
+        def __init__(self, cudagraph_mode):
+            self.vllm_config = types.SimpleNamespace(
+                compilation_config=types.SimpleNamespace(cudagraph_mode=cudagraph_mode)
+            )
+
+        def _init_model_kwargs(self, num_tokens=None):
+            return {}
+
+        def _determine_batch_execution_and_padding(self, **kwargs):
+            return CUDAGraphMode.NONE, BatchDescriptor(), False, None, None
+
+    runner_module = types.ModuleType("vllm_omni.worker.gpu_model_runner")
+    runner_module.OmniGPUModelRunner = OmniGPUModelRunner
+    monkeypatch.setitem(sys.modules, "vllm_omni", types.ModuleType("vllm_omni"))
+    monkeypatch.setitem(sys.modules, "vllm_omni.worker", types.ModuleType("vllm_omni.worker"))
+    monkeypatch.setitem(sys.modules, "vllm_omni.worker.gpu_model_runner", runner_module)
+
+    install_easy_magpie_runtime_compat()
+    install_easy_magpie_runtime_compat()
+
+    mixed_result = OmniGPUModelRunner(CUDAGraphMode.PIECEWISE)._determine_batch_execution_and_padding(
+        num_tokens=8,
+        num_reqs=4,
+        force_eager=False,
+        force_uniform_decode=False,
+    )
+    eager_result = OmniGPUModelRunner(CUDAGraphMode.PIECEWISE)._determine_batch_execution_and_padding(
+        num_tokens=8,
+        num_reqs=4,
+        force_eager=True,
+        force_uniform_decode=False,
+    )
+    full_and_piecewise_mixed = OmniGPUModelRunner(
+        CUDAGraphMode.FULL_AND_PIECEWISE
+    )._determine_batch_execution_and_padding(
+        num_tokens=8,
+        num_reqs=4,
+        force_eager=False,
+        force_uniform_decode=False,
+    )
+    full_and_piecewise_decode = OmniGPUModelRunner(
+        CUDAGraphMode.FULL_AND_PIECEWISE
+    )._determine_batch_execution_and_padding(
+        num_tokens=8,
+        num_reqs=4,
+        force_eager=False,
+        force_uniform_decode=True,
+    )
+
+    assert mixed_result[0] == CUDAGraphMode.PIECEWISE
+    assert eager_result[0] == CUDAGraphMode.NONE
+    assert full_and_piecewise_mixed[0] == CUDAGraphMode.PIECEWISE
+    assert full_and_piecewise_decode[0] == CUDAGraphMode.FULL

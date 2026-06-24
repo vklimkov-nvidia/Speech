@@ -240,6 +240,65 @@ def _install_omni_gpu_model_runner_init_kwargs_compat() -> None:
     _base_init_model_kwargs._easymagpie_original = current  # type: ignore[attr-defined]
     runner_cls._init_model_kwargs = _base_init_model_kwargs
 
+
+def _install_omni_batch_execution_padding_compat() -> None:
+    """Let vLLM 0.21 CUDA-graph capture use Omni's fallback batch descriptor.
+
+    The vLLM-Omni branch used by EasyMagpie includes a compatibility fallback
+    for ``_determine_batch_execution_and_padding`` that always returns
+    ``CUDAGraphMode.NONE``. Newer vLLM V1 passes the runtime capture mode
+    explicitly into ``_dummy_run`` and asserts it matches the returned mode.
+    Preserve Omni's simple descriptor while reporting the configured runtime
+    graph mode when the call is not forced eager.
+    """
+
+    try:
+        module = importlib.import_module("vllm_omni.worker.gpu_model_runner")
+        from vllm.config import CUDAGraphMode
+    except Exception:
+        return
+
+    runner_cls = getattr(module, "OmniGPUModelRunner", None)
+    if runner_cls is None:
+        return
+
+    current = getattr(runner_cls, "_determine_batch_execution_and_padding", None)
+    if current is None or getattr(current, "_easymagpie_batch_execution_padding_compat", False):
+        return
+
+    def _runtime_mode_from_config(self: Any, *, force_uniform_decode: bool) -> Any:
+        compilation_config = getattr(getattr(self, "vllm_config", None), "compilation_config", None)
+        configured_mode = getattr(compilation_config, "cudagraph_mode", None)
+        if configured_mode is None:
+            return CUDAGraphMode.NONE
+        if force_uniform_decode and hasattr(configured_mode, "decode_mode"):
+            return configured_mode.decode_mode()
+        if hasattr(configured_mode, "mixed_mode"):
+            return configured_mode.mixed_mode()
+        return configured_mode
+
+    def _determine_batch_execution_and_padding(self: Any, *args: Any, **kwargs: Any) -> Any:
+        result = current(self, *args, **kwargs)
+        if not isinstance(result, tuple) or len(result) < 5:
+            return result
+        cudagraph_mode, batch_desc, should_ubatch, num_tokens_across_dp, cudagraph_stats = result[:5]
+        if bool(kwargs.get("force_eager", False)) or cudagraph_mode != CUDAGraphMode.NONE:
+            return result
+        runtime_mode = _runtime_mode_from_config(
+            self,
+            force_uniform_decode=bool(kwargs.get("force_uniform_decode", False)),
+        )
+        if runtime_mode == CUDAGraphMode.NONE:
+            return result
+        patched = (runtime_mode, batch_desc, should_ubatch, num_tokens_across_dp, cudagraph_stats)
+        if len(result) > 5:
+            patched += result[5:]
+        return patched
+
+    _determine_batch_execution_and_padding._easymagpie_batch_execution_padding_compat = True  # type: ignore[attr-defined]
+    _determine_batch_execution_and_padding._easymagpie_original = current  # type: ignore[attr-defined]
+    runner_cls._determine_batch_execution_and_padding = _determine_batch_execution_and_padding
+
 def _install_v1_serial_utils_dense_tensor_compat() -> None:
     try:
         import msgspec.msgpack as msgpack
@@ -1275,6 +1334,7 @@ def install_easy_magpie_refit_rpc_compat() -> None:
     _install_vllm_multimodal_inputs_alias()
     _install_engine_utils_compat()
     _install_omni_gpu_model_runner_init_kwargs_compat()
+    _install_omni_batch_execution_padding_compat()
     _install_easy_magpie_refit_rpc_compat()
     _install_async_omni_client_compat()
 
@@ -1294,6 +1354,7 @@ def install_easy_magpie_runtime_compat() -> None:
     _install_vllm_multimodal_inputs_alias()
     _install_engine_utils_compat()
     _install_omni_gpu_model_runner_init_kwargs_compat()
+    _install_omni_batch_execution_padding_compat()
     _install_easy_magpie_refit_rpc_compat()
     _install_v1_serial_utils_dense_tensor_compat()
     _install_async_omni_client_compat()
