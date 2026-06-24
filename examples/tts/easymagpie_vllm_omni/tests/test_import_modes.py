@@ -147,6 +147,9 @@ def test_runtime_compat_handles_new_vllm_init_model_kwargs_signature(monkeypatch
                 num_tokens = int(getattr(self, "max_num_tokens", 0) or 0)
             return super()._init_model_kwargs(num_tokens)
 
+    class RuntimeRunner(OmniGPUModelRunner):
+        pass
+
     runner_module = types.ModuleType("vllm_omni.worker.gpu_model_runner")
     runner_module.OmniGPUModelRunner = OmniGPUModelRunner
     monkeypatch.setitem(sys.modules, "vllm_omni", types.ModuleType("vllm_omni"))
@@ -161,8 +164,10 @@ def test_runtime_compat_handles_new_vllm_init_model_kwargs_signature(monkeypatch
         raise AssertionError("test fixture should reproduce the vLLM 0.21 signature mismatch")
 
     install_easy_magpie_runtime_compat()
+    install_easy_magpie_runtime_compat()
 
     assert OmniGPUModelRunner()._init_model_kwargs() == {"source": "new-vllm"}
+    assert RuntimeRunner()._init_model_kwargs() == {"source": "new-vllm"}
 
 
 def test_runtime_compat_preserves_old_vllm_init_model_kwargs_signature(monkeypatch) -> None:
@@ -180,6 +185,9 @@ def test_runtime_compat_preserves_old_vllm_init_model_kwargs_signature(monkeypat
                 num_tokens = int(getattr(self, "max_num_tokens", 0) or 0)
             return super()._init_model_kwargs(num_tokens)
 
+    class RuntimeRunner(OmniGPUModelRunner):
+        pass
+
     runner_module = types.ModuleType("vllm_omni.worker.gpu_model_runner")
     runner_module.OmniGPUModelRunner = OmniGPUModelRunner
     monkeypatch.setitem(sys.modules, "vllm_omni", types.ModuleType("vllm_omni"))
@@ -187,6 +195,9 @@ def test_runtime_compat_preserves_old_vllm_init_model_kwargs_signature(monkeypat
     monkeypatch.setitem(sys.modules, "vllm_omni.worker.gpu_model_runner", runner_module)
 
     install_easy_magpie_runtime_compat()
+    install_easy_magpie_runtime_compat()
 
     assert OmniGPUModelRunner()._init_model_kwargs() == {"source": "old-vllm", "num_tokens": 19}
     assert OmniGPUModelRunner()._init_model_kwargs(5) == {"source": "old-vllm", "num_tokens": 5}
+    assert RuntimeRunner()._init_model_kwargs() == {"source": "old-vllm", "num_tokens": 19}
+    assert RuntimeRunner()._init_model_kwargs(5) == {"source": "old-vllm", "num_tokens": 5}

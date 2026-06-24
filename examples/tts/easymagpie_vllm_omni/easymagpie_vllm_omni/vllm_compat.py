@@ -203,9 +203,16 @@ def _install_omni_gpu_model_runner_init_kwargs_compat() -> None:
     def _base_init_model_kwargs(self: Any, num_tokens: int | None = None) -> Any:
         if num_tokens is None:
             num_tokens = int(getattr(self, "max_num_tokens", 0) or 0)
-        for base_cls in type(self).__mro__[1:]:
+        mro = type(self).__mro__
+        try:
+            base_classes = mro[mro.index(runner_cls) + 1 :]
+        except ValueError:
+            base_classes = mro[1:]
+        for base_cls in base_classes:
             base_method = base_cls.__dict__.get("_init_model_kwargs")
             if base_method is None:
+                continue
+            if getattr(base_method, "_easymagpie_init_model_kwargs_compat", False):
                 continue
             try:
                 signature = inspect.signature(base_method)
