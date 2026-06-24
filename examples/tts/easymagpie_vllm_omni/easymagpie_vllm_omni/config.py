@@ -25,7 +25,7 @@ and provides a single, well-documented default profile.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Iterable
 
 # Number of trailing special tokens appended to every audio codebook.
 # Matches ``len(SpecialAudioToken)`` in
@@ -40,6 +40,75 @@ SPECIAL_AUDIO_EOS: int = 1
 SPECIAL_AUDIO_CONTEXT_BOS: int = 2
 SPECIAL_AUDIO_CONTEXT_EOS: int = 3
 SPECIAL_AUDIO_MASK: int = 4
+
+
+def normalize_nemotron_h_config(hf_config: Any) -> Any:
+    """Fill vLLM Nemotron-H runtime aliases on converted EasyMagpie configs."""
+    if not hasattr(hf_config, "rms_norm_eps") and hasattr(hf_config, "layer_norm_epsilon"):
+        hf_config.rms_norm_eps = hf_config.layer_norm_epsilon
+    return hf_config
+
+
+def derive_nemotron_h_hybrid_pattern_from_weight_keys(
+    keys: Iterable[str],
+    *,
+    layer_prefix: str = "decoder.layers.",
+) -> str | None:
+    """Infer a Nemotron-H hybrid pattern from converted checkpoint key names.
+
+    Older EasyMagpie conversion snippets could carry a stale
+    ``hybrid_override_pattern``. The state dict is the authoritative source for
+    whether a layer is Mamba (``M``), attention (``*``), dense MLP (``-``), or
+    routed MoE (``E``).
+    """
+    layer_kinds: dict[int, set[str]] = {}
+    for key in keys:
+        if not key.startswith(layer_prefix):
+            continue
+        rest = key[len(layer_prefix) :]
+        layer_str, sep, tail = rest.partition(".")
+        if not sep:
+            continue
+        try:
+            layer_idx = int(layer_str)
+        except ValueError:
+            continue
+        if not tail.startswith("mixer."):
+            layer_kinds.setdefault(layer_idx, set())
+            continue
+
+        mixer_key = tail[len("mixer.") :]
+        layer_kind = layer_kinds.setdefault(layer_idx, set())
+        if mixer_key.startswith(("experts.", "shared_experts.", "gate.")):
+            layer_kind.add("E")
+        elif mixer_key.startswith(("A_log", "D", "conv1d.", "dt_bias", "in_proj.", "out_proj.", "norm.")):
+            layer_kind.add("M")
+        elif mixer_key.startswith(("q_proj.", "k_proj.", "v_proj.", "o_proj.", "qkv_proj.")):
+            layer_kind.add("*")
+        elif mixer_key.startswith(("down_proj.", "gate_proj.", "up_proj.")):
+            layer_kind.add("-")
+
+    if not layer_kinds:
+        return None
+
+    max_layer = max(layer_kinds)
+    if any(idx not in layer_kinds for idx in range(max_layer + 1)):
+        return None
+
+    chars: list[str] = []
+    for idx in range(max_layer + 1):
+        kinds = layer_kinds[idx]
+        if "E" in kinds:
+            chars.append("E")
+        elif "M" in kinds:
+            chars.append("M")
+        elif "*" in kinds:
+            chars.append("*")
+        elif "-" in kinds:
+            chars.append("-")
+        else:
+            return None
+    return "".join(chars)
 
 
 @dataclass

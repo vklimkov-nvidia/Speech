@@ -31,12 +31,34 @@ drop-in replacement for ``OmniARAsyncScheduler``; wire it in via the stage's
 """
 from __future__ import annotations
 
-from vllm.v1.request import Request, StreamingUpdate
+import os
+import logging
 
-from vllm_omni.core.sched.omni_ar_scheduler import OmniARAsyncScheduler
+from vllm.v1.core.sched.request_queue import create_request_queue
+from vllm.v1.request import Request
+
+try:
+    from vllm.v1.request import StreamingUpdate
+except ImportError:
+    StreamingUpdate = object
+
+try:
+    from vllm_omni.core.sched.omni_ar_scheduler import OmniARAsyncScheduler as _OmniARBaseScheduler
+except ImportError:
+    from vllm_omni.core.sched.omni_ar_scheduler import OmniARScheduler as _OmniARBaseScheduler
 
 
-class EasyMagpieARAsyncScheduler(OmniARAsyncScheduler):
+logger = logging.getLogger(__name__)
+
+
+def _env_flag(name: str, default: bool) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() not in {"0", "false", "no", "off"}
+
+
+class EasyMagpieARAsyncScheduler(_OmniARBaseScheduler):
     """``OmniARAsyncScheduler`` that forwards per-chunk ``additional_information``.
 
     Replace (not merge) is the correct session-level semantics: the session field
@@ -49,6 +71,231 @@ class EasyMagpieARAsyncScheduler(OmniARAsyncScheduler):
     placeholder chunks (e.g. the masking ``text_token=-1`` sentinel still sets a
     value; a truly empty chunk leaves the previous payload intact).
     """
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.disable_mixed_prefill_decode = _env_flag(
+            "EASYMAGPIE_DISABLE_MIXED_PREFILL_DECODE", True
+        )
+        self.purge_stale_train_before_post_refit = _env_flag(
+            "EASYMAGPIE_PURGE_STALE_TRAIN_BEFORE_POST_REFIT", True
+        )
+
+    @staticmethod
+    def _request_id(request: Request) -> str:
+        return str(getattr(request, "request_id", ""))
+
+    @staticmethod
+    def _request_ids_head(requests, limit: int = 8) -> list[str]:
+        ids: list[str] = []
+        for request in requests or []:
+            ids.append(EasyMagpieARAsyncScheduler._request_id(request))
+            if len(ids) >= limit:
+                break
+        return ids
+
+    @staticmethod
+    def _safe_len(value) -> int | None:
+        try:
+            return len(value)
+        except Exception:
+            return None
+
+    @staticmethod
+    def _is_train_rollout_request(request: Request) -> bool:
+        request_id = EasyMagpieARAsyncScheduler._request_id(request)
+        return request_id.startswith(
+            (
+                "easymagpie-grpo-train-step-",
+                "easymagpie-grpo-train-rank-",
+            )
+        )
+
+    @staticmethod
+    def _is_post_refit_request(request: Request) -> bool:
+        request_id = EasyMagpieARAsyncScheduler._request_id(request)
+        return request_id.startswith(
+            (
+                "easymagpie-grpo-train-post-refit-step-",
+                "easymagpie-grpo-train-post-refit-rank-",
+            )
+        )
+
+    def _has_waiting_post_refit_request(self) -> bool:
+        return any(self._is_post_refit_request(request) for request in self.waiting)
+
+    def _purge_stale_train_running_before_post_refit(self) -> list[str]:
+        if (
+            not getattr(self, "purge_stale_train_before_post_refit", True)
+            or not self.waiting
+            or not self._has_waiting_post_refit_request()
+            or not self.running
+        ):
+            return []
+
+        kept = []
+        purged = []
+        for request in self.running:
+            if self._is_train_rollout_request(request):
+                purged.append(self._request_id(request))
+            else:
+                kept.append(request)
+
+        if not purged:
+            return []
+        try:
+            self.running[:] = kept
+        except TypeError:
+            self.running = kept
+        self._easymagpie_last_post_refit_purge = {
+            "num_purged_running": len(purged),
+            "purged_running_head": purged[:16],
+            "purged_running_tail": purged[-16:],
+        }
+        logger.info(
+            "EasyMagpie post-refit scheduler purged stale train running requests: "
+            "num_purged=%d waiting_head=%s purged_head=%s",
+            len(purged),
+            self._request_ids_head(self.waiting),
+            purged[:8],
+        )
+        return purged
+
+    @staticmethod
+    def _is_active_decode_request(request: Request) -> bool:
+        is_finished = getattr(request, "is_finished", None)
+        if callable(is_finished) and is_finished():
+            return False
+
+        status = getattr(request, "status", None)
+        status_name = getattr(status, "name", None)
+        if status_name is None and status is not None:
+            status_name = str(status)
+        if status_name is not None and status_name != "RUNNING":
+            return False
+
+        pending = EasyMagpieARAsyncScheduler._num_pending_tokens(request)
+        if pending is not None and pending <= 0:
+            return False
+
+        # Older tests/stubs may not carry vLLM RequestStatus. If no status is
+        # present, keep the conservative old behavior and treat it as active.
+        return True
+
+    @staticmethod
+    def _num_pending_tokens(request: Request) -> int | None:
+        required = (
+            "num_tokens_with_spec",
+            "num_output_placeholders",
+            "num_computed_tokens",
+        )
+        if not all(hasattr(request, name) for name in required):
+            return None
+        return (
+            int(getattr(request, "num_tokens_with_spec") or 0)
+            + int(getattr(request, "num_output_placeholders") or 0)
+            - int(getattr(request, "num_computed_tokens") or 0)
+        )
+
+    def _has_active_decode_requests(self) -> bool:
+        return any(self._is_active_decode_request(request) for request in self.running)
+
+    @staticmethod
+    def _scheduled_token_count(schedule_output) -> int | None:
+        num_scheduled_tokens = getattr(schedule_output, "num_scheduled_tokens", None)
+        if num_scheduled_tokens is None:
+            return None
+        if isinstance(num_scheduled_tokens, dict):
+            try:
+                return sum(int(count or 0) for count in num_scheduled_tokens.values())
+            except Exception:
+                return None
+        try:
+            return int(num_scheduled_tokens or 0)
+        except Exception:
+            return None
+
+    @staticmethod
+    def _restore_deferred_waiting(current_waiting, deferred_waiting):
+        if current_waiting:
+            for request in deferred_waiting:
+                current_waiting.add_request(request)
+            return current_waiting
+        return deferred_waiting
+
+    def schedule(self):  # type: ignore[override]
+        post_refit_waiting = self._has_waiting_post_refit_request()
+        if post_refit_waiting:
+            logger.info(
+                "EasyMagpie post-refit scheduler before schedule: waiting=%s running=%s "
+                "waiting_head=%s running_head=%s active_decode=%s",
+                self._safe_len(self.waiting),
+                self._safe_len(self.running),
+                self._request_ids_head(self.waiting),
+                self._request_ids_head(self.running),
+                self._has_active_decode_requests(),
+            )
+        self._purge_stale_train_running_before_post_refit()
+
+        if (
+            not self.disable_mixed_prefill_decode
+            or not self._has_active_decode_requests()
+            or not self.waiting
+        ):
+            result = super().schedule()
+            if post_refit_waiting:
+                logger.info(
+                    "EasyMagpie post-refit scheduler after direct schedule: scheduled_tokens=%s "
+                    "waiting=%s running=%s waiting_head=%s running_head=%s",
+                    self._scheduled_token_count(result),
+                    self._safe_len(self.waiting),
+                    self._safe_len(self.running),
+                    self._request_ids_head(self.waiting),
+                    self._request_ids_head(self.running),
+                )
+            return result
+
+        # The EasyMagpie Mamba path is unstable when vLLM batches cached
+        # one-token decodes together with fresh prompt prefills.
+        deferred_waiting = self.waiting
+        self.waiting = create_request_queue(self.policy)
+        restored_waiting = False
+        try:
+            result = super().schedule()
+            scheduled_tokens = self._scheduled_token_count(result)
+            self._easymagpie_last_mixed_guard = {
+                "deferred_waiting": len(deferred_waiting),
+                "guarded_scheduled_tokens": scheduled_tokens,
+                "fallback_to_waiting_prefill": scheduled_tokens == 0,
+            }
+            if scheduled_tokens == 0:
+                self.waiting = self._restore_deferred_waiting(self.waiting, deferred_waiting)
+                restored_waiting = True
+                result = super().schedule()
+                if post_refit_waiting:
+                    logger.info(
+                        "EasyMagpie post-refit scheduler after guarded fallback: scheduled_tokens=%s "
+                        "waiting=%s running=%s waiting_head=%s running_head=%s",
+                        self._scheduled_token_count(result),
+                        self._safe_len(self.waiting),
+                        self._safe_len(self.running),
+                        self._request_ids_head(self.waiting),
+                        self._request_ids_head(self.running),
+                    )
+                return result
+            if post_refit_waiting:
+                logger.info(
+                    "EasyMagpie post-refit scheduler after guarded decode schedule: scheduled_tokens=%s "
+                    "deferred_waiting=%s waiting=%s running=%s",
+                    scheduled_tokens,
+                    self._safe_len(deferred_waiting),
+                    self._safe_len(self.waiting),
+                    self._safe_len(self.running),
+                )
+            return result
+        finally:
+            if not restored_waiting:
+                self.waiting = self._restore_deferred_waiting(self.waiting, deferred_waiting)
 
     def _update_request_as_session(self, session: Request, update: StreamingUpdate) -> None:
         super()._update_request_as_session(session, update)

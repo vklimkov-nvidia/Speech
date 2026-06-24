@@ -27,6 +27,8 @@ from easymagpie_vllm_omni.config import (
     SPECIAL_AUDIO_EOS,
     SPECIAL_AUDIO_MASK,
     EasyMagpieOmniArch,
+    derive_nemotron_h_hybrid_pattern_from_weight_keys,
+    normalize_nemotron_h_config,
 )
 
 
@@ -86,3 +88,29 @@ def test_from_hf_config_hidden_size_fallback():
     assert arch.hidden_dim == 999
     # embedding_dim defaults to the same backbone width when not given explicitly.
     assert arch.embedding_dim == 999
+
+
+def test_normalize_nemotron_h_config_adds_norm_alias_but_preserves_moe_layers():
+    hf_config = types.SimpleNamespace(layer_norm_epsilon=1e-5, hybrid_override_pattern="MEM*E")
+    out = normalize_nemotron_h_config(hf_config)
+    assert out.rms_norm_eps == 1e-5
+    assert out.hybrid_override_pattern == "MEM*E"
+
+
+def test_derive_nemotron_h_hybrid_pattern_from_weight_keys_prefers_checkpoint_layout():
+    keys = [
+        "decoder.layers.0.mixer.A_log",
+        "decoder.layers.0.mixer.conv1d.weight",
+        "decoder.layers.1.mixer.experts.0.down_proj.weight",
+        "decoder.layers.1.mixer.experts.0.up_proj.weight",
+        "decoder.layers.1.mixer.shared_experts.down_proj.weight",
+        "decoder.layers.1.mixer.gate.weight",
+        "decoder.layers.2.mixer.q_proj.weight",
+        "decoder.layers.2.mixer.k_proj.weight",
+        "decoder.layers.2.mixer.v_proj.weight",
+        "decoder.layers.2.mixer.o_proj.weight",
+        "decoder.layers.3.mixer.experts.0.down_proj.weight",
+        "decoder.layers.3.mixer.experts.0.up_proj.weight",
+    ]
+
+    assert derive_nemotron_h_hybrid_pattern_from_weight_keys(keys) == "ME*E"
