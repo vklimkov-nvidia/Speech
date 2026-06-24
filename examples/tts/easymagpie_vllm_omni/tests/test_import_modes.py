@@ -46,3 +46,44 @@ print(json.dumps(loaded))
     )
     loaded = json.loads(proc.stdout.strip())
     assert loaded == []
+
+
+def test_compat_mode_serial_imports_review_path() -> None:
+    root = Path(__file__).resolve().parents[1]
+    env = os.environ.copy()
+    env["EASYMAGPIE_VLLM_COMPAT_MODE"] = "serial"
+    env["PYTHONPATH"] = str(root)
+
+    code = """
+import easymagpie_vllm_omni
+print("ok")
+"""
+    proc = subprocess.run(
+        [sys.executable, "-c", code],
+        check=True,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=30,
+    )
+    assert proc.stdout.strip().splitlines()[-1] == "ok"
+
+
+def test_compat_mode_full_is_not_part_of_review_branch() -> None:
+    root = Path(__file__).resolve().parents[1]
+    env = os.environ.copy()
+    env["EASYMAGPIE_VLLM_COMPAT_MODE"] = "full"
+    env["PYTHONPATH"] = str(root)
+
+    proc = subprocess.run(
+        [sys.executable, "-c", "import easymagpie_vllm_omni"],
+        check=False,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=30,
+    )
+    assert proc.returncode != 0
+    assert "not included in the review-friendly EasyMagpie RL branch" in proc.stderr
