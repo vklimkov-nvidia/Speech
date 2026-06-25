@@ -315,7 +315,9 @@ def _install_omni_batch_execution_padding_compat() -> None:
     ``CUDAGraphMode.NONE``. Newer vLLM V1 passes the runtime capture mode
     explicitly into ``_dummy_run`` and asserts it matches the returned mode.
     Preserve Omni's simple descriptor while reporting the configured runtime
-    graph mode when the call is not forced eager.
+    graph mode only for descriptors vLLM captured at startup. Larger runtime
+    batches must stay eager; otherwise vLLM attempts a lazy CUDA-graph capture
+    after capture has been disabled.
 
     Also normalize Omni's fallback descriptor into a value-keyed object. The
     fallback descriptor class is created inside the method and is identity
@@ -400,6 +402,19 @@ def _install_omni_batch_execution_padding_compat() -> None:
             uniform_decode=bool(getattr(batch_desc, "uniform_decode", False)),
         )
 
+    def _descriptor_has_captured_graph(self: Any, batch_desc: Any) -> bool:
+        """Return whether vLLM should already have captured this graph key."""
+
+        num_tokens = getattr(batch_desc, "num_tokens", None)
+        if num_tokens is None:
+            return False
+        compilation_config = getattr(getattr(self, "vllm_config", None), "compilation_config", None)
+        capture_sizes = getattr(compilation_config, "cudagraph_capture_sizes", None)
+        if capture_sizes:
+            return int(num_tokens) in {int(size) for size in capture_sizes}
+        max_capture = getattr(compilation_config, "max_cudagraph_capture_size", None)
+        return max_capture is not None and int(num_tokens) <= int(max_capture)
+
     def _determine_batch_execution_and_padding(self: Any, *args: Any, **kwargs: Any) -> Any:
         result = current(self, *args, **kwargs)
         if not isinstance(result, tuple) or len(result) < 5:
@@ -417,6 +432,11 @@ def _install_omni_batch_execution_padding_compat() -> None:
         )
         if runtime_mode == CUDAGraphMode.NONE:
             patched = (cudagraph_mode, batch_desc, should_ubatch, num_tokens_across_dp, cudagraph_stats)
+            if len(result) > 5:
+                patched += result[5:]
+            return patched
+        if not _descriptor_has_captured_graph(self, batch_desc):
+            patched = (CUDAGraphMode.NONE, batch_desc, should_ubatch, num_tokens_across_dp, cudagraph_stats)
             if len(result) > 5:
                 patched += result[5:]
             return patched

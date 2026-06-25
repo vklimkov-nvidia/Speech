@@ -337,20 +337,34 @@ def test_runtime_compat_reports_configured_cudagraph_mode_for_omni_fallback(monk
     from easymagpie_vllm_omni.vllm_compat import install_easy_magpie_runtime_compat
 
     class BatchDescriptor:
-        num_tokens = 8
-        num_reqs = 4
+        def __init__(self, num_tokens=8, num_reqs=4):
+            self.num_tokens = num_tokens
+            self.num_reqs = num_reqs
 
     class OmniGPUModelRunner:
         def __init__(self, cudagraph_mode):
             self.vllm_config = types.SimpleNamespace(
-                compilation_config=types.SimpleNamespace(cudagraph_mode=cudagraph_mode)
+                compilation_config=types.SimpleNamespace(
+                    cudagraph_mode=cudagraph_mode,
+                    cudagraph_capture_sizes=[1, 2, 4, 8, 16, 24, 32, 40, 48, 56, 64],
+                    max_cudagraph_capture_size=64,
+                )
             )
 
         def _init_model_kwargs(self, num_tokens=None):
             return {}
 
         def _determine_batch_execution_and_padding(self, **kwargs):
-            return CUDAGraphMode.NONE, BatchDescriptor(), False, None, None
+            return (
+                CUDAGraphMode.NONE,
+                BatchDescriptor(
+                    num_tokens=kwargs.get("num_tokens", 8),
+                    num_reqs=kwargs.get("num_reqs", 4),
+                ),
+                False,
+                None,
+                None,
+            )
 
     runner_module = types.ModuleType("vllm_omni.worker.gpu_model_runner")
     runner_module.OmniGPUModelRunner = OmniGPUModelRunner
@@ -389,11 +403,19 @@ def test_runtime_compat_reports_configured_cudagraph_mode_for_omni_fallback(monk
         force_eager=False,
         force_uniform_decode=True,
     )
+    oversized_mixed = OmniGPUModelRunner(CUDAGraphMode.PIECEWISE)._determine_batch_execution_and_padding(
+        num_tokens=80,
+        num_reqs=32,
+        force_eager=False,
+        force_uniform_decode=False,
+    )
 
     assert mixed_result[0] == CUDAGraphMode.PIECEWISE
     assert eager_result[0] == CUDAGraphMode.NONE
     assert full_and_piecewise_mixed[0] == CUDAGraphMode.PIECEWISE
     assert full_and_piecewise_decode[0] == CUDAGraphMode.FULL
+    assert oversized_mixed[0] == CUDAGraphMode.NONE
+    assert oversized_mixed[1].num_tokens == 80
 
     capture_desc = mixed_result[1]
     runtime_desc = OmniGPUModelRunner(CUDAGraphMode.PIECEWISE)._determine_batch_execution_and_padding(
