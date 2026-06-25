@@ -299,6 +299,50 @@ def _install_omni_batch_execution_padding_compat() -> None:
     _determine_batch_execution_and_padding._easymagpie_original = current  # type: ignore[attr-defined]
     runner_cls._determine_batch_execution_and_padding = _determine_batch_execution_and_padding
 
+
+def _install_omni_structured_output_request_compat() -> None:
+    """Bridge vLLM-Omni's legacy ``StructuredOutputRequest`` construction.
+
+    The EasyMagpie vLLM-Omni branch builds structured-output metadata with
+    ``StructuredOutputRequest(sampling_params=...)`` when every request is
+    converted inside the engine core. Some vLLM 0.21 builds accept that keyword
+    while others only accept positional construction or no construction for
+    requests without guided/structured output constraints. Keep EasyMagpie audio
+    requests moving across both variants without changing vLLM-Omni source.
+    """
+
+    try:
+        request_module = importlib.import_module("vllm_omni.request")
+    except Exception:
+        return
+
+    original = getattr(request_module, "StructuredOutputRequest", None)
+    if original is None or getattr(original, "_easymagpie_structured_output_request_compat", False):
+        return
+
+    def structured_output_request_compat(*args: Any, **kwargs: Any) -> Any:
+        if "sampling_params" not in kwargs:
+            return original(*args, **kwargs)
+
+        sampling_params = kwargs["sampling_params"]
+        try:
+            return original(*args, **kwargs)
+        except TypeError as exc:
+            if "sampling_params" not in str(exc) and "unexpected keyword" not in str(exc):
+                raise
+
+        positional_kwargs = dict(kwargs)
+        positional_kwargs.pop("sampling_params", None)
+        try:
+            return original(sampling_params, *args, **positional_kwargs)
+        except TypeError:
+            return None
+
+    structured_output_request_compat._easymagpie_structured_output_request_compat = True  # type: ignore[attr-defined]
+    structured_output_request_compat._easymagpie_original = original  # type: ignore[attr-defined]
+    request_module.StructuredOutputRequest = structured_output_request_compat
+
+
 def _install_v1_serial_utils_dense_tensor_compat() -> None:
     try:
         import msgspec.msgpack as msgpack
@@ -1335,6 +1379,7 @@ def install_easy_magpie_refit_rpc_compat() -> None:
     _install_engine_utils_compat()
     _install_omni_gpu_model_runner_init_kwargs_compat()
     _install_omni_batch_execution_padding_compat()
+    _install_omni_structured_output_request_compat()
     _install_easy_magpie_refit_rpc_compat()
     _install_async_omni_client_compat()
 
@@ -1355,6 +1400,7 @@ def install_easy_magpie_runtime_compat() -> None:
     _install_engine_utils_compat()
     _install_omni_gpu_model_runner_init_kwargs_compat()
     _install_omni_batch_execution_padding_compat()
+    _install_omni_structured_output_request_compat()
     _install_easy_magpie_refit_rpc_compat()
     _install_v1_serial_utils_dense_tensor_compat()
     _install_async_omni_client_compat()

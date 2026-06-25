@@ -266,3 +266,39 @@ def test_runtime_compat_reports_configured_cudagraph_mode_for_omni_fallback(monk
     assert eager_result[0] == CUDAGraphMode.NONE
     assert full_and_piecewise_mixed[0] == CUDAGraphMode.PIECEWISE
     assert full_and_piecewise_decode[0] == CUDAGraphMode.FULL
+
+
+def test_runtime_compat_handles_structured_output_request_signature_variants(monkeypatch) -> None:
+    from easymagpie_vllm_omni.vllm_compat import install_easy_magpie_runtime_compat
+
+    class KeywordStructuredOutputRequest:
+        def __init__(self, *, sampling_params):
+            self.mode = "keyword"
+            self.sampling_params = sampling_params
+
+    class PositionalStructuredOutputRequest:
+        def __init__(self, sampling_params):
+            self.mode = "positional"
+            self.sampling_params = sampling_params
+
+    class NoSamplingStructuredOutputRequest:
+        def __init__(self):
+            self.mode = "none"
+
+    request_module = types.ModuleType("vllm_omni.request")
+    monkeypatch.setitem(sys.modules, "vllm_omni", types.ModuleType("vllm_omni"))
+    monkeypatch.setitem(sys.modules, "vllm_omni.request", request_module)
+
+    request_module.StructuredOutputRequest = KeywordStructuredOutputRequest
+    install_easy_magpie_runtime_compat()
+    assert request_module.StructuredOutputRequest(sampling_params="sp").mode == "keyword"
+
+    request_module.StructuredOutputRequest = PositionalStructuredOutputRequest
+    install_easy_magpie_runtime_compat()
+    positional_result = request_module.StructuredOutputRequest(sampling_params="sp")
+    assert positional_result.mode == "positional"
+    assert positional_result.sampling_params == "sp"
+
+    request_module.StructuredOutputRequest = NoSamplingStructuredOutputRequest
+    install_easy_magpie_runtime_compat()
+    assert request_module.StructuredOutputRequest(sampling_params="sp") is None
