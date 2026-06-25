@@ -395,6 +395,20 @@ def test_runtime_compat_reports_configured_cudagraph_mode_for_omni_fallback(monk
     assert full_and_piecewise_mixed[0] == CUDAGraphMode.PIECEWISE
     assert full_and_piecewise_decode[0] == CUDAGraphMode.FULL
 
+    capture_desc = mixed_result[1]
+    runtime_desc = OmniGPUModelRunner(CUDAGraphMode.PIECEWISE)._determine_batch_execution_and_padding(
+        num_tokens=8,
+        num_reqs=4,
+        force_eager=False,
+        force_uniform_decode=False,
+    )[1]
+    assert capture_desc is not runtime_desc
+    assert capture_desc == runtime_desc
+    assert hash(capture_desc) == hash(runtime_desc)
+    assert capture_desc.num_tokens == 8
+    assert capture_desc.num_reqs == 4
+    assert capture_desc.uniform_decode is False
+
 
 def test_runtime_compat_handles_structured_output_request_signature_variants(monkeypatch) -> None:
     from easymagpie_vllm_omni.vllm_compat import install_easy_magpie_runtime_compat

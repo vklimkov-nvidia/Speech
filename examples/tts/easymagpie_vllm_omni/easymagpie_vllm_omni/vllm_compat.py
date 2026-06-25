@@ -316,6 +316,13 @@ def _install_omni_batch_execution_padding_compat() -> None:
     explicitly into ``_dummy_run`` and asserts it matches the returned mode.
     Preserve Omni's simple descriptor while reporting the configured runtime
     graph mode when the call is not forced eager.
+
+    Also normalize Omni's fallback descriptor into a value-keyed object. The
+    fallback descriptor class is created inside the method and is identity
+    hashed, so vLLM's piecewise CUDA-graph wrapper cannot match runtime
+    descriptors against the descriptors captured at engine startup. When that
+    happens, vLLM attempts a lazy graph capture after capture has been disabled
+    and raises ``CUDA graph capturing detected at an inappropriate time``.
     """
 
     try:
@@ -343,19 +350,76 @@ def _install_omni_batch_execution_padding_compat() -> None:
             return configured_mode.mixed_mode()
         return configured_mode
 
+    class _ValueBatchDescriptor:
+        __slots__ = ("num_tokens", "num_reqs", "uniform_decode")
+
+        def __init__(
+            self,
+            *,
+            num_tokens: int,
+            num_reqs: int | None = None,
+            uniform_decode: bool = False,
+        ) -> None:
+            self.num_tokens = int(num_tokens)
+            self.num_reqs = None if num_reqs is None else int(num_reqs)
+            self.uniform_decode = bool(uniform_decode)
+
+        @property
+        def non_uniform(self) -> "_ValueBatchDescriptor":
+            return _ValueBatchDescriptor(
+                num_tokens=self.num_tokens,
+                num_reqs=self.num_reqs,
+                uniform_decode=False,
+            )
+
+        def __eq__(self, other: Any) -> bool:
+            return (
+                hasattr(other, "num_tokens")
+                and int(getattr(other, "num_tokens")) == self.num_tokens
+                and bool(getattr(other, "uniform_decode", False)) == self.uniform_decode
+            )
+
+        def __hash__(self) -> int:
+            return hash((self.num_tokens, self.uniform_decode))
+
+        def __repr__(self) -> str:
+            return (
+                f"EasyMagpieBatchDescriptor(num_tokens={self.num_tokens}, "
+                f"uniform_decode={self.uniform_decode}, num_reqs={self.num_reqs})"
+            )
+
+    def _normalize_batch_descriptor(batch_desc: Any) -> Any:
+        if batch_desc is None or isinstance(batch_desc, _ValueBatchDescriptor):
+            return batch_desc
+        num_tokens = getattr(batch_desc, "num_tokens", None)
+        if num_tokens is None:
+            return batch_desc
+        return _ValueBatchDescriptor(
+            num_tokens=int(num_tokens),
+            num_reqs=getattr(batch_desc, "num_reqs", None),
+            uniform_decode=bool(getattr(batch_desc, "uniform_decode", False)),
+        )
+
     def _determine_batch_execution_and_padding(self: Any, *args: Any, **kwargs: Any) -> Any:
         result = current(self, *args, **kwargs)
         if not isinstance(result, tuple) or len(result) < 5:
             return result
         cudagraph_mode, batch_desc, should_ubatch, num_tokens_across_dp, cudagraph_stats = result[:5]
+        batch_desc = _normalize_batch_descriptor(batch_desc)
         if bool(kwargs.get("force_eager", False)) or cudagraph_mode != CUDAGraphMode.NONE:
-            return result
+            patched = (cudagraph_mode, batch_desc, should_ubatch, num_tokens_across_dp, cudagraph_stats)
+            if len(result) > 5:
+                patched += result[5:]
+            return patched
         runtime_mode = _runtime_mode_from_config(
             self,
             force_uniform_decode=bool(kwargs.get("force_uniform_decode", False)),
         )
         if runtime_mode == CUDAGraphMode.NONE:
-            return result
+            patched = (cudagraph_mode, batch_desc, should_ubatch, num_tokens_across_dp, cudagraph_stats)
+            if len(result) > 5:
+                patched += result[5:]
+            return patched
         patched = (runtime_mode, batch_desc, should_ubatch, num_tokens_across_dp, cudagraph_stats)
         if len(result) > 5:
             patched += result[5:]
