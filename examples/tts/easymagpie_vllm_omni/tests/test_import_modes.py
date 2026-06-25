@@ -203,8 +203,104 @@ def test_runtime_compat_preserves_old_vllm_init_model_kwargs_signature(monkeypat
     assert RuntimeRunner()._init_model_kwargs(5) == {"source": "old-vllm", "num_tokens": 5}
 
 
+def test_runtime_compat_supplies_new_vllm_cumsum_arange_output_buffer(monkeypatch) -> None:
+    import numpy as np
+
+    from easymagpie_vllm_omni.vllm_compat import install_easy_magpie_runtime_compat
+
+    class NewParentRunner:
+        def __init__(self):
+            self.arange_np = np.arange(16, dtype=np.int32)
+
+        def _get_cumsum_and_arange(self, num_tokens, arange_out):
+            cu_num_tokens = np.cumsum(num_tokens, dtype=np.int32)
+            offsets = np.repeat(cu_num_tokens - num_tokens, num_tokens)
+            np.subtract(self.arange_np[: int(cu_num_tokens[-1])], offsets, out=arange_out)
+            return cu_num_tokens, arange_out
+
+    class OmniGPUModelRunner(NewParentRunner):
+        pass
+
+    runner_module = types.ModuleType("vllm_omni.worker.gpu_model_runner")
+    runner_module.OmniGPUModelRunner = OmniGPUModelRunner
+    monkeypatch.setitem(sys.modules, "vllm_omni", types.ModuleType("vllm_omni"))
+    monkeypatch.setitem(sys.modules, "vllm_omni.worker", types.ModuleType("vllm_omni.worker"))
+    monkeypatch.setitem(sys.modules, "vllm_omni.worker.gpu_model_runner", runner_module)
+
+    try:
+        OmniGPUModelRunner()._get_cumsum_and_arange(np.array([2, 3], dtype=np.int32))
+    except TypeError as exc:
+        assert "arange_out" in str(exc)
+    else:
+        raise AssertionError("test fixture should reproduce the vLLM arange_out signature mismatch")
+
+    install_easy_magpie_runtime_compat()
+    install_easy_magpie_runtime_compat()
+
+    cu_num_tokens, arange = OmniGPUModelRunner()._get_cumsum_and_arange(np.array([2, 3], dtype=np.int32))
+
+    assert cu_num_tokens.tolist() == [2, 5]
+    assert arange.tolist() == [0, 1, 0, 1, 2]
+
+
+def test_runtime_compat_preserves_old_vllm_cumsum_arange_signature(monkeypatch) -> None:
+    import numpy as np
+
+    from easymagpie_vllm_omni.vllm_compat import install_easy_magpie_runtime_compat
+
+    class OldParentRunner:
+        def __init__(self):
+            self.arange_np = np.arange(16, dtype=np.int32)
+
+        def _get_cumsum_and_arange(self, num_tokens, cumsum_dtype=None):
+            cu_num_tokens = np.cumsum(num_tokens, dtype=cumsum_dtype)
+            offsets = np.repeat(cu_num_tokens - num_tokens, num_tokens)
+            return cu_num_tokens, self.arange_np[: int(cu_num_tokens[-1])] - offsets
+
+    class OmniGPUModelRunner(OldParentRunner):
+        pass
+
+    runner_module = types.ModuleType("vllm_omni.worker.gpu_model_runner")
+    runner_module.OmniGPUModelRunner = OmniGPUModelRunner
+    monkeypatch.setitem(sys.modules, "vllm_omni", types.ModuleType("vllm_omni"))
+    monkeypatch.setitem(sys.modules, "vllm_omni.worker", types.ModuleType("vllm_omni.worker"))
+    monkeypatch.setitem(sys.modules, "vllm_omni.worker.gpu_model_runner", runner_module)
+
+    install_easy_magpie_runtime_compat()
+    install_easy_magpie_runtime_compat()
+
+    cu_num_tokens, arange = OmniGPUModelRunner()._get_cumsum_and_arange(
+        np.array([2, 3], dtype=np.int32),
+        cumsum_dtype=np.int64,
+    )
+
+    assert cu_num_tokens.dtype == np.int64
+    assert cu_num_tokens.tolist() == [2, 5]
+    assert arange.tolist() == [0, 1, 0, 1, 2]
+
+
 def test_runtime_compat_reports_configured_cudagraph_mode_for_omni_fallback(monkeypatch) -> None:
-    from vllm.config import CUDAGraphMode
+    from enum import Enum
+
+    class CUDAGraphMode(Enum):
+        NONE = 0
+        PIECEWISE = 1
+        FULL = 2
+        FULL_AND_PIECEWISE = 3
+
+        def mixed_mode(self):
+            if self == CUDAGraphMode.FULL_AND_PIECEWISE:
+                return CUDAGraphMode.PIECEWISE
+            return self
+
+        def decode_mode(self):
+            if self == CUDAGraphMode.FULL_AND_PIECEWISE:
+                return CUDAGraphMode.FULL
+            return self
+
+    config_module = types.ModuleType("vllm.config")
+    config_module.CUDAGraphMode = CUDAGraphMode
+    monkeypatch.setitem(sys.modules, "vllm.config", config_module)
 
     from easymagpie_vllm_omni.vllm_compat import install_easy_magpie_runtime_compat
 

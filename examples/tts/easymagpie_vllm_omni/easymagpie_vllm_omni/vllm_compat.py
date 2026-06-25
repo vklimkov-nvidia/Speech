@@ -241,6 +241,63 @@ def _install_omni_gpu_model_runner_init_kwargs_compat() -> None:
     runner_cls._init_model_kwargs = _base_init_model_kwargs
 
 
+def _install_omni_cumsum_arange_compat() -> None:
+    """Supply vLLM 0.21's required ``arange_out`` buffer when Omni calls old API."""
+
+    try:
+        import numpy as np
+
+        module = importlib.import_module("vllm_omni.worker.gpu_model_runner")
+    except Exception:
+        return
+
+    runner_cls = getattr(module, "OmniGPUModelRunner", None)
+    if runner_cls is None:
+        return
+
+    current = getattr(runner_cls, "_get_cumsum_and_arange", None)
+    if current is None or getattr(current, "_easymagpie_cumsum_arange_compat", False):
+        return
+
+    try:
+        signature = inspect.signature(current)
+    except (TypeError, ValueError):
+        return
+
+    parameters = signature.parameters
+    if "arange_out" not in parameters:
+        return
+
+    positional_parameters = [
+        name
+        for name, parameter in parameters.items()
+        if parameter.kind
+        in {
+            inspect.Parameter.POSITIONAL_ONLY,
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        }
+    ]
+    remaining_positional = [name for name in positional_parameters if name not in {"self", "num_tokens"}]
+    arange_out_args_index = remaining_positional.index("arange_out") if "arange_out" in remaining_positional else None
+
+    def _make_arange_out(self: Any, num_tokens: Any) -> Any:
+        num_tokens_np = np.asarray(num_tokens)
+        total_num_tokens = int(num_tokens_np.sum(dtype=np.int64))
+        arange_np = getattr(self, "arange_np", None)
+        dtype = getattr(arange_np, "dtype", np.int64)
+        return np.empty((total_num_tokens,), dtype=dtype)
+
+    def _get_cumsum_and_arange(self: Any, num_tokens: Any, *args: Any, **kwargs: Any) -> Any:
+        supplied_positionally = arange_out_args_index is not None and len(args) > arange_out_args_index
+        if not supplied_positionally and "arange_out" not in kwargs:
+            kwargs["arange_out"] = _make_arange_out(self, num_tokens)
+        return current(self, num_tokens, *args, **kwargs)
+
+    _get_cumsum_and_arange._easymagpie_cumsum_arange_compat = True  # type: ignore[attr-defined]
+    _get_cumsum_and_arange._easymagpie_original = current  # type: ignore[attr-defined]
+    runner_cls._get_cumsum_and_arange = _get_cumsum_and_arange
+
+
 def _install_omni_batch_execution_padding_compat() -> None:
     """Let vLLM 0.21 CUDA-graph capture use Omni's fallback batch descriptor.
 
@@ -1411,6 +1468,7 @@ def install_easy_magpie_refit_rpc_compat() -> None:
     _install_vllm_multimodal_inputs_alias()
     _install_engine_utils_compat()
     _install_omni_gpu_model_runner_init_kwargs_compat()
+    _install_omni_cumsum_arange_compat()
     _install_omni_batch_execution_padding_compat()
     _install_omni_structured_output_request_compat()
     _install_omni_request_mm_kwargs_compat()
@@ -1433,6 +1491,7 @@ def install_easy_magpie_runtime_compat() -> None:
     _install_vllm_multimodal_inputs_alias()
     _install_engine_utils_compat()
     _install_omni_gpu_model_runner_init_kwargs_compat()
+    _install_omni_cumsum_arange_compat()
     _install_omni_batch_execution_padding_compat()
     _install_omni_structured_output_request_compat()
     _install_omni_request_mm_kwargs_compat()
