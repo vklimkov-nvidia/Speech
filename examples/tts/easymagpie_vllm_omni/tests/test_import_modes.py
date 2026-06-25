@@ -302,3 +302,28 @@ def test_runtime_compat_handles_structured_output_request_signature_variants(mon
     request_module.StructuredOutputRequest = NoSamplingStructuredOutputRequest
     install_easy_magpie_runtime_compat()
     assert request_module.StructuredOutputRequest(sampling_params="sp") is None
+
+
+def test_runtime_compat_supplies_legacy_omni_request_mm_kwargs(monkeypatch) -> None:
+    from easymagpie_vllm_omni.vllm_compat import install_easy_magpie_runtime_compat
+
+    class OmniRequest:
+        def __init__(self, *, mm_features=None):
+            del mm_features
+            self.mm_features = self.mm_kwargs
+
+    request_module = types.ModuleType("vllm_omni.request")
+    request_module.OmniRequest = OmniRequest
+    monkeypatch.setitem(sys.modules, "vllm_omni", types.ModuleType("vllm_omni"))
+    monkeypatch.setitem(sys.modules, "vllm_omni.request", request_module)
+
+    install_easy_magpie_runtime_compat()
+
+    empty_request = request_module.OmniRequest()
+    assert empty_request.mm_kwargs == {}
+    assert empty_request.mm_features == {}
+
+    mm_features = {"audio": object()}
+    audio_request = request_module.OmniRequest(mm_features=mm_features)
+    assert audio_request.mm_kwargs is mm_features
+    assert audio_request.mm_features is mm_features

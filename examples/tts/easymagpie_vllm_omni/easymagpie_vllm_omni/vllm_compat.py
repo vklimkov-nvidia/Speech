@@ -343,6 +343,39 @@ def _install_omni_structured_output_request_compat() -> None:
     request_module.StructuredOutputRequest = structured_output_request_compat
 
 
+def _install_omni_request_mm_kwargs_compat() -> None:
+    """Restore the legacy ``mm_kwargs`` attribute expected by OmniRequest.
+
+    Some vLLM 0.21 builds no longer populate ``Request.mm_kwargs`` before
+    vLLM-Omni's ``OmniRequest.__init__`` aliases it into ``mm_features``.
+    EasyMagpie requests already carry multimodal payloads through Omni's prompt
+    object, so an absent field should behave like an empty mapping rather than
+    making request preprocessing fail before generation starts.
+    """
+
+    try:
+        request_module = importlib.import_module("vllm_omni.request")
+    except Exception:
+        return
+
+    request_cls = getattr(request_module, "OmniRequest", None)
+    if request_cls is None:
+        return
+
+    current = getattr(request_cls, "__init__", None)
+    if current is None or getattr(current, "_easymagpie_mm_kwargs_compat", False):
+        return
+
+    def omni_request_init_compat(self: Any, *args: Any, **kwargs: Any) -> Any:
+        if not hasattr(self, "mm_kwargs"):
+            setattr(self, "mm_kwargs", kwargs.get("mm_features", {}))
+        return current(self, *args, **kwargs)
+
+    omni_request_init_compat._easymagpie_mm_kwargs_compat = True  # type: ignore[attr-defined]
+    omni_request_init_compat._easymagpie_original = current  # type: ignore[attr-defined]
+    request_cls.__init__ = omni_request_init_compat
+
+
 def _install_v1_serial_utils_dense_tensor_compat() -> None:
     try:
         import msgspec.msgpack as msgpack
@@ -1380,6 +1413,7 @@ def install_easy_magpie_refit_rpc_compat() -> None:
     _install_omni_gpu_model_runner_init_kwargs_compat()
     _install_omni_batch_execution_padding_compat()
     _install_omni_structured_output_request_compat()
+    _install_omni_request_mm_kwargs_compat()
     _install_easy_magpie_refit_rpc_compat()
     _install_async_omni_client_compat()
 
@@ -1401,6 +1435,7 @@ def install_easy_magpie_runtime_compat() -> None:
     _install_omni_gpu_model_runner_init_kwargs_compat()
     _install_omni_batch_execution_padding_compat()
     _install_omni_structured_output_request_compat()
+    _install_omni_request_mm_kwargs_compat()
     _install_easy_magpie_refit_rpc_compat()
     _install_v1_serial_utils_dense_tensor_compat()
     _install_async_omni_client_compat()
