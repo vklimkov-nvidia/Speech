@@ -243,6 +243,38 @@ def test_runtime_compat_supplies_new_vllm_cumsum_arange_output_buffer(monkeypatc
     assert arange.tolist() == [0, 1, 0, 1, 2]
 
 
+def test_runtime_compat_normalizes_new_vllm_cumsum_single_return(monkeypatch) -> None:
+    import numpy as np
+
+    from easymagpie_vllm_omni.vllm_compat import install_easy_magpie_runtime_compat
+
+    class NewParentRunner:
+        def __init__(self):
+            self.arange_np = np.arange(16, dtype=np.int32)
+
+        def _get_cumsum_and_arange(self, num_tokens, arange_out):
+            cu_num_tokens = np.cumsum(num_tokens, dtype=np.int32)
+            offsets = np.repeat(cu_num_tokens - num_tokens, num_tokens)
+            np.subtract(self.arange_np[: int(cu_num_tokens[-1])], offsets, out=arange_out)
+            return cu_num_tokens
+
+    class OmniGPUModelRunner(NewParentRunner):
+        pass
+
+    runner_module = types.ModuleType("vllm_omni.worker.gpu_model_runner")
+    runner_module.OmniGPUModelRunner = OmniGPUModelRunner
+    monkeypatch.setitem(sys.modules, "vllm_omni", types.ModuleType("vllm_omni"))
+    monkeypatch.setitem(sys.modules, "vllm_omni.worker", types.ModuleType("vllm_omni.worker"))
+    monkeypatch.setitem(sys.modules, "vllm_omni.worker.gpu_model_runner", runner_module)
+
+    install_easy_magpie_runtime_compat()
+
+    cu_num_tokens, arange = OmniGPUModelRunner()._get_cumsum_and_arange(np.array([2, 3], dtype=np.int32))
+
+    assert cu_num_tokens.tolist() == [2, 5]
+    assert arange.tolist() == [0, 1, 0, 1, 2]
+
+
 def test_runtime_compat_preserves_old_vllm_cumsum_arange_signature(monkeypatch) -> None:
     import numpy as np
 

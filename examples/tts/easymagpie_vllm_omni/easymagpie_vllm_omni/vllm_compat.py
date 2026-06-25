@@ -289,9 +289,18 @@ def _install_omni_cumsum_arange_compat() -> None:
 
     def _get_cumsum_and_arange(self: Any, num_tokens: Any, *args: Any, **kwargs: Any) -> Any:
         supplied_positionally = arange_out_args_index is not None and len(args) > arange_out_args_index
+        supplied_arange_out = None
+        if supplied_positionally:
+            supplied_arange_out = args[arange_out_args_index]
+        elif "arange_out" in kwargs:
+            supplied_arange_out = kwargs["arange_out"]
         if not supplied_positionally and "arange_out" not in kwargs:
-            kwargs["arange_out"] = _make_arange_out(self, num_tokens)
-        return current(self, num_tokens, *args, **kwargs)
+            supplied_arange_out = _make_arange_out(self, num_tokens)
+            kwargs["arange_out"] = supplied_arange_out
+        result = current(self, num_tokens, *args, **kwargs)
+        if isinstance(result, tuple) and len(result) >= 2:
+            return result
+        return result, supplied_arange_out
 
     _get_cumsum_and_arange._easymagpie_cumsum_arange_compat = True  # type: ignore[attr-defined]
     _get_cumsum_and_arange._easymagpie_original = current  # type: ignore[attr-defined]
