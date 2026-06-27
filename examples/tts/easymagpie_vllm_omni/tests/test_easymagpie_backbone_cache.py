@@ -98,6 +98,44 @@ class _FakeCurrentRunMambaCache(_FakeMambaCache):
         )
 
 
+class _BackboneForRefit(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        hidden_dim = 3
+        num_experts = 2
+        self.embed_tokens = torch.nn.Embedding(8, hidden_dim)
+        self.layers = torch.nn.ModuleList([_RefitLayer(hidden_dim, num_experts)])
+
+    def load_weights(self, weights):
+        params = dict(self.named_parameters())
+        loaded = set()
+        for name, tensor in weights:
+            target = params.get(name)
+            if target is None:
+                continue
+            with torch.no_grad():
+                target.copy_(tensor.to(dtype=target.dtype, device=target.device))
+            loaded.add(name)
+        return loaded
+
+
+class _RefitLayer(torch.nn.Module):
+    def __init__(self, hidden_dim: int, num_experts: int) -> None:
+        super().__init__()
+        self.norm = torch.nn.LayerNorm(hidden_dim)
+        self.mixer = _RefitMixer(hidden_dim, num_experts)
+
+
+class _RefitMixer(torch.nn.Module):
+    def __init__(self, hidden_dim: int, num_experts: int) -> None:
+        super().__init__()
+        self.gate = torch.nn.Linear(hidden_dim, num_experts, bias=False)
+        self.gate.e_score_correction_bias = torch.nn.Parameter(
+            torch.zeros(num_experts),
+            requires_grad=False,
+        )
+
+
 def _minimal_model(backbone: torch.nn.Module) -> EasyMagpieTTSForConditionalGeneration:
     model = EasyMagpieTTSForConditionalGeneration.__new__(EasyMagpieTTSForConditionalGeneration)
     torch.nn.Module.__init__(model)
@@ -119,6 +157,57 @@ def _minimal_model(backbone: torch.nn.Module) -> EasyMagpieTTSForConditionalGene
     model.code_predictor = SimpleNamespace()
     model._get_decode_idxs = lambda: (torch.empty(0, dtype=torch.long), 0)
     return model
+
+
+def _minimal_refit_model() -> EasyMagpieTTSForConditionalGeneration:
+    model = EasyMagpieTTSForConditionalGeneration.__new__(EasyMagpieTTSForConditionalGeneration)
+    torch.nn.Module.__init__(model)
+    model.backbone = _BackboneForRefit()
+    model.text_embedding = torch.nn.Embedding(8, 3)
+    model.context_text_embedding = torch.nn.Embedding(8, 3)
+    model.task_embedding = None
+    model.code_predictor = SimpleNamespace(init_forbidden_mask=lambda: None)
+    return model
+
+
+def test_non_text_refit_allows_static_backbone_and_text_targets():
+    model = _minimal_refit_model()
+    model._easymagpie_allow_missing_text_tables_refit = True
+    weights = [
+        ("decoder.layers.0.norm.weight", torch.ones(3)),
+        ("decoder.layers.0.norm.bias", torch.zeros(3)),
+        ("decoder.layers.0.mixer.gate.weight", torch.ones(2, 3)),
+    ]
+
+    loaded = model.load_weights(weights)
+
+    summary = model._last_easy_magpie_load_weights_summary
+    assert "backbone.layers.0.norm.weight" in loaded
+    assert summary["ok"] is True
+    assert summary["num_blocking_missing_model_targets"] == 0
+    assert "backbone.embed_tokens.weight" in summary["allowed_missing_model_targets"]
+    assert "backbone.layers.0.mixer.gate.e_score_correction_bias" in summary[
+        "allowed_missing_model_targets"
+    ]
+    assert "text_embedding.weight" in summary["allowed_missing_model_targets"]
+    assert "context_text_embedding.weight" in summary["allowed_missing_model_targets"]
+
+
+def test_non_text_refit_still_blocks_unexpected_missing_targets():
+    model = _minimal_refit_model()
+    model.backbone.unexpected_projection = torch.nn.Linear(3, 3, bias=False)
+    model._easymagpie_allow_missing_text_tables_refit = True
+    weights = [
+        ("decoder.layers.0.norm.weight", torch.ones(3)),
+        ("decoder.layers.0.norm.bias", torch.zeros(3)),
+        ("decoder.layers.0.mixer.gate.weight", torch.ones(2, 3)),
+    ]
+
+    model.load_weights(weights)
+
+    summary = model._last_easy_magpie_load_weights_summary
+    assert summary["ok"] is False
+    assert summary["blocking_missing_model_targets"] == ["backbone.unexpected_projection.weight"]
 
 
 def test_forward_passes_mamba_cache_params_to_vllm_backbone():

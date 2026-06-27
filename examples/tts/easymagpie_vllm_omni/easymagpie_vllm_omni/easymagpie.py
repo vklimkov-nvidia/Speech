@@ -1900,6 +1900,22 @@ class EasyMagpieTTSForConditionalGeneration(
             context_weight.copy_(text_weight.to(dtype=context_weight.dtype, device=context_weight.device))
         return True
 
+    @staticmethod
+    def _allowed_missing_non_text_refit_targets(missing_model_targets: list[str]) -> set[str]:
+        """Model parameters intentionally omitted by the non-text refit path."""
+
+        allowed = {
+            "text_embedding.weight",
+            "context_text_embedding.weight",
+            # The EasyMagpie vLLM model feeds the backbone through inputs_embeds;
+            # this synthetic table is never consumed by generation.
+            "backbone.embed_tokens.weight",
+        }
+        for name in missing_model_targets:
+            if name.startswith("backbone.layers.") and name.endswith(".mixer.gate.e_score_correction_bias"):
+                allowed.add(name)
+        return allowed
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Load backbone (Nemotron-H) + TTS submodule weights from a converted checkpoint.
 
@@ -2155,8 +2171,7 @@ class EasyMagpieTTSForConditionalGeneration(
         allow_missing_text_tables = bool(getattr(self, "_easymagpie_allow_missing_text_tables_refit", False))
         allowed_missing_model_targets = set()
         if allow_missing_text_tables:
-            allowed_missing_model_targets.add("text_embedding.weight")
-            allowed_missing_model_targets.add("context_text_embedding.weight")
+            allowed_missing_model_targets = self._allowed_missing_non_text_refit_targets(missing_model_targets)
         blocking_missing_model_targets = [
             name for name in missing_model_targets if name not in allowed_missing_model_targets
         ]
