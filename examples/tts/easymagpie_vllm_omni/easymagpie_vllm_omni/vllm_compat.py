@@ -629,14 +629,19 @@ def _install_v1_serial_utils_dense_tensor_compat() -> None:
         if "got `array`" not in error_text or "at `$[2]`" not in error_text:
             raise exc
 
+        try:
+            from vllm.v1.engine import EngineCoreOutputs
+        except Exception:
+            raise exc
+
         target_type = getattr(self.decoder, "type", None)
         if target_type is None:
-            try:
-                from vllm.v1.engine import EngineCoreOutputs
-            except Exception:
-                raise exc
             target_type = EngineCoreOutputs
-        if getattr(target_type, "__name__", "") != "EngineCoreOutputs":
+        try:
+            is_engine_core_outputs = issubclass(target_type, EngineCoreOutputs)
+        except TypeError:
+            is_engine_core_outputs = False
+        if not is_engine_core_outputs:
             raise exc
 
         raw_decoder = msgpack.Decoder(ext_hook=self.decoder.ext_hook)
