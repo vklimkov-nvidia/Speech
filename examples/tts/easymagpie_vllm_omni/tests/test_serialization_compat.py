@@ -10,7 +10,7 @@ from typing import Any
 import msgspec
 
 
-def _install_fake_serial_utils(monkeypatch):
+def _install_fake_serial_utils(monkeypatch, engine_core_outputs_type):
     class MsgpackEncoder:
         size_threshold = 256
 
@@ -53,12 +53,26 @@ def _install_fake_serial_utils(monkeypatch):
     serial_utils.MsgpackEncoder = MsgpackEncoder
     vllm = types.ModuleType("vllm")
     vllm_v1 = types.ModuleType("vllm.v1")
+    vllm_engine = types.ModuleType("vllm.v1.engine")
+    vllm_engine.EngineCoreOutputs = engine_core_outputs_type
     vllm.v1 = vllm_v1
     vllm_v1.serial_utils = serial_utils
+    vllm_v1.engine = vllm_engine
     monkeypatch.setitem(sys.modules, "vllm", vllm)
     monkeypatch.setitem(sys.modules, "vllm.v1", vllm_v1)
+    monkeypatch.setitem(sys.modules, "vllm.v1.engine", vllm_engine)
     monkeypatch.setitem(sys.modules, "vllm.v1.serial_utils", serial_utils)
     return serial_utils
+
+
+class _DecoderWithoutTypeMetadata:
+    def __init__(self, delegate):
+        self._delegate = delegate
+        self.ext_hook = delegate.ext_hook
+        self.dec_hook = delegate.dec_hook
+
+    def decode(self, data):
+        return self._delegate.decode(data)
 
 
 def test_decoder_drops_only_incompatible_array_scheduler_stats(monkeypatch) -> None:
@@ -72,9 +86,10 @@ def test_decoder_drops_only_incompatible_array_scheduler_stats(monkeypatch) -> N
         scheduler_stats: dict[str, int] | None = None
         timestamp: float = 0.0
 
-    serial_utils = _install_fake_serial_utils(monkeypatch)
+    serial_utils = _install_fake_serial_utils(monkeypatch, EngineCoreOutputs)
     _install_v1_serial_utils_dense_tensor_compat()
     decoder = serial_utils.MsgpackDecoder(EngineCoreOutputs)
+    decoder.decoder = _DecoderWithoutTypeMetadata(decoder.decoder)
 
     incompatible_wire = msgspec.msgpack.encode([0, [7], [123], 4.5])
     recovered = decoder.decode([incompatible_wire])
@@ -103,7 +118,7 @@ def test_decoder_does_not_hide_other_engine_output_schema_errors(monkeypatch) ->
         outputs: list[int] = []
         scheduler_stats: dict[str, int] | None = None
 
-    serial_utils = _install_fake_serial_utils(monkeypatch)
+    serial_utils = _install_fake_serial_utils(monkeypatch, EngineCoreOutputs)
     _install_v1_serial_utils_dense_tensor_compat()
     decoder = serial_utils.MsgpackDecoder(EngineCoreOutputs)
 
@@ -115,3 +130,32 @@ def test_decoder_does_not_hide_other_engine_output_schema_errors(monkeypatch) ->
         assert "at `$[1]`" in str(exc)
     else:
         raise AssertionError("unrelated EngineCoreOutputs schema errors must propagate")
+
+
+def test_decoder_does_not_retype_unrelated_array_like_outputs(monkeypatch) -> None:
+    from easymagpie_vllm_omni.vllm_compat import (
+        _install_v1_serial_utils_dense_tensor_compat,
+    )
+
+    class EngineCoreOutputs(msgspec.Struct, array_like=True, omit_defaults=True):
+        engine_index: int = 0
+        outputs: list[int] = []
+        scheduler_stats: dict[str, int] | None = None
+
+    class OtherOutputs(msgspec.Struct, array_like=True, omit_defaults=True):
+        engine_index: int = 0
+        outputs: list[int] = []
+        scheduler_stats: dict[str, int] | None = None
+
+    serial_utils = _install_fake_serial_utils(monkeypatch, EngineCoreOutputs)
+    _install_v1_serial_utils_dense_tensor_compat()
+    decoder = serial_utils.MsgpackDecoder(OtherOutputs)
+
+    incompatible_wire = msgspec.msgpack.encode([0, [7], [123]])
+
+    try:
+        decoder.decode([incompatible_wire])
+    except msgspec.ValidationError as exc:
+        assert "at `$[2]`" in str(exc)
+    else:
+        raise AssertionError("unrelated typed decoder errors must propagate")

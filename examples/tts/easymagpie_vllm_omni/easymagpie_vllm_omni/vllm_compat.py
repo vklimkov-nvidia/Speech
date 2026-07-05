@@ -625,12 +625,18 @@ def _install_v1_serial_utils_dense_tensor_compat() -> None:
         primary_buffer: Any,
         exc: msgspec.ValidationError,
     ) -> Any:
+        error_text = str(exc)
+        if "got `array`" not in error_text or "at `$[2]`" not in error_text:
+            raise exc
+
         target_type = getattr(self.decoder, "type", None)
-        if (
-            getattr(target_type, "__name__", "") != "EngineCoreOutputs"
-            or "got `array`" not in str(exc)
-            or "at `$[2]`" not in str(exc)
-        ):
+        if target_type is None:
+            try:
+                from vllm.v1.engine import EngineCoreOutputs
+            except Exception:
+                raise exc
+            target_type = EngineCoreOutputs
+        if getattr(target_type, "__name__", "") != "EngineCoreOutputs":
             raise exc
 
         raw_decoder = msgpack.Decoder(ext_hook=self.decoder.ext_hook)
