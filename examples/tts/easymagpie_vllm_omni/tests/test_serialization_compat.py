@@ -136,6 +136,28 @@ def test_decoder_recovers_vllm_omni_engine_output_subclass(monkeypatch) -> None:
     assert decoder._easymagpie_array_scheduler_stats_recoveries == 1
 
 
+def test_installed_vllm_omni_output_decoder_recovers_scheduler_stats() -> None:
+    import pytest
+
+    omni_engine = pytest.importorskip("vllm_omni.engine")
+    serial_utils = pytest.importorskip("vllm.v1.serial_utils")
+    from easymagpie_vllm_omni.vllm_compat import (
+        _install_v1_serial_utils_dense_tensor_compat,
+    )
+
+    _install_v1_serial_utils_dense_tensor_compat()
+    decoder = serial_utils.MsgpackDecoder(omni_engine.OmniEngineCoreOutputs)
+
+    incompatible_wire = msgspec.msgpack.encode([0, [], [123], 4.5])
+    recovered = decoder.decode([incompatible_wire])
+
+    assert isinstance(recovered, omni_engine.OmniEngineCoreOutputs)
+    assert recovered.outputs == []
+    assert recovered.scheduler_stats is None
+    assert recovered.timestamp == 4.5
+    assert decoder._easymagpie_array_scheduler_stats_recoveries == 1
+
+
 def test_decoder_does_not_hide_other_engine_output_schema_errors(monkeypatch) -> None:
     from easymagpie_vllm_omni.vllm_compat import (
         _install_v1_serial_utils_dense_tensor_compat,
