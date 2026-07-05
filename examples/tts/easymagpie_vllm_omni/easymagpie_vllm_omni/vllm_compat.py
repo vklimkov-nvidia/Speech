@@ -528,6 +528,7 @@ def _install_omni_request_mm_kwargs_compat() -> None:
 
 def _install_v1_serial_utils_dense_tensor_compat() -> None:
     try:
+        import msgspec
         import msgspec.msgpack as msgpack
         import torch
         import vllm.v1.serial_utils as serial_utils
@@ -619,6 +620,45 @@ def _install_v1_serial_utils_dense_tensor_compat() -> None:
             return False
         return utility_args[0] in easy_magpie_refit_methods
 
+    def _recover_engine_outputs_with_array_scheduler_stats(
+        self: Any,
+        primary_buffer: Any,
+        exc: msgspec.ValidationError,
+    ) -> Any:
+        target_type = getattr(self.decoder, "type", None)
+        if (
+            getattr(target_type, "__name__", "") != "EngineCoreOutputs"
+            or "got `array`" not in str(exc)
+            or "at `$[2]`" not in str(exc)
+        ):
+            raise exc
+
+        raw_decoder = msgpack.Decoder(ext_hook=self.decoder.ext_hook)
+        raw = raw_decoder.decode(primary_buffer)
+        if not isinstance(raw, list) or len(raw) <= 2 or not isinstance(raw[2], list):
+            raise exc
+
+        # Some vLLM/vLLM-Omni combinations emit array-like scheduler stats
+        # while the frontend's typed EngineCoreOutputs expects a map. These
+        # stats are optional and unrelated to request outputs or refit results.
+        raw[2] = None
+        recovered = msgspec.convert(
+            raw,
+            target_type,
+            strict=False,
+            dec_hook=self.decoder.dec_hook,
+        )
+        recovery_count = int(
+            getattr(self, "_easymagpie_array_scheduler_stats_recoveries", 0)
+        ) + 1
+        self._easymagpie_array_scheduler_stats_recoveries = recovery_count
+        if recovery_count == 1:
+            logger.warning(
+                "Dropped incompatible array-form vLLM scheduler stats while "
+                "preserving EngineCoreOutputs"
+            )
+        return recovered
+
     def decode_with_easy_magpie_refit_tensors(self: Any, bufs: Any) -> Any:
         bytestr_types = (bytes, bytearray, memoryview)
         zmq_module = getattr(serial_utils, "zmq", None)
@@ -626,7 +666,12 @@ def _install_v1_serial_utils_dense_tensor_compat() -> None:
         if frame_cls is not None:
             bytestr_types = (*bytestr_types, frame_cls)
         if isinstance(bufs, bytestr_types):
-            decoded = self.decoder.decode(bufs)
+            try:
+                decoded = self.decoder.decode(bufs)
+            except msgspec.ValidationError as exc:
+                decoded = _recover_engine_outputs_with_array_scheduler_stats(
+                    self, bufs, exc
+                )
             if _is_easy_magpie_refit_utility_request(decoded):
                 decoded = _decode_easy_magpie_refit_tensors(self, decoded)
             return decoded
@@ -634,7 +679,12 @@ def _install_v1_serial_utils_dense_tensor_compat() -> None:
         self.aux_buffers = bufs
         _decode_easy_magpie_refit_tensors._active_aux_buffers = bufs  # type: ignore[attr-defined]
         try:
-            decoded = self.decoder.decode(bufs[0])
+            try:
+                decoded = self.decoder.decode(bufs[0])
+            except msgspec.ValidationError as exc:
+                decoded = _recover_engine_outputs_with_array_scheduler_stats(
+                    self, bufs[0], exc
+                )
             if _is_easy_magpie_refit_utility_request(decoded):
                 decoded = _decode_easy_magpie_refit_tensors(self, decoded)
             return decoded
