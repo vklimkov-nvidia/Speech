@@ -645,7 +645,26 @@ def _install_v1_serial_utils_dense_tensor_compat() -> None:
             raise exc
 
         raw_decoder = msgpack.Decoder(ext_hook=self.decoder.ext_hook)
-        raw = raw_decoder.decode(primary_buffer)
+        trailing_bytes = 0
+        try:
+            raw = raw_decoder.decode(primary_buffer)
+        except msgspec.DecodeError as raw_exc:
+            prefix = "MessagePack data is malformed: trailing characters (byte "
+            raw_error = str(raw_exc)
+            if not raw_error.startswith(prefix) or not raw_error.endswith(")"):
+                raise exc from raw_exc
+            try:
+                first_object_end = int(raw_error[len(prefix) : -1])
+                primary_view = memoryview(primary_buffer)
+            except (TypeError, ValueError):
+                raise exc from raw_exc
+            if not 0 < first_object_end < primary_view.nbytes:
+                raise exc from raw_exc
+            try:
+                raw = raw_decoder.decode(primary_view[:first_object_end])
+            except msgspec.DecodeError as prefix_exc:
+                raise exc from prefix_exc
+            trailing_bytes = primary_view.nbytes - first_object_end
         if not isinstance(raw, list) or len(raw) <= 2 or not isinstance(raw[2], list):
             raise exc
 
@@ -663,10 +682,23 @@ def _install_v1_serial_utils_dense_tensor_compat() -> None:
             getattr(self, "_easymagpie_array_scheduler_stats_recoveries", 0)
         ) + 1
         self._easymagpie_array_scheduler_stats_recoveries = recovery_count
+        self._easymagpie_array_scheduler_stats_trailing_bytes = int(
+            getattr(
+                self,
+                "_easymagpie_array_scheduler_stats_trailing_bytes",
+                0,
+            )
+        ) + trailing_bytes
         if recovery_count == 1:
+            detail = (
+                f"; ignored {trailing_bytes} bytes after the first MessagePack object"
+                if trailing_bytes
+                else ""
+            )
             logger.warning(
                 "Dropped incompatible array-form vLLM scheduler stats while "
-                "preserving EngineCoreOutputs"
+                "preserving EngineCoreOutputs%s",
+                detail,
             )
         return recovered
 

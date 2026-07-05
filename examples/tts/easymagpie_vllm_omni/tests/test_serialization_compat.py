@@ -136,6 +136,47 @@ def test_decoder_recovers_vllm_omni_engine_output_subclass(monkeypatch) -> None:
     assert decoder._easymagpie_array_scheduler_stats_recoveries == 1
 
 
+def test_decoder_recovers_scheduler_stats_before_trailing_frame_bytes(
+    monkeypatch,
+) -> None:
+    import zmq
+
+    from easymagpie_vllm_omni.vllm_compat import (
+        _install_v1_serial_utils_dense_tensor_compat,
+    )
+
+    class EngineCoreOutputs(msgspec.Struct, array_like=True, omit_defaults=True):
+        engine_index: int = 0
+        outputs: list[int] = []
+        scheduler_stats: dict[str, int] | None = None
+        timestamp: float = 0.0
+
+    serial_utils = _install_fake_serial_utils(monkeypatch, EngineCoreOutputs)
+    serial_utils.zmq = zmq
+    _install_v1_serial_utils_dense_tensor_compat()
+    decoder = serial_utils.MsgpackDecoder(EngineCoreOutputs)
+
+    first_object = msgspec.msgpack.encode([0, [7], [123], 4.5])
+    trailing = msgspec.msgpack.encode({"previous_frame_tail": [1, 2, 3]})
+    recovered = decoder.decode(zmq.Frame(first_object + trailing))
+
+    assert recovered.outputs == [7]
+    assert recovered.scheduler_stats is None
+    assert recovered.timestamp == 4.5
+    assert decoder._easymagpie_array_scheduler_stats_recoveries == 1
+    assert decoder._easymagpie_array_scheduler_stats_trailing_bytes == len(trailing)
+
+    compatible_with_trailing = (
+        msgspec.msgpack.encode([0, [8], {"running": 3}, 5.5]) + trailing
+    )
+    try:
+        decoder.decode([compatible_with_trailing])
+    except msgspec.DecodeError as exc:
+        assert "trailing characters" in str(exc)
+    else:
+        raise AssertionError("compatible frames with trailing bytes must fail closed")
+
+
 def test_installed_vllm_omni_output_decoder_recovers_scheduler_stats() -> None:
     import pytest
 
