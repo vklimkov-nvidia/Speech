@@ -135,7 +135,6 @@ def test_decoder_recovers_vllm_omni_engine_output_subclass(monkeypatch) -> None:
     assert recovered.timestamp == 4.5
     assert decoder._easymagpie_array_scheduler_stats_recoveries == 1
 
-
 def test_decoder_recovers_scheduler_stats_before_trailing_frame_bytes(
     monkeypatch,
 ) -> None:
@@ -177,6 +176,39 @@ def test_decoder_recovers_scheduler_stats_before_trailing_frame_bytes(
         raise AssertionError("compatible frames with trailing bytes must fail closed")
 
 
+def test_decoder_recovers_null_optional_engine_timestamp(monkeypatch) -> None:
+    from easymagpie_vllm_omni.vllm_compat import (
+        _install_v1_serial_utils_dense_tensor_compat,
+    )
+
+    class EngineCoreOutputs(msgspec.Struct, array_like=True, omit_defaults=True):
+        engine_index: int = 0
+        outputs: list[int] = []
+        scheduler_stats: dict[str, int] | None = None
+        timestamp: float = 0.0
+
+    serial_utils = _install_fake_serial_utils(monkeypatch, EngineCoreOutputs)
+    _install_v1_serial_utils_dense_tensor_compat()
+    decoder = serial_utils.MsgpackDecoder(EngineCoreOutputs)
+
+    incompatible_wire = msgspec.msgpack.encode([0, [7], [123], None])
+    recovered = decoder.decode([incompatible_wire])
+
+    assert recovered.outputs == [7]
+    assert recovered.scheduler_stats is None
+    assert recovered.timestamp > 0.0
+    assert decoder._easymagpie_array_scheduler_stats_recoveries == 1
+    assert decoder._easymagpie_null_engine_timestamp_recoveries == 1
+
+    invalid_timestamp = msgspec.msgpack.encode([0, [8], [123], "not-a-float"])
+    try:
+        decoder.decode([invalid_timestamp])
+    except msgspec.ValidationError as exc:
+        assert "at `$[3]`" in str(exc)
+    else:
+        raise AssertionError("non-null timestamp schema errors must propagate")
+
+
 def test_installed_vllm_omni_output_decoder_recovers_scheduler_stats() -> None:
     import pytest
 
@@ -197,6 +229,16 @@ def test_installed_vllm_omni_output_decoder_recovers_scheduler_stats() -> None:
     assert recovered.scheduler_stats is None
     assert recovered.timestamp == 4.5
     assert decoder._easymagpie_array_scheduler_stats_recoveries == 1
+
+    null_timestamp_wire = msgspec.msgpack.encode([0, [], [456], None])
+    recovered_null_timestamp = decoder.decode([null_timestamp_wire])
+
+    assert isinstance(recovered_null_timestamp, omni_engine.OmniEngineCoreOutputs)
+    assert recovered_null_timestamp.outputs == []
+    assert recovered_null_timestamp.scheduler_stats is None
+    assert recovered_null_timestamp.timestamp > 0.0
+    assert decoder._easymagpie_array_scheduler_stats_recoveries == 2
+    assert decoder._easymagpie_null_engine_timestamp_recoveries == 1
 
 
 def test_decoder_does_not_hide_other_engine_output_schema_errors(monkeypatch) -> None:
