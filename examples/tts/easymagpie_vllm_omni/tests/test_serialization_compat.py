@@ -209,6 +209,31 @@ def test_decoder_recovers_null_optional_engine_timestamp(monkeypatch) -> None:
         raise AssertionError("non-null timestamp schema errors must propagate")
 
 
+def test_decoder_recovers_array_form_engine_timestamp(monkeypatch) -> None:
+    from easymagpie_vllm_omni.vllm_compat import (
+        _install_v1_serial_utils_dense_tensor_compat,
+    )
+
+    class EngineCoreOutputs(msgspec.Struct, array_like=True, omit_defaults=True):
+        engine_index: int = 0
+        outputs: list[int] = []
+        scheduler_stats: dict[str, int] | None = None
+        timestamp: float = 0.0
+
+    serial_utils = _install_fake_serial_utils(monkeypatch, EngineCoreOutputs)
+    _install_v1_serial_utils_dense_tensor_compat()
+    decoder = serial_utils.MsgpackDecoder(EngineCoreOutputs)
+
+    eos_wire = msgspec.msgpack.encode([0, [7], [123], [456]])
+    recovered = decoder.decode([eos_wire])
+
+    assert recovered.outputs == [7]
+    assert recovered.scheduler_stats is None
+    assert recovered.timestamp > 0.0
+    assert decoder._easymagpie_array_scheduler_stats_recoveries == 1
+    assert decoder._easymagpie_array_engine_timestamp_recoveries == 1
+
+
 def test_installed_vllm_omni_output_decoder_recovers_scheduler_stats() -> None:
     import pytest
 
@@ -239,6 +264,16 @@ def test_installed_vllm_omni_output_decoder_recovers_scheduler_stats() -> None:
     assert recovered_null_timestamp.timestamp > 0.0
     assert decoder._easymagpie_array_scheduler_stats_recoveries == 2
     assert decoder._easymagpie_null_engine_timestamp_recoveries == 1
+
+    array_timestamp_wire = msgspec.msgpack.encode([0, [], [789], [1011]])
+    recovered_array_timestamp = decoder.decode([array_timestamp_wire])
+
+    assert isinstance(recovered_array_timestamp, omni_engine.OmniEngineCoreOutputs)
+    assert recovered_array_timestamp.outputs == []
+    assert recovered_array_timestamp.scheduler_stats is None
+    assert recovered_array_timestamp.timestamp > 0.0
+    assert decoder._easymagpie_array_scheduler_stats_recoveries == 3
+    assert decoder._easymagpie_array_engine_timestamp_recoveries == 1
 
 
 def test_decoder_does_not_hide_other_engine_output_schema_errors(monkeypatch) -> None:

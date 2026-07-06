@@ -673,8 +673,8 @@ def _install_v1_serial_utils_dense_tensor_compat() -> None:
         # while the frontend's typed EngineCoreOutputs expects a map. These
         # stats are optional and unrelated to request outputs or refit results.
         raw[2] = None
-        recovered_timestamp = False
-        if len(raw) > 3 and raw[3] is None:
+        recovered_timestamp_kind: str | None = None
+        if len(raw) > 3 and (raw[3] is None or isinstance(raw[3], list)):
             try:
                 target_fields = msgspec.structs.fields(target_type)
             except TypeError:
@@ -682,10 +682,10 @@ def _install_v1_serial_utils_dense_tensor_compat() -> None:
             if len(target_fields) <= 3 or target_fields[3].name != "timestamp":
                 raise exc
             # vLLM defines this as a process-local monotonic telemetry field.
-            # Legacy vLLM-Omni can serialize None instead of applying the
-            # EngineCoreOutputs default when subclassing the array-like struct.
+            # Legacy vLLM-Omni can serialize None or array-form telemetry here
+            # instead of applying the EngineCoreOutputs timestamp default.
+            recovered_timestamp_kind = "null" if raw[3] is None else "array"
             raw[3] = time.monotonic()
-            recovered_timestamp = True
         recovered = msgspec.convert(
             raw,
             target_type,
@@ -703,18 +703,28 @@ def _install_v1_serial_utils_dense_tensor_compat() -> None:
                 0,
             )
         ) + trailing_bytes
-        if recovered_timestamp:
-            self._easymagpie_null_engine_timestamp_recoveries = int(
-                getattr(self, "_easymagpie_null_engine_timestamp_recoveries", 0)
-            ) + 1
+        if recovered_timestamp_kind is not None:
+            counter_name = (
+                "_easymagpie_null_engine_timestamp_recoveries"
+                if recovered_timestamp_kind == "null"
+                else "_easymagpie_array_engine_timestamp_recoveries"
+            )
+            setattr(
+                self,
+                counter_name,
+                int(getattr(self, counter_name, 0)) + 1,
+            )
         if recovery_count == 1:
             detail = (
                 f"; ignored {trailing_bytes} bytes after the first MessagePack object"
                 if trailing_bytes
                 else ""
             )
-            if recovered_timestamp:
-                detail += "; replaced a null engine timestamp with monotonic time"
+            if recovered_timestamp_kind is not None:
+                detail += (
+                    f"; replaced an {recovered_timestamp_kind} engine timestamp "
+                    "with monotonic time"
+                )
             logger.warning(
                 "Dropped incompatible array-form vLLM scheduler stats while "
                 "preserving EngineCoreOutputs%s",
