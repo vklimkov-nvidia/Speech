@@ -248,6 +248,60 @@ def _extract_last_frame(multimodal_output: OmniPayload | dict[str, Any]) -> torc
     raise ValueError(f"Invalid audio_codes shape for EasyMagpie async_chunk: {tuple(audio_codes.shape)}")
 
 
+def _resolve_speech_delay(transfer_manager: Any) -> int:
+    """Number of leading warm-up frames the EasyMagpie talker emits before real audio.
+
+    The talker offsets its audio channel by ``streaming_speech_delay`` decode steps
+    (the channel is masked until then); those leading frames carry throw-away codes
+    and must be dropped by the caller — this is the same warm-up the Triton backend
+    skips via ``head = prompt_len + speech_delay``. Resolved once from the Stage-0
+    model's ``hf_config`` (the converter bakes ``streaming_speech_delay`` into
+    ``config.json``) and cached on the transfer manager.
+    """
+    cached = getattr(transfer_manager, "_easymagpie_speech_delay", None)
+    if cached is not None:
+        return cached
+
+    # The chunk transfer adapter stores the Stage-0 model_config as ``.config``
+    # (OmniTransferAdapterBase.__init__); the model-runner mixin instead exposes
+    # ``_get_model_config()``. Try both so this works regardless of which object
+    # the connector passes as ``transfer_manager``.
+    model_config = getattr(transfer_manager, "config", None)
+    if getattr(model_config, "hf_config", None) is None:
+        getter = getattr(transfer_manager, "_get_model_config", None)
+        if callable(getter):
+            try:
+                model_config = getter()
+            except Exception:
+                pass
+
+    hf_config = getattr(model_config, "hf_config", None)
+    try:
+        delay = int(getattr(hf_config, "streaming_speech_delay", 0) or 0)
+    except Exception:
+        delay = 0
+    transfer_manager._easymagpie_speech_delay = delay
+    logger.info("easymagpie: resolved streaming_speech_delay=%d (leading warm-up frames dropped)", delay)
+    return delay
+
+
+def _is_warmup_frame(request: Any, transfer_manager: Any) -> bool:
+    """Whether the newest talker frame is still within the leading
+    ``streaming_speech_delay`` warm-up window.
+
+    Stateless: uses the request's own generated-token count as the decode-step
+    index (each decode step emits exactly one backbone token and one audio frame),
+    so there is nothing to store or clean up per request. The frame at decode step
+    ``k`` (0-indexed) is warm-up iff ``k < speech_delay``; ``output_token_ids``
+    already includes the current step's token, hence ``len <= speech_delay``.
+    """
+    speech_delay = _resolve_speech_delay(transfer_manager)
+    if speech_delay <= 0:
+        return False
+    n_emitted = len(getattr(request, "output_token_ids", None) or [])
+    return n_emitted <= speech_delay
+
+
 def talker2code2wav_async_chunk(
     transfer_manager: Any,
     pooling_output: OmniPayload | dict[str, Any] | None,
@@ -260,6 +314,10 @@ def talker2code2wav_async_chunk(
     window of ``codec_left_context_frames + chunk`` frames with
     ``meta.left_context_size`` set so Stage 1 trims the overlap after decode.
 
+    The leading ``streaming_speech_delay`` frames are the talker's warm-up (audio
+    channel masked); they carry throw-away codes and are dropped here before
+    accumulation so they never reach the codec.
+
     NOTE: the installed vllm_omni chunk_transfer_adapter calls this as
     ``func(transfer_manager=..., pooling_output=..., request=..., is_finished=...)``
     — the second arg must be named ``pooling_output`` (it is the per-step
@@ -270,7 +328,7 @@ def talker2code2wav_async_chunk(
 
     if isinstance(pooling_output, Mapping):
         frame = _extract_last_frame(pooling_output)
-        if frame is not None:
+        if frame is not None and not _is_warmup_frame(request, transfer_manager):
             transfer_manager.code_prompt_token_ids[request_id].append(frame.cpu().tolist())
     elif not finished:
         return None

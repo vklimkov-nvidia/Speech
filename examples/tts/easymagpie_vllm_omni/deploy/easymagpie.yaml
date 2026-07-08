@@ -42,10 +42,22 @@ connectors:
       # overlaps prior frames into each window; code2wav trims the overlap after
       # decode (meta.left_context_size). Set left context > 0 only if the codec
       # shows chunk-boundary artifacts.
-      codec_chunk_frames: 15               # fixed 15-frame chunk
-      codec_left_context_frames: 0         # >0 only if you see boundary artifacts
-      initial_codec_chunk_frames: 15       # first window size (was 1 for low TTFA)
-      decode_cudagraph_capture_frames: [15]   # capture exactly the 15-frame shape
+      # Sliding codec window: hop of 3 NEW frames + 12 overlap frames reused from
+      # the previous inference as left context. code2wav trims the first 12 frames'
+      # audio (meta.left_context_size) so only the 3 new frames are kept — the
+      # overlap smooths chunk-boundary artifacts. The producer's window ramps up
+      # (1,4,7,10,13,15,...) since there is no history to reuse at the start, but
+      # code2wav then right-pads every short window to codec_fixed_chunk_frames so
+      # the codec ALWAYS decodes exactly 15 frames (one CUDA-graph size).
+      codec_chunk_frames: 3                # hop: new frames emitted per inference
+      codec_left_context_frames: 12        # reused overlap -> window = 12 + 3 = 15
+      initial_codec_chunk_frames: 1        # first emission after 1 frame (low TTFA)
+      # Fixed codec chunk: Stage 1 right-pads every window (the ramp-up and the EOS
+      # tail are < 15) up to this many frames so the codec always runs one shape.
+      # Padding is on the right (causal codec) and its audio is sliced off after
+      # decode. Defaults to codec_left_context_frames + codec_chunk_frames.
+      codec_fixed_chunk_frames: 15
+      decode_cudagraph_capture_frames: [15]   # single capture size (no-op under enforce_eager)
 
 stages:
   # IMPORTANT: do NOT nest tuning fields under an ``engine_args:`` sub-block.

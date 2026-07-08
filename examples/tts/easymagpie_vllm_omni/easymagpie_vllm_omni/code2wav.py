@@ -159,6 +159,10 @@ class EasyMagpieCode2Wav(nn.Module):
         self._samples_per_frame = 0
         self._output_sample_rate = int(getattr(self.hf_config, "codec_output_sample_rate", 22050))
         self._logged_codec_stats = False
+        # Fixed codec chunk (frames). When > 0 every decode is right-padded to this
+        # many frames so the codec always runs a single shape (one CUDA graph).
+        # Resolved from connector config in load_weights().
+        self._fixed_chunk_frames = 0
 
     # ------------------------------------------------------------------
     # vLLM runner shims
@@ -252,17 +256,36 @@ class EasyMagpieCode2Wav(nn.Module):
             # codebook-major flat [q*F] -> (q, F) -> (F, q) -> (1, F, q)
             codes_fq = flat.reshape(q, frames).transpose(0, 1).contiguous().unsqueeze(0)
 
+            # Fixed-size codec chunks: right-pad short windows (streaming ramp-up
+            # and the EOS tail are < fixed) up to the fixed frame count so the codec
+            # ALWAYS decodes the same shape -> a single CUDA-graph size. Pad on the
+            # RIGHT (replicating the last real frame) because the codec is causal:
+            # frames appended after the real ones cannot change the real frames'
+            # audio, and the extra audio they generate is sliced off below.
+            pad_frames = 0
+            fixed = self._fixed_chunk_frames
+            if fixed and frames < fixed:
+                pad_frames = fixed - frames
+                pad = codes_fq[:, -1:, :].expand(-1, pad_frames, -1)
+                codes_fq = torch.cat([codes_fq, pad], dim=1).contiguous()
+
             if not self._logged_codec_stats:
                 self._logged_codec_stats = True
                 logger.info(
-                    "EasyMagpie Code2Wav codec: frames=%d q=%d range=[%d,%d]",
+                    "EasyMagpie Code2Wav codec: frames=%d (+%d pad -> %d) q=%d range=[%d,%d]",
                     frames,
+                    pad_frames,
+                    frames + pad_frames,
                     q,
                     int(codes_fq.min().item()),
                     int(codes_fq.max().item()),
                 )
 
             wav = self._decode_codes(codes_fq)[0]  # (L,)
+            # Drop the audio generated from the right padding (keep only real frames).
+            if pad_frames > 0 and spf > 0:
+                keep = max(0, wav.shape[0] - pad_frames * spf)
+                wav = wav[:keep]
             start = max(0, left_context[i] * spf)
             if start >= wav.shape[0]:
                 continue
@@ -325,6 +348,24 @@ class EasyMagpieCode2Wav(nn.Module):
             self._output_sample_rate,
             converter is not None,
         )
+
+        # Resolve the fixed codec chunk size (frames). Prefer an explicit
+        # ``codec_fixed_chunk_frames``; otherwise derive it from the streaming
+        # window = ``codec_left_context_frames`` (reused overlap) + ``codec_chunk_frames``
+        # (new-frame hop). With this set every decode is right-padded to this size.
+        extra_cfg = self._connector_extra()
+        hop = int(extra_cfg.get("codec_chunk_frames") or 0)
+        left = int(extra_cfg.get("codec_left_context_frames") or 0)
+        fixed = int(extra_cfg.get("codec_fixed_chunk_frames") or 0) or (hop + left)
+        self._fixed_chunk_frames = fixed if fixed > 0 else 0
+        if self._fixed_chunk_frames:
+            logger.info(
+                "EasyMagpie Code2Wav: fixed codec chunk = %d frames (left_context=%d + hop=%d); "
+                "short windows are right-padded to this size and the padded audio is sliced off.",
+                self._fixed_chunk_frames,
+                left,
+                hop,
+            )
 
         self._maybe_enable_cudagraph(device)
         # The codec (decode_module.*) params are loaded from the bundled .nemo in
@@ -436,7 +477,12 @@ class EasyMagpieCode2Wav(nn.Module):
         extra_cfg = self._connector_extra()
         capture_frames = self._int_list(extra_cfg.get("decode_cudagraph_capture_frames"))
         if not capture_frames:
-            capture_frames = self._default_capture_frames(extra_cfg)
+            # With a fixed chunk every decode is exactly that many frames, so a
+            # single capture size suffices; otherwise fall back to a bucket set.
+            if self._fixed_chunk_frames:
+                capture_frames = [self._fixed_chunk_frames]
+            else:
+                capture_frames = self._default_capture_frames(extra_cfg)
         capture_batch_sizes = self._int_list(extra_cfg.get("decode_cudagraph_batch_sizes")) or [1]
 
         self._graph = CUDAGraphCodecDecoder(
