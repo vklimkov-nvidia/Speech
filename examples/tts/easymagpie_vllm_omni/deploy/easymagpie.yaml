@@ -1,0 +1,100 @@
+# EasyMagpieTTS two-stage deploy: talker (text -> stacked acoustic codes) ->
+# code2wav (codes -> audio), fully in-engine (no external codec service).
+#
+# Mirrors vllm_omni/deploy/qwen3_tts.yaml. Pass this file to `vllm-omni serve`
+# (see scripts/run_server.sh) or to AsyncOmni(model=..., deploy_config=<this>)
+# (see scripts/synthesize_two_stage.py). The `pipeline: easymagpie` key forces
+# routing to EASYMAGPIE_PIPELINE (the talker's HF config reports the generic
+# model_type "nemotron_h", so it cannot be auto-detected by model_type alone).
+#
+# Stage 0 (talker) runs the Nemotron-H hybrid-Mamba backbone + local
+# transformer; Stage 1 (code2wav) decodes the bundled NeMo codec (see
+# scripts/easy_magpietts_convert_to_vllm.py --bundle_codec, on by default).
+pipeline: easymagpie
+
+# MUST be true for this pipeline. In the installed vllm_omni (0.21.0rc1) the
+# non-async ("full_payload") data plane that ships the talker's codes to Stage 1
+# is hard-coded to Qwen3-Omni only (see
+# omni_connector_model_runner_mixin._should_accumulate_full_payload_output, which
+# returns False for any model_arch != "Qwen3OmniMoeForConditionalGeneration").
+# With async_chunk=false our Stage 1 therefore never receives real codes and
+# decodes the zero placeholder (symptom: "codec ... range=[0,0]"). The async_chunk
+# path (talker2code2wav_async_chunk -> chunk_transfer_adapter) is model-agnostic
+# and is what actually delivers the codes. codec_chunk_frames below sets the
+# fixed 15-frame streaming window. The engine's output_processor accumulates the
+# per-chunk audio into mm["audio"] and concatenates it on the finished output,
+# which synthesize_two_stage.py reads.
+async_chunk: true
+
+# Pipeline-wide engine settings applied to every stage.
+trust_remote_code: true
+dtype: float16
+
+connectors:
+  connector_of_shared_memory:
+    name: SharedMemoryConnector
+    extra:
+      shm_threshold_bytes: 65536
+      connector_get_sleep_s: 0.01
+      connector_get_max_wait_first_chunk: 3000
+      connector_get_max_wait: 300
+      # Streaming (async_chunk: true) codec windowing. codec_left_context_frames
+      # overlaps prior frames into each window; code2wav trims the overlap after
+      # decode (meta.left_context_size). Set left context > 0 only if the codec
+      # shows chunk-boundary artifacts.
+      codec_chunk_frames: 15               # fixed 15-frame chunk
+      codec_left_context_frames: 0         # >0 only if you see boundary artifacts
+      initial_codec_chunk_frames: 15       # first window size (was 1 for low TTFA)
+      decode_cudagraph_capture_frames: [15]   # capture exactly the 15-frame shape
+
+stages:
+  # IMPORTANT: do NOT nest tuning fields under an ``engine_args:`` sub-block.
+  # vllm_omni's _parse_stage_deploy, when a stage has an ``engine_args`` key,
+  # reads recognized fields (enforce_eager, max_num_seqs, gpu_memory_utilization,
+  # max_model_len, ...) ONLY from inside that sub-block and ignores the top-level
+  # siblings. Keep everything flat at the stage level; unknown keys (e.g.
+  # mamba_ssm_cache_dtype) are passed through to vLLM EngineArgs as engine_extras.
+  - stage_id: 0
+    max_num_seqs: 8
+    gpu_memory_utilization: 0.45
+    # enforce_eager disables vLLM's own CUDA-graph capture (the ~51 PIECEWISE
+    # graphs) — set true for now to avoid capture-time OOM while confirming the
+    # pipeline runs. Flip back to false later to regain talker throughput.
+    enforce_eager: true
+    async_scheduling: true
+    enable_prefix_caching: false
+    max_num_batched_tokens: 4096
+    max_model_len: 4096
+    devices: "0"
+    output_connectors:
+      to_stage_1: connector_of_shared_memory
+    # EasyMagpie talker engine specifics (hybrid Mamba + inputs_embeds path),
+    # flat so they are parsed (passed through as engine_extras -> EngineArgs).
+    mamba_ssm_cache_dtype: float32
+    attention_backend: TRITON_ATTN
+    skip_tokenizer_init: true
+    default_sampling_params:
+      temperature: 0.0
+      detokenize: false
+      max_tokens: 2048
+
+  - stage_id: 1
+    max_num_seqs: 8
+    gpu_memory_utilization: 0.35
+    # enforce_eager disables vLLM's own CUDA-graph capture for the code2wav stage
+    # (the ~31 graphs). NOTE: it also disables the codec decode CUDA graph, so
+    # decode_cudagraph_capture_frames above is a no-op while this is true — the
+    # codec decodes eagerly. Flip to false to re-enable the single 15-frame codec
+    # graph once you've confirmed correctness.
+    enforce_eager: true
+    async_scheduling: true
+    enable_prefix_caching: false
+    # Prefill length is Q * num_frames (e.g. 16 * 2048 = 32768); keep headroom.
+    max_num_batched_tokens: 65536
+    max_model_len: 65536
+    devices: "0"
+    input_connectors:
+      from_stage_0: connector_of_shared_memory
+    default_sampling_params:
+      temperature: 0.0
+      max_tokens: 65536

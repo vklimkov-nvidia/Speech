@@ -593,7 +593,20 @@ class EasyMagpieTTSForConditionalGeneration(
     # ------------------------------------------------------------------
 
     def make_omni_output(self, model_outputs, **_: Any) -> OmniOutput:
-        """Surface the sampled codes (``BT x num_codebooks``) under ``audio_codes``."""
+        """Surface the sampled codes (``BT x num_codebooks``).
+
+        The codes are exposed under **two** keys so the same model serves both
+        deployment shapes:
+
+        * ``audio_codes`` — the flat single-stage key read by the standalone
+          (Triton/TRT codec) clients and by :meth:`postprocess`.
+        * ``codes.audio`` — the nested :class:`~vllm_omni.data_entry_keys.OmniPayload`
+          layout consumed by the in-engine two-stage pipeline (Code2Wav). The
+          AR runner's ``flatten_payload`` turns this into the ``codes.audio``
+          dotted key, which CONCATenates across decode steps into the full
+          acoustic sequence for the Stage-1 producer / async-chunk streamer
+          (see :mod:`easymagpie_vllm_omni.stage_processors`).
+        """
         if isinstance(model_outputs, OmniOutput):
             return model_outputs
         hidden = model_outputs
@@ -601,7 +614,7 @@ class EasyMagpieTTSForConditionalGeneration(
         audio_codes = self._out_codes[:num_tokens].clone()
         return OmniOutput(
             text_hidden_states=hidden,
-            multimodal_outputs={"audio_codes": audio_codes},
+            multimodal_outputs={"audio_codes": audio_codes, "codes": {"audio": audio_codes}},
         )
 
     # ------------------------------------------------------------------

@@ -8,9 +8,77 @@ transformer over a 25 fps spectral codec).
 The vLLM-Omni model definition (talker that runs the backbone + local
 transformer as a single CUDA graph during uniform-batch decoding, piecewise
 during prefill/mixed) lives in
-[`vllm_plugin_easymagpie_omni/`](vllm_plugin_easymagpie_omni). A Triton
-ensemble wraps it together with a TensorRT codec decoder to serve gRPC
-streaming requests.
+[`vllm_plugin_easymagpie_omni/`](vllm_plugin_easymagpie_omni).
+
+There are **two ways** to turn the talker's acoustic codes into a waveform:
+
+* **In-engine two-stage pipeline (recommended, no external service)** — a
+  Stage-1 `EasyMagpieCode2Wav` runs the NeMo codec decoder directly inside
+  vLLM-Omni (optionally CUDA-graphed), exactly like Qwen3-TTS's `code2wav`
+  stage. See [In-engine two-stage pipeline](#in-engine-two-stage-pipeline)
+  below.
+* **Triton + TensorRT codec service** — a Triton ensemble wraps the talker
+  together with a TensorRT codec decoder for gRPC streaming. See
+  [Triton service pipeline](#triton-service-pipeline) below.
+
+## In-engine two-stage pipeline
+
+The two-stage pipeline (`EASYMAGPIE_PIPELINE` in
+[`easymagpie_vllm_omni/pipeline.py`](easymagpie_vllm_omni/pipeline.py)) chains
+the talker (Stage 0, autoregressive) into `EasyMagpieCode2Wav` (Stage 1,
+generative) with the same structure as the Qwen3-TTS reference pipeline:
+
+- **Stage 0** — the existing talker; emits stacked acoustic codes under
+  `codes.audio`.
+- **Stage 1** — [`easymagpie_vllm_omni/code2wav.py`](easymagpie_vllm_omni/code2wav.py)
+  reproduces the `export_codec_decoder_onnx.py` decode path (clamp specials →
+  unstack → FSQ index-convert → `AudioCodecModel.decode`) and optionally
+  captures it as a CUDA graph
+  ([`cuda_graph_codec_wrapper.py`](easymagpie_vllm_omni/cuda_graph_codec_wrapper.py)).
+- **Stage plumbing** — [`stage_processors.py`](easymagpie_vllm_omni/stage_processors.py)
+  turns the talker's per-frame codes into the codebook-major flat stream the
+  codec consumes (full-payload for end-to-end mode, chunked windows for
+  `async_chunk` streaming).
+
+Steps:
+
+1. **Convert with the codec bundled** (the `--bundle_codec` default copies the
+   codec `.nemo` and the FSQ `vector_quantizer` config into `<model>/codec/`, so
+   Stage 1 is self-contained):
+
+   ```bash
+   python examples/tts/easymagpie_vllm_omni/scripts/easy_magpietts_convert_to_vllm.py \
+       --nemo_file <ckpt>/2605_EMTTS_SmallMamba_Step150k_posttrained_epoch12.nemo \
+       --codec_model_path <ckpt>/25fps_spectral_codec_with_bandwidth_extension.nemo \
+       --outdir examples/tts/easymagpie_vllm_omni/easymp_vllm_model \
+       --context_audio english_sample.wav --speaker_name eng \
+       --phoneme_tokenizer_path <ckpt>/bpe_ipa_tokenizer_2048_en_de_es_fr_hi_it_vi_zh_ko-KR_pt-BR_ar.json
+   ```
+
+2. **Offline synthesis** (single engine, both stages):
+
+   ```bash
+   python examples/tts/easymagpie_vllm_omni/scripts/synthesize_two_stage.py \
+       --model examples/tts/easymagpie_vllm_omni/easymp_vllm_model \
+       --text "Hello, welcome to the voice synthesis demo." --out out.wav
+   ```
+
+3. **Or serve it** (OpenAI-compatible vLLM-Omni server):
+
+   ```bash
+   examples/tts/easymagpie_vllm_omni/scripts/run_server.sh \
+       examples/tts/easymagpie_vllm_omni/easymp_vllm_model 8091
+   ```
+
+Deployment knobs (stage placement, `async_chunk` streaming vs end-to-end, codec
+chunking, Code2Wav CUDA-graph capture buckets) live in
+[`deploy/easymagpie.yaml`](deploy/easymagpie.yaml).
+
+## Triton service pipeline
+
+The following steps build the Triton ensemble (talker python backend + TensorRT
+codec plan). Use this only if you specifically need the standalone TRT codec
+service; the in-engine pipeline above needs no ONNX/TRT export.
 
 ### Pipeline
 

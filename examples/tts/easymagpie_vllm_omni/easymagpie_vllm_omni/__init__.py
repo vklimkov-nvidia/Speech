@@ -26,3 +26,13 @@ vLLM's ``ModelRegistry`` through the ``vllm.general_plugins`` entry point.
 from easymagpie_vllm_omni.config import EASYMAGPIE_SMALLMAMBA, EasyMagpieOmniArch
 
 __all__ = ["EASYMAGPIE_SMALLMAMBA", "EasyMagpieOmniArch"]
+
+
+def __getattr__(name: str):
+    # Lazily expose the two-stage pipeline config without importing vllm_omni
+    # (a heavy dependency) at package import time.
+    if name == "EASYMAGPIE_PIPELINE":
+        from easymagpie_vllm_omni.pipeline import EASYMAGPIE_PIPELINE
+
+        return EASYMAGPIE_PIPELINE
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

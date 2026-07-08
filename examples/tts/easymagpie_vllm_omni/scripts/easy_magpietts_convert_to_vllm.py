@@ -30,6 +30,13 @@ It contains:
 * ``speaker_embeddings/<name>.pt`` (optional) — pre-computed speaker-encoder
   outputs for one or more reference audio files, used as the ``speaker_embedding``
   input at inference time.
+* ``codec/codec.nemo`` + ``codec/vector_quantizer.yaml`` (optional, on by
+  default) — the audio codec checkpoint and the model's FSQ ``vector_quantizer``
+  config, bundled so the in-engine two-stage pipeline's Code2Wav stage
+  (:class:`easymagpie_vllm_omni.code2wav.EasyMagpieCode2Wav`) can decode acoustic
+  codes to a waveform without an external Triton/TRT codec service. Disable with
+  ``--no_bundle_codec`` when serving the talker only (single-stage / external
+  codec).
 
 Compared to running the reference model, the character-aware subword (CAS)
 encoder is collapsed into a single pre-computed lookup table mapping
@@ -51,6 +58,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 
 import torch
 import tqdm
@@ -153,6 +161,14 @@ def parse_args():
         "--speaker_name",
         default="default",
         help="Name for the saved speaker embedding (speaker_embeddings/<name>.pt).",
+    )
+    parser.add_argument(
+        "--bundle_codec",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Bundle the codec .nemo + FSQ vector_quantizer config into the model dir "
+        "(codec/) so the in-engine two-stage pipeline's Code2Wav can decode without an "
+        "external codec service. Use --no-bundle-codec to serve the talker only.",
     )
     parser.add_argument("--context_audio_duration", type=float, default=5.0)
     parser.add_argument(
@@ -377,6 +393,39 @@ def select_weights(state_dict: dict, hidden_dim: int, dtype: torch.dtype) -> dic
     return weights
 
 
+def bundle_codec(model, codec_model_path: str, outdir: str) -> dict:
+    """Copy the codec .nemo + the model's FSQ ``vector_quantizer`` config into ``outdir``.
+
+    The Code2Wav stage rebuilds the exact decode path used by
+    ``scripts/export_codec_decoder_onnx.py`` (clamp specials -> unstack -> FSQ
+    index convert -> ``AudioCodecModel.decode``). It needs (a) the codec
+    checkpoint and (b) the model's regrouped ``vector_quantizer`` config to build
+    the ``VectorQuantizerIndexConverter``. Both are bundled under ``codec/`` and
+    referenced by relative paths in ``config.json``.
+
+    Returns the config.json fragment describing the bundled artifacts.
+    """
+    codec_dir = os.path.join(outdir, "codec")
+    os.makedirs(codec_dir, exist_ok=True)
+
+    codec_dst = os.path.join(codec_dir, "codec.nemo")
+    logging.info(f"Bundling codec checkpoint {codec_model_path} -> {codec_dst}")
+    shutil.copyfile(codec_model_path, codec_dst)
+
+    fragment: dict = {"codec_model_path": "codec/codec.nemo"}
+
+    vq_cfg = model.cfg.get("vector_quantizer")
+    if vq_cfg is not None:
+        vq_dst = os.path.join(codec_dir, "vector_quantizer.yaml")
+        OmegaConf.save(config=vq_cfg, f=vq_dst)
+        fragment["codec_vq_config"] = "codec/vector_quantizer.yaml"
+        logging.info(f"Saved FSQ vector_quantizer config -> {vq_dst}")
+    else:
+        logging.info("Checkpoint has no vector_quantizer override; Code2Wav will use codec native decode.")
+
+    return fragment
+
+
 def save_text_tokenizer(model, outdir: str, override: str | None) -> None:
     """Export the checkpoint's text-conditioning tokenizer into ``outdir``."""
     from transformers import AutoTokenizer
@@ -419,6 +468,11 @@ def convert(args) -> None:
 
     # ── 2. config.json ───────────────────────────────────────────────────
     config = build_config(model, vocab_size, args.dtype)
+    # Bundle the codec + FSQ vector_quantizer config so the in-engine two-stage
+    # Code2Wav can decode acoustic codes to a waveform (writes into codec/ and
+    # records relative paths in config.json).
+    if args.bundle_codec:
+        config.update(bundle_codec(model, args.codec_model_path, args.outdir))
     with open(os.path.join(args.outdir, "config.json"), "w") as f:
         json.dump(config, f, indent=2)
     logging.info("Saved config.json")
