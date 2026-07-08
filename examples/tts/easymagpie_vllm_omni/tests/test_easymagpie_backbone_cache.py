@@ -170,6 +170,54 @@ def _minimal_refit_model() -> EasyMagpieTTSForConditionalGeneration:
     return model
 
 
+def test_cfg_unconditional_prefill_replaces_the_full_context_with_cfg_unk():
+    model = EasyMagpieTTSForConditionalGeneration.__new__(EasyMagpieTTSForConditionalGeneration)
+    torch.nn.Module.__init__(model)
+    model._combined_embeddings = torch.zeros(8, 3)
+    model.task_embedding = None
+    model.context_text_embedding = torch.nn.Embedding(10, 3)
+    model.cfg_unk_token_id = 9
+    model._encode_context_text = lambda _text, device: torch.tensor([2, 4], device=device)
+    speaker_embedding = torch.randn(4, 3)
+
+    result = model._build_prefill_embeds(
+        torch.device("cpu"),
+        {
+            "speaker_embedding": speaker_embedding,
+            "context_text": "[EN]",
+            "cfg_role": "unconditional",
+        },
+    )
+
+    expected_row = model.context_text_embedding(torch.tensor([9]))
+    assert result.shape == (6, 3)
+    assert torch.equal(result, expected_row.expand(6, -1))
+
+
+def test_cfg_unconditional_decode_keeps_audio_but_masks_text():
+    model = EasyMagpieTTSForConditionalGeneration.__new__(EasyMagpieTTSForConditionalGeneration)
+    torch.nn.Module.__init__(model)
+    model.has_phoneme = False
+    model._cfg_roles = torch.tensor([1, 2], dtype=torch.long)
+    model._dec_audio_codes = torch.tensor([[1, 2], [3, 4]], dtype=torch.long)
+    model._dec_audio_valid = torch.ones(2, dtype=torch.long)
+    model._dec_text_tokens = torch.tensor([1, 1], dtype=torch.long)
+    model._dec_text_mask = torch.ones(2, dtype=torch.long)
+    model.text_embedding = torch.nn.Embedding(3, 2)
+    with torch.no_grad():
+        model.text_embedding.weight.zero_()
+        model.text_embedding.weight[1] = torch.tensor([10.0, 20.0])
+    model.code_predictor = SimpleNamespace(
+        embed_audio_frame=lambda codes: codes.float(),
+    )
+    combined = torch.zeros(2, 2)
+
+    model._assemble_decode_embeddings(combined, torch.tensor([0, 1]))
+
+    assert torch.equal(combined[0], torch.tensor([11.0, 22.0]))
+    assert torch.equal(combined[1], torch.tensor([3.0, 4.0]))
+
+
 def test_non_text_refit_allows_static_backbone_and_text_targets():
     model = _minimal_refit_model()
     model._easymagpie_allow_missing_text_tables_refit = True

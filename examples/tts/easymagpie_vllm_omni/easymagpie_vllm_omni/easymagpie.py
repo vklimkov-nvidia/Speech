@@ -44,6 +44,10 @@ inside the engine.
 
 Per-request I/O (via ``additional_information``):
 
+* ``cfg_enabled`` / ``cfg_num_outputs`` / ``cfg_scale`` opt a parallel-sampling
+  parent into paired classifier-free guidance. The scheduler annotates its
+  ``2*n`` child requests with ``cfg_role`` and ``cfg_pair_index``; ordinary
+  requests never enter this path.
 * ``speaker_embedding`` (prefill only) — ``(T_audio, embedding_dim)``
   speaker-encoded context-audio embedding. ``preprocess`` assembles the full
   prefill context embedding itself as
@@ -294,6 +298,7 @@ class EasyMagpieTTSForConditionalGeneration(
         # Appended to the in-model-tokenized target text stream (see
         # :meth:`_encode_text_stream`).
         self.text_eos_id = text_vocab_size - 2
+        self.cfg_unk_token_id = text_vocab_size - 1
 
         # Task ("service token") embedding — a single learned per-mode row
         # prepended to the prefill context for multi-mode checkpoints. Built only
@@ -341,6 +346,11 @@ class EasyMagpieTTSForConditionalGeneration(
         self._dec_text_mask = torch.zeros(max_num_tokens, dtype=torch.long)
         self._dec_audio_codes = torch.zeros(max_num_tokens, self.num_codebooks, dtype=torch.long)
         self._dec_audio_valid = torch.zeros(max_num_tokens, dtype=torch.long)
+        # CFG roles: 0=ordinary request, 1=conditional, 2=unconditional.
+        self._cfg_roles = torch.zeros(max_num_tokens, dtype=torch.long)
+        self._cfg_step_active = False
+        self._cfg_step_num_outputs = 0
+        self._cfg_step_scale = 1.0
         if self.has_phoneme:
             self._dec_phoneme_tokens = torch.zeros(
                 max_num_tokens, arch.phoneme_stacking_factor, dtype=torch.long
@@ -693,8 +703,46 @@ class EasyMagpieTTSForConditionalGeneration(
 
         hidden_states = self.backbone(**backbone_kwargs)
 
-        # Sample codes (local transformer) only where needed.
-        if decode_idx is None:
+        # Sample codes (local transformer) only where needed. CFG requests are
+        # kept as complete parent blocks by the scheduler and reordered here to
+        # the reference layout [all conditional, all unconditional].
+        if bool(getattr(self, "_cfg_step_active", False)):
+            if decode_idx is None:
+                valid = torch.arange(num_tokens, device=hidden_states.device, dtype=torch.long)
+            else:
+                valid = decode_idx[:num_req]
+            cfg_n = int(getattr(self, "_cfg_step_num_outputs", 0))
+            roles = self._cfg_roles[valid]
+            conditional_rows = valid[roles == 1]
+            unconditional_rows = valid[roles == 2]
+            if (
+                cfg_n <= 0
+                or int(conditional_rows.numel()) <= 0
+                or int(conditional_rows.numel()) != int(unconditional_rows.numel())
+            ):
+                raise RuntimeError(
+                    "EasyMagpie CFG decode rows are not complete pairs: "
+                    f"conditional={int(conditional_rows.numel())}, "
+                    f"unconditional={int(unconditional_rows.numel())}, outputs={cfg_n}"
+                )
+            ordered = torch.cat([conditional_rows, unconditional_rows], dim=0)
+            ctx = get_forward_context()
+            orig_bd = ctx.batch_descriptor
+            ctx.batch_descriptor = BatchDescriptor(num_tokens=int(ordered.numel()))
+            try:
+                codes, code_logprobs, sampling_logprobs = self.code_predictor.generate_codes_with_cfg_logprobs(
+                    hidden_states[ordered], cfg_scale=float(getattr(self, "_cfg_step_scale", 1.0))
+                )
+            finally:
+                ctx.batch_descriptor = orig_bd
+            self._out_codes[ordered] = codes
+            self._out_code_logprobs[ordered] = code_logprobs
+            self._out_code_sampling_logprobs[ordered] = sampling_logprobs
+            self._out_frame_logprobs[ordered] = code_logprobs.sum(dim=-1)
+            self._flag_audio_eos(codes, ordered)
+            if self.has_phoneme:
+                self._predict_phonemes_cfg(hidden_states, ordered)
+        elif decode_idx is None:
             codes, code_logprobs, sampling_logprobs = self.code_predictor.generate_codes_with_logprobs(hidden_states)
             self._out_codes[:num_tokens].copy_(codes)
             self._out_code_logprobs[:num_tokens].copy_(code_logprobs)
@@ -764,12 +812,15 @@ class EasyMagpieTTSForConditionalGeneration(
         # Text: current subword token (gated by validity).
         text_emb = self.text_embedding(self._dec_text_tokens[idx])
         text_emb = text_emb * self._dec_text_mask[idx].unsqueeze(-1).to(text_emb.dtype)
+        conditional = (self._cfg_roles[idx] != 2).unsqueeze(-1).to(text_emb.dtype)
+        text_emb = text_emb * conditional
         assembled += text_emb
 
         # Phoneme: previous predicted phoneme (gated by validity).
         if self.has_phoneme:
             phon_emb = self._embed_phoneme(self._dec_phoneme_tokens[idx])
             phon_emb = phon_emb * self._dec_phoneme_valid[idx].unsqueeze(-1).to(phon_emb.dtype)
+            phon_emb = phon_emb * conditional
             assembled += phon_emb
         combined[idx] = assembled
 
@@ -804,6 +855,17 @@ class EasyMagpieTTSForConditionalGeneration(
 
         self._dec_phoneme_tokens[idx] = preds
         self._dec_phoneme_valid[idx] = 1
+
+    @torch.no_grad()
+    def _predict_phonemes_cfg(self, hidden_states: torch.Tensor, ordered) -> None:
+        """Predict phonemes from conditional rows and mirror them to their CFG peers."""
+
+        actual_batch_size = int(ordered.numel()) // 2
+        conditional_rows = ordered[:actual_batch_size]
+        unconditional_rows = ordered[actual_batch_size:]
+        self._predict_phonemes(hidden_states, conditional_rows)
+        self._dec_phoneme_tokens[unconditional_rows] = self._dec_phoneme_tokens[conditional_rows]
+        self._dec_phoneme_valid[unconditional_rows] = self._dec_phoneme_valid[conditional_rows]
 
     # ------------------------------------------------------------------
     # compute_logits — dummy (real output is the codes tensor)
@@ -1012,6 +1074,7 @@ class EasyMagpieTTSForConditionalGeneration(
             "_dec_text_mask",
             "_dec_audio_codes",
             "_dec_audio_valid",
+            "_cfg_roles",
             "_dec_phoneme_tokens",
             "_dec_phoneme_valid",
             "_out_codes",
@@ -1090,6 +1153,12 @@ class EasyMagpieTTSForConditionalGeneration(
         device: torch.device,
         info_dict: dict[str, Any],
     ) -> tuple[torch.Tensor, torch.Tensor, dict[str, Any]]:
+        row_start = self._batch_slot_offset(input_ids, 0)
+        if row_start == 0:
+            self._cfg_step_active = False
+            self._cfg_step_num_outputs = 0
+            self._cfg_step_scale = 1.0
+
         # Forward the audio (local-transformer) sampling params from the request.
         # vLLM's ``SamplingParams.temperature`` drives only the dummy backbone
         # token sampler, so the real audio temperature/top-k are passed via
@@ -1113,7 +1182,6 @@ class EasyMagpieTTSForConditionalGeneration(
             )
             take = torch.cat([take, pad_rows], dim=0)
 
-        row_start = self._batch_slot_offset(input_ids, 0)
         self._clear_runtime_rows(row_start, row_start + span_len)
 
         info_update = {
@@ -1171,6 +1239,15 @@ class EasyMagpieTTSForConditionalGeneration(
             + (f" with ndim={speaker_embedding.ndim}" if isinstance(speaker_embedding, torch.Tensor) else "")
         )
 
+        context_text = self._first_str(info_dict.get("context_text")) or _DEFAULT_CONTEXT_TEXT
+        ctx_ids = self._encode_context_text(context_text, device)
+        task_len = 1 if self.task_embedding is not None else 0
+        total_context_len = task_len + int(speaker_embedding.shape[0]) + int(ctx_ids.numel())
+        if str(info_dict.get("cfg_role") or "").lower() == "unconditional":
+            cfg_id = torch.tensor([self.cfg_unk_token_id], device=device, dtype=torch.long)
+            cfg_row = self.context_text_embedding(cfg_id).to(dtype)
+            return cfg_row.expand(total_context_len, -1).clone()
+
         parts: list[torch.Tensor] = []
 
         # Task / "service token" embedding (prepended), when present.
@@ -1184,8 +1261,6 @@ class EasyMagpieTTSForConditionalGeneration(
         parts.append(speaker_embedding.to(device=device, dtype=dtype))
 
         # Context text: tokenized in-model and embedded through the baked table.
-        context_text = self._first_str(info_dict.get("context_text")) or _DEFAULT_CONTEXT_TEXT
-        ctx_ids = self._encode_context_text(context_text, device)
         if ctx_ids.numel() > 0:
             parts.append(self.context_text_embedding(ctx_ids).to(dtype))
 
@@ -1300,6 +1375,27 @@ class EasyMagpieTTSForConditionalGeneration(
         decode_offset = int(info_dict.get("decode_offset", 0) or 0)
         info_update: dict[str, Any] = {"decode_offset": decode_offset + 1}
         self._clear_runtime_rows(start, start + 1)
+        if start == 0:
+            self._cfg_step_active = False
+            self._cfg_step_num_outputs = 0
+            self._cfg_step_scale = 1.0
+        cfg_enabled = bool(info_dict.get("cfg_enabled", False))
+        if cfg_enabled:
+            role = str(info_dict.get("cfg_role") or "").lower()
+            if role not in {"conditional", "unconditional"}:
+                raise RuntimeError(f"EasyMagpie CFG request has invalid role {role!r}")
+            cfg_n = int(info_dict.get("cfg_num_outputs", 0) or 0)
+            cfg_scale = float(info_dict.get("cfg_scale", 1.0) or 1.0)
+            if cfg_n <= 0:
+                raise RuntimeError("EasyMagpie CFG request is missing cfg_num_outputs")
+            if self._cfg_step_active and (
+                cfg_n != self._cfg_step_num_outputs or cfg_scale != self._cfg_step_scale
+            ):
+                raise RuntimeError("EasyMagpie CFG batch mixed incompatible CFG contracts")
+            self._cfg_step_active = True
+            self._cfg_step_num_outputs = cfg_n
+            self._cfg_step_scale = cfg_scale
+            self._cfg_roles[start] = 1 if role == "conditional" else 2
         self._decode_offsets[start] = decode_offset
 
         # ── Text channel ── (delay 0: one subword per step from step 0). The text

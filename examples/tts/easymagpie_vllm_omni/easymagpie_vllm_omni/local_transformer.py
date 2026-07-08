@@ -504,3 +504,69 @@ class EasyMagpieCodePredictor(nn.Module):
                 buf[:, k + 1, :] = self.local_transformer_in_projection(emb)
 
         return out[:num_tokens], out_logprobs[:num_tokens], out_sampling_logprobs[:num_tokens]
+
+    @torch.no_grad()
+    def generate_codes_with_cfg_logprobs(
+        self,
+        dec_hidden: torch.Tensor,
+        *,
+        cfg_scale: float,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Sample paired conditional/unconditional rows with classifier-free guidance.
+
+        ``dec_hidden`` is ordered as ``[all conditional, all unconditional]``.
+        Every codebook combines the paired logits before sampling, then copies
+        the selected code back to the unconditional stream so both backbone KV
+        states receive the same audio history on the next frame.
+        """
+
+        num_tokens = int(dec_hidden.shape[0])
+        if num_tokens <= 0 or num_tokens % 2:
+            raise ValueError(
+                "EasyMagpie CFG needs an even, nonzero conditional/unconditional batch; "
+                f"got {num_tokens} rows"
+            )
+        actual_batch_size = num_tokens // 2
+        run_tokens = self._local_transformer_run_tokens(num_tokens)
+        buf_run = self._buf_inputs[:run_tokens]
+        buf = buf_run[:num_tokens]
+        out = self._out_codes[:num_tokens]
+        out_logprobs = self._out_code_logprobs[:num_tokens]
+        out_sampling_logprobs = self._out_code_sampling_logprobs[:num_tokens]
+        buf_run.zero_()
+        out_logprobs.zero_()
+        out_sampling_logprobs.zero_()
+        buf[:, 0, :] = self.local_transformer_in_projection(dec_hidden)
+
+        forbidden = self.forbidden_mask
+        scale = float(cfg_scale)
+        for k in range(self.num_codebooks):
+            hidden = self(buf_run)
+            row = self.local_transformer_audio_out_projection(hidden[:num_tokens, k, :])
+            logits = self.local_transformer_out_projections[k](row)
+            guided_logits = logits.clone()
+            guided_logits[:actual_batch_size] = (
+                scale * logits[:actual_batch_size]
+                + (1.0 - scale) * logits[actual_batch_size:]
+            )
+            code_k, _, sampling_lp = sample_codebook_with_logprobs(
+                guided_logits,
+                temperature=self.temperature,
+                top_k=self.top_k,
+                forbidden_mask=forbidden,
+            )
+            conditional_model_lp = _selected_logprob(
+                _sanitize_logits(logits[:actual_batch_size]),
+                code_k[:actual_batch_size],
+            )
+            code_k[actual_batch_size:].copy_(code_k[:actual_batch_size])
+            model_lp = torch.cat([conditional_model_lp, conditional_model_lp], dim=0)
+            sampling_lp[actual_batch_size:].copy_(sampling_lp[:actual_batch_size])
+            out[:, k] = code_k
+            out_logprobs[:, k] = model_lp
+            out_sampling_logprobs[:, k] = sampling_lp
+            if k + 1 < self.num_codebooks:
+                emb = self.audio_in_projection(self.audio_embeddings[k](code_k))
+                buf[:, k + 1, :] = self.local_transformer_in_projection(emb)
+
+        return out[:num_tokens], out_logprobs[:num_tokens], out_sampling_logprobs[:num_tokens]

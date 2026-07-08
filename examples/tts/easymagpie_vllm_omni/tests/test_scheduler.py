@@ -19,6 +19,8 @@ import types
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 
 class _FakeQueue(list):
     def add_request(self, request):
@@ -313,3 +315,65 @@ def test_easy_scheduler_keeps_non_train_running_before_post_refit(monkeypatch):
         "easymagpie-grpo-train-post-refit-step-000000-0-0"
     ]
     assert not hasattr(scheduler, "_easymagpie_last_post_refit_purge")
+
+
+def _cfg_request(child_index: int, *, outputs: int = 8):
+    return SimpleNamespace(
+        request_id=f"{child_index}_parent-request",
+        additional_information={
+            "cfg_enabled": True,
+            "cfg_num_outputs": outputs,
+            "cfg_scale": 2.5,
+        },
+        num_computed_tokens=64,
+        num_prompt_tokens=64,
+    )
+
+
+def test_easy_scheduler_annotates_parallel_cfg_children(monkeypatch):
+    scheduler_mod = _load_scheduler_with_stubs(monkeypatch)
+    conditional = _cfg_request(3)
+    unconditional = _cfg_request(11)
+
+    scheduler_mod.EasyMagpieARAsyncScheduler._annotate_cfg_request(conditional)
+    scheduler_mod.EasyMagpieARAsyncScheduler._annotate_cfg_request(unconditional)
+
+    assert conditional.additional_information["cfg_role"] == "conditional"
+    assert unconditional.additional_information["cfg_role"] == "unconditional"
+    assert conditional._easymagpie_cfg_parent_id == "parent-request"
+    assert unconditional._easymagpie_cfg_parent_id == "parent-request"
+    assert conditional._easymagpie_cfg_pair_index == 3
+    assert unconditional._easymagpie_cfg_pair_index == 3
+
+
+def test_easy_scheduler_accepts_complete_cfg_decode_pair(monkeypatch):
+    scheduler_mod = _load_scheduler_with_stubs(monkeypatch)
+    scheduler = object.__new__(scheduler_mod.EasyMagpieARAsyncScheduler)
+    conditional = _cfg_request(3)
+    unconditional = _cfg_request(11)
+    scheduler_mod.EasyMagpieARAsyncScheduler._annotate_cfg_request(conditional)
+    scheduler_mod.EasyMagpieARAsyncScheduler._annotate_cfg_request(unconditional)
+    scheduler.running = [conditional, unconditional]
+    scheduler.waiting = _FakeQueue()
+
+    scheduler._assert_complete_cfg_decode_pairs(
+        SimpleNamespace(
+            num_scheduled_tokens={conditional.request_id: 1, unconditional.request_id: 1}
+        )
+    )
+
+
+def test_easy_scheduler_rejects_split_cfg_decode_pair(monkeypatch):
+    scheduler_mod = _load_scheduler_with_stubs(monkeypatch)
+    scheduler = object.__new__(scheduler_mod.EasyMagpieARAsyncScheduler)
+    conditional = _cfg_request(3)
+    unconditional = _cfg_request(11)
+    scheduler_mod.EasyMagpieARAsyncScheduler._annotate_cfg_request(conditional)
+    scheduler_mod.EasyMagpieARAsyncScheduler._annotate_cfg_request(unconditional)
+    scheduler.running = [conditional, unconditional]
+    scheduler.waiting = _FakeQueue()
+
+    with pytest.raises(RuntimeError, match="split CFG decode pairs"):
+        scheduler._assert_complete_cfg_decode_pairs(
+            SimpleNamespace(num_scheduled_tokens={conditional.request_id: 1})
+        )

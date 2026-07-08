@@ -388,3 +388,70 @@ def test_generate_codes_deterministic_with_seed():
     second = cp.generate_codes(dec_hidden)
 
     assert torch.equal(first, second)
+
+
+@pytest.mark.unit
+def test_cfg_scale_one_matches_conditional_argmax_and_mirrors_pairs():
+    """Scale 1 is the conditional model, with identical companion histories."""
+
+    cp, _, arch = _build_pair(ARCH_PROFILES["equal_dims"])
+    cp.temperature = 0.0
+    torch.manual_seed(17)
+    conditional = torch.randn(3, arch.hidden_dim)
+    unconditional = torch.randn(3, arch.hidden_dim)
+
+    expected_codes, expected_model_lp, expected_sampling_lp = cp.generate_codes_with_logprobs(
+        conditional
+    )
+    expected_codes = expected_codes.clone()
+    expected_model_lp = expected_model_lp.clone()
+    expected_sampling_lp = expected_sampling_lp.clone()
+    codes, model_lp, sampling_lp = cp.generate_codes_with_cfg_logprobs(
+        torch.cat([conditional, unconditional], dim=0),
+        cfg_scale=1.0,
+    )
+
+    assert torch.equal(codes[:3], expected_codes)
+    assert torch.equal(codes[3:], expected_codes)
+    assert torch.allclose(model_lp[:3], expected_model_lp, atol=1e-6)
+    assert torch.allclose(model_lp[3:], expected_model_lp, atol=1e-6)
+    assert torch.equal(sampling_lp[:3], expected_sampling_lp)
+    assert torch.equal(sampling_lp[3:], expected_sampling_lp)
+
+
+@pytest.mark.unit
+def test_cfg_guides_first_codebook_and_keeps_conditional_model_logprob():
+    """Guided sampling and conditional-policy accounting are separate contracts."""
+
+    cp, _, arch = _build_pair(ARCH_PROFILES["equal_dims"])
+    cp.temperature = 0.0
+    torch.manual_seed(29)
+    hidden = torch.randn(4, arch.hidden_dim)
+
+    buf = torch.zeros(4, cp.num_codebooks, cp._buf_inputs.shape[-1])
+    buf[:, 0, :] = cp.local_transformer_in_projection(hidden)
+    first_hidden = cp(buf)
+    first_row = cp.local_transformer_audio_out_projection(first_hidden[:, 0, :])
+    first_logits = cp.local_transformer_out_projections[0](first_row)
+    guided = 2.5 * first_logits[:2] + (1.0 - 2.5) * first_logits[2:]
+    guided = guided.masked_fill(cp.forbidden_mask, float("-inf"))
+    expected_codes = guided.argmax(dim=-1)
+    expected_model_lp = torch.log_softmax(first_logits[:2].float(), dim=-1).gather(
+        -1, expected_codes.unsqueeze(-1)
+    ).squeeze(-1)
+
+    codes, model_lp, sampling_lp = cp.generate_codes_with_cfg_logprobs(hidden, cfg_scale=2.5)
+
+    assert torch.equal(codes[:2, 0], expected_codes)
+    assert torch.equal(codes[2:], codes[:2])
+    assert torch.allclose(model_lp[:2, 0], expected_model_lp, atol=1e-6)
+    assert torch.allclose(model_lp[2:], model_lp[:2], atol=1e-6)
+    assert torch.equal(sampling_lp, torch.zeros_like(sampling_lp))
+
+
+@pytest.mark.unit
+def test_cfg_rejects_incomplete_pair_batch():
+    cp, _, arch = _build_pair(ARCH_PROFILES["equal_dims"])
+
+    with pytest.raises(ValueError, match="even, nonzero"):
+        cp.generate_codes_with_cfg_logprobs(torch.randn(3, arch.hidden_dim), cfg_scale=2.5)

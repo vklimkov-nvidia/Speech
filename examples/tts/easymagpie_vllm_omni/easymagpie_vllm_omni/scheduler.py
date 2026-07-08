@@ -201,6 +201,106 @@ class EasyMagpieARAsyncScheduler(_OmniARBaseScheduler):
         return any(self._is_active_decode_request(request) for request in self.running)
 
     @staticmethod
+    def _payload_scalar(payload, key: str):
+        if isinstance(payload, dict):
+            return payload.get(key)
+        entries = getattr(payload, "entries", None)
+        entry = entries.get(key) if isinstance(entries, dict) else None
+        if entry is None:
+            return None
+        scalar = getattr(entry, "scalar_data", None)
+        if scalar is not None:
+            return scalar
+        values = getattr(entry, "list_data", None)
+        return values[0] if isinstance(values, list) and values else None
+
+    @classmethod
+    def _annotate_cfg_request(cls, request: Request) -> None:
+        if getattr(request, "_easymagpie_cfg_annotated", False):
+            return
+        payload = getattr(request, "additional_information", None)
+        if not bool(cls._payload_scalar(payload, "cfg_enabled")):
+            request._easymagpie_cfg_annotated = True
+            return
+        cfg_n = int(cls._payload_scalar(payload, "cfg_num_outputs") or 0)
+        request_id = cls._request_id(request)
+        child_text, separator, parent_id = request_id.partition("_")
+        if cfg_n <= 0 or not separator or not child_text.isdigit():
+            raise RuntimeError(
+                f"Malformed EasyMagpie CFG child request {request_id!r}: cfg_num_outputs={cfg_n}"
+            )
+        child_index = int(child_text)
+        if child_index >= 2 * cfg_n:
+            raise RuntimeError(
+                f"EasyMagpie CFG child index {child_index} is outside 2*n={2 * cfg_n}"
+            )
+        role = "conditional" if child_index < cfg_n else "unconditional"
+        pair_index = child_index % cfg_n
+
+        if isinstance(payload, dict):
+            annotated = dict(payload)
+            annotated.update(
+                {
+                    "cfg_role": role,
+                    "cfg_pair_index": pair_index,
+                    "cfg_parent_request_id": parent_id,
+                }
+            )
+        else:
+            from vllm_omni.engine import AdditionalInformationEntry, AdditionalInformationPayload
+
+            entries = dict(getattr(payload, "entries", {}) or {})
+            entries.update(
+                {
+                    "cfg_role": AdditionalInformationEntry(scalar_data=role),
+                    "cfg_pair_index": AdditionalInformationEntry(scalar_data=pair_index),
+                    "cfg_parent_request_id": AdditionalInformationEntry(scalar_data=parent_id),
+                }
+            )
+            annotated = AdditionalInformationPayload(entries=entries)
+        request.additional_information = annotated
+        request._easymagpie_cfg_annotated = True
+        request._easymagpie_cfg_parent_id = parent_id
+        request._easymagpie_cfg_pair_index = pair_index
+        request._easymagpie_cfg_role = role
+
+    def _annotate_cfg_requests(self) -> None:
+        for request in list(self.waiting or []) + list(self.running or []):
+            self._annotate_cfg_request(request)
+
+    def _assert_complete_cfg_decode_pairs(self, schedule_output) -> None:
+        scheduled = getattr(schedule_output, "num_scheduled_tokens", None)
+        if not isinstance(scheduled, dict):
+            return
+        requests = {
+            self._request_id(request): request
+            for request in list(self.running or []) + list(self.waiting or [])
+        }
+        pairs: dict[tuple[str, int], set[str]] = {}
+        for request_id, token_count in scheduled.items():
+            request = requests.get(str(request_id))
+            if request is None or not getattr(request, "_easymagpie_cfg_parent_id", None):
+                continue
+            if int(getattr(request, "num_computed_tokens", 0) or 0) < int(
+                getattr(request, "num_prompt_tokens", 0) or 0
+            ):
+                continue
+            if int(token_count or 0) != 1:
+                continue
+            key = (
+                str(request._easymagpie_cfg_parent_id),
+                int(request._easymagpie_cfg_pair_index),
+            )
+            pairs.setdefault(key, set()).add(str(request._easymagpie_cfg_role))
+        incomplete = {key: sorted(roles) for key, roles in pairs.items() if roles != {"conditional", "unconditional"}}
+        if incomplete:
+            raise RuntimeError(f"EasyMagpie scheduler split CFG decode pairs: {incomplete}")
+
+    def _finalize_schedule(self, result):
+        self._assert_complete_cfg_decode_pairs(result)
+        return result
+
+    @staticmethod
     def _scheduled_token_count(schedule_output) -> int | None:
         num_scheduled_tokens = getattr(schedule_output, "num_scheduled_tokens", None)
         if num_scheduled_tokens is None:
@@ -224,6 +324,7 @@ class EasyMagpieARAsyncScheduler(_OmniARBaseScheduler):
         return deferred_waiting
 
     def schedule(self):  # type: ignore[override]
+        self._annotate_cfg_requests()
         post_refit_waiting = self._has_waiting_post_refit_request()
         if post_refit_waiting:
             logger.info(
@@ -253,7 +354,7 @@ class EasyMagpieARAsyncScheduler(_OmniARBaseScheduler):
                     self._request_ids_head(self.waiting),
                     self._request_ids_head(self.running),
                 )
-            return result
+            return self._finalize_schedule(result)
 
         # The EasyMagpie Mamba path is unstable when vLLM batches cached
         # one-token decodes together with fresh prompt prefills.
@@ -282,7 +383,7 @@ class EasyMagpieARAsyncScheduler(_OmniARBaseScheduler):
                         self._request_ids_head(self.waiting),
                         self._request_ids_head(self.running),
                     )
-                return result
+                return self._finalize_schedule(result)
             if post_refit_waiting:
                 logger.info(
                     "EasyMagpie post-refit scheduler after guarded decode schedule: scheduled_tokens=%s "
@@ -292,7 +393,7 @@ class EasyMagpieARAsyncScheduler(_OmniARBaseScheduler):
                     self._safe_len(self.waiting),
                     self._safe_len(self.running),
                 )
-            return result
+            return self._finalize_schedule(result)
         finally:
             if not restored_waiting:
                 self.waiting = self._restore_deferred_waiting(self.waiting, deferred_waiting)
