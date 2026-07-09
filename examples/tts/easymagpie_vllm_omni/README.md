@@ -1,5 +1,25 @@
 ## EasyMagpie TTS — vLLM-Omni + Triton service
 
+### Optimized RL runtime
+
+The branch `codex/magpie-optimized-integrated-runtime` is the self-contained
+source dependency for the optimized EasyMagpie GRPO recipes in NeMo-RL. It
+contains both parts required by those recipes:
+
+- this EasyMagpie adapter, including static refit, predicted-phone recurrence,
+  and paired CFG generation; and
+- the top-level `vllm_omni/` runtime used with vLLM 0.21.0.
+
+The adapter state is based on commit
+`65633e00a9435a92754eb35a554bdfca2e1dd82e`. The runtime tree is imported
+without modification from commit
+`295ef10a2f17562692ce4564eeccfb7d413f4750`, which reports vLLM-Omni 0.18.0.
+Those two source identities replace the former cross-branch assembly step.
+
+For a source checkout, put the repository root and
+`examples/tts/easymagpie_vllm_omni` on `PYTHONPATH`. No package snapshot,
+SafeRun wrapper, or import-time monkey patch is required.
+
 Streaming TTS server for **EasyMagpieTTS** (NeMo model
 `nemo.collections.tts.models.easy_magpietts.EasyMagpieTTSModel` /
 `EasyMagpieTTSInferenceModel`, Nemotron-H backbone + per-codebook local
