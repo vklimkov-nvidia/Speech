@@ -229,6 +229,36 @@ def test_cfg_rows_are_ordered_by_logical_pair_index():
     assert torch.equal(ordered, torch.tensor([2, 0, 1, 3]))
 
 
+def test_cfg_pair_indices_are_unique_across_concurrent_parents():
+    model = EasyMagpieTTSForConditionalGeneration.__new__(EasyMagpieTTSForConditionalGeneration)
+    torch.nn.Module.__init__(model)
+    model._cfg_step_active = False
+    model._cfg_step_num_outputs = 0
+    model._cfg_step_parent_outputs = 0
+    model._cfg_step_parent_slots = {}
+    model._cfg_step_scale = 1.0
+
+    indices = [
+        model._cfg_global_pair_index(
+            parent_id=parent,
+            parent_outputs=8,
+            pair_index=pair,
+            cfg_scale=2.5,
+        )
+        for parent in ("prompt-a", "prompt-b")
+        for pair in range(8)
+    ]
+
+    assert indices == list(range(16))
+    assert model._cfg_step_num_outputs == 16
+    assert model._cfg_global_pair_index(
+        parent_id="prompt-a",
+        parent_outputs=8,
+        pair_index=3,
+        cfg_scale=2.5,
+    ) == 3
+
+
 def test_non_text_refit_allows_static_backbone_and_text_targets():
     model = _minimal_refit_model()
     model._easymagpie_allow_missing_text_tables_refit = True

@@ -351,6 +351,8 @@ class EasyMagpieTTSForConditionalGeneration(
         self._cfg_pair_indices = torch.full((max_num_tokens,), -1, dtype=torch.long)
         self._cfg_step_active = False
         self._cfg_step_num_outputs = 0
+        self._cfg_step_parent_outputs = 0
+        self._cfg_step_parent_slots: dict[str, int] = {}
         self._cfg_step_scale = 1.0
         if self.has_phoneme:
             self._dec_phoneme_tokens = torch.zeros(
@@ -819,6 +821,36 @@ class EasyMagpieTTSForConditionalGeneration(
             )
         return torch.cat([conditional_rows, unconditional_rows], dim=0)
 
+    def _cfg_global_pair_index(
+        self,
+        *,
+        parent_id: str,
+        parent_outputs: int,
+        pair_index: int,
+        cfg_scale: float,
+    ) -> int:
+        """Map a parent's local CFG pair onto the current scheduler batch."""
+
+        if not parent_id:
+            raise RuntimeError("EasyMagpie CFG request is missing cfg_parent_request_id")
+        if self._cfg_step_active and (
+            parent_outputs != self._cfg_step_parent_outputs
+            or cfg_scale != self._cfg_step_scale
+        ):
+            raise RuntimeError("EasyMagpie CFG batch mixed incompatible CFG contracts")
+        if not self._cfg_step_active:
+            self._cfg_step_parent_outputs = parent_outputs
+            self._cfg_step_scale = cfg_scale
+        parent_slot = self._cfg_step_parent_slots.setdefault(
+            parent_id, len(self._cfg_step_parent_slots)
+        )
+        self._cfg_step_active = True
+        self._cfg_step_num_outputs = max(
+            self._cfg_step_num_outputs,
+            (parent_slot + 1) * parent_outputs,
+        )
+        return parent_slot * parent_outputs + pair_index
+
     def _assemble_decode_embeddings(self, combined: torch.Tensor, idx) -> None:
         """Add ``text + phoneme + audio`` embeddings into ``combined`` at ``idx``."""
         # Mixed prefill/decode batches carry real prefill rows in ``inputs_embeds``.
@@ -1184,6 +1216,8 @@ class EasyMagpieTTSForConditionalGeneration(
         if row_start == 0:
             self._cfg_step_active = False
             self._cfg_step_num_outputs = 0
+            self._cfg_step_parent_outputs = 0
+            self._cfg_step_parent_slots = {}
             self._cfg_step_scale = 1.0
 
         # Forward the audio (local-transformer) sampling params from the request.
@@ -1405,6 +1439,8 @@ class EasyMagpieTTSForConditionalGeneration(
         if start == 0:
             self._cfg_step_active = False
             self._cfg_step_num_outputs = 0
+            self._cfg_step_parent_outputs = 0
+            self._cfg_step_parent_slots = {}
             self._cfg_step_scale = 1.0
         cfg_enabled = bool(info_dict.get("cfg_enabled", False))
         if cfg_enabled:
@@ -1422,15 +1458,15 @@ class EasyMagpieTTSForConditionalGeneration(
                     "EasyMagpie CFG request has invalid pair index "
                     f"{pair_index} for outputs={cfg_n}"
                 )
-            if self._cfg_step_active and (
-                cfg_n != self._cfg_step_num_outputs or cfg_scale != self._cfg_step_scale
-            ):
-                raise RuntimeError("EasyMagpie CFG batch mixed incompatible CFG contracts")
-            self._cfg_step_active = True
-            self._cfg_step_num_outputs = cfg_n
-            self._cfg_step_scale = cfg_scale
+            parent_id = str(info_dict.get("cfg_parent_request_id") or "")
+            global_pair_index = self._cfg_global_pair_index(
+                parent_id=parent_id,
+                parent_outputs=cfg_n,
+                pair_index=pair_index,
+                cfg_scale=cfg_scale,
+            )
             self._cfg_roles[start] = 1 if role == "conditional" else 2
-            self._cfg_pair_indices[start] = pair_index
+            self._cfg_pair_indices[start] = global_pair_index
         self._decode_offsets[start] = decode_offset
 
         # ── Text channel ── (delay 0: one subword per step from step 0). The text
@@ -1606,6 +1642,11 @@ class EasyMagpieTTSForConditionalGeneration(
             self._decode_offsets.fill_(-1)
         if isinstance(getattr(self, "_cfg_pair_indices", None), torch.Tensor):
             self._cfg_pair_indices.fill_(-1)
+        self._cfg_step_active = False
+        self._cfg_step_num_outputs = 0
+        self._cfg_step_parent_outputs = 0
+        self._cfg_step_parent_slots = {}
+        self._cfg_step_scale = 1.0
 
     # Checkpoint prefixes (EasyMagpieTTS state dict) → in-model paths.
     # ``decoder.*`` is fed to the vLLM backbone loader separately (it understands
