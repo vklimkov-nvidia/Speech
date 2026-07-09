@@ -1,48 +1,18 @@
 import time
 from collections import defaultdict
 
-try:
-    import vllm.compilation.cuda_graph as _vllm_cuda_graph
-
-    CUDAGraphStat = _vllm_cuda_graph.CUDAGraphStat
-except (AttributeError, ImportError):
-    class CUDAGraphStat:
-        pass
+from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.distributed.kv_events import KVEventBatch
-try:
-    import vllm.distributed.kv_transfer.kv_connector.v1.metrics as _vllm_kv_connector_metrics
-
-    KVConnectorStats = _vllm_kv_connector_metrics.KVConnectorStats
-except (AttributeError, ImportError):
-    class KVConnectorStats:
-        def aggregate(self, other):
-            return self
+from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStats
 from vllm.logger import init_logger
 from vllm.v1.core.kv_cache_manager import KVCacheBlocks
-try:
-    from vllm.v1.core.sched.interface import PauseState
-except ImportError:
-    class PauseState:
-        UNPAUSED = "UNPAUSED"
-        PAUSED_ALL = "PAUSED_ALL"
+from vllm.v1.core.sched.interface import PauseState
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.request_queue import create_request_queue
 from vllm.v1.core.sched.scheduler import Scheduler as VLLMScheduler
-try:
-    import vllm.v1.core.sched.utils as _vllm_sched_utils
-
-    remove_all = _vllm_sched_utils.remove_all
-except (AttributeError, ImportError):
-    def remove_all(values, removed):
-        return [value for value in values if value not in removed]
+from vllm.v1.core.sched.utils import remove_all
 from vllm.v1.engine import EngineCoreEventType, EngineCoreOutput, EngineCoreOutputs
-try:
-    import vllm.v1.metrics.perf as _vllm_perf_metrics
-
-    PerfStats = _vllm_perf_metrics.PerfStats
-except (AttributeError, ImportError):
-    class PerfStats:
-        pass
+from vllm.v1.metrics.perf import PerfStats
 from vllm.v1.request import Request, RequestStatus
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 
@@ -635,13 +605,7 @@ class OmniGenerationScheduler(VLLMScheduler):
                     engine_core_outputs[client_index] = EngineCoreOutputs(finished_requests=finished_set)
             finished_req_ids.clear()
 
-        try:
-            stats = self.make_stats(spec_decoding_stats, kv_connector_stats, cudagraph_stats, perf_stats)
-        except TypeError as exc:
-            if "positional" not in str(exc) or "make_stats" not in str(exc):
-                raise
-            stats = self.make_stats(spec_decoding_stats)
-        if stats is not None:
+        if (stats := self.make_stats(spec_decoding_stats, kv_connector_stats, cudagraph_stats, perf_stats)) is not None:
             # Return stats to only one of the front-ends.
             if (eco := next(iter(engine_core_outputs.values()), None)) is None:
                 # We must return the stats even if there are no request

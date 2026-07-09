@@ -7,7 +7,7 @@ from typing import Any
 import numpy as np
 import torch
 from vllm.config import LoadConfig
-from vllm.model_executor.model_loader.utils import set_default_torch_dtype
+from vllm.utils.torch_utils import set_default_torch_dtype
 
 from vllm_omni.diffusion.cache.teacache.extractors import get_extractor
 from vllm_omni.diffusion.data import OmniDiffusionConfig

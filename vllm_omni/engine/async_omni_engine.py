@@ -10,7 +10,6 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import dataclasses
-import inspect
 import json
 import os
 import queue
@@ -31,47 +30,11 @@ import torch
 from omegaconf import OmegaConf
 from vllm.inputs import PromptType
 from vllm.logger import init_logger
-from vllm.transformers_utils.tokenizer import cached_tokenizer_from_config
+from vllm.tokenizers import cached_tokenizer_from_config
 from vllm.v1.engine import EngineCoreRequest
+from vllm.v1.engine.input_processor import InputProcessor
 from vllm.v1.engine.parallel_sampling import ParentRequest
-
-
-def _call_process_inputs_with_supported_kwargs(func, args: tuple[Any, ...], kwargs: dict[str, Any]):
-    try:
-        signature = inspect.signature(func)
-    except (TypeError, ValueError):
-        return func(*args, **kwargs)
-    if any(param.kind == inspect.Parameter.VAR_KEYWORD for param in signature.parameters.values()):
-        return func(*args, **kwargs)
-    positional_names = {
-        param.name
-        for param in list(signature.parameters.values())[: len(args)]
-        if param.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
-    }
-    filtered = {
-        key: value for key, value in kwargs.items() if key in signature.parameters and key not in positional_names
-    }
-    return func(*args, **filtered)
-
-
-try:
-    from vllm.v1.engine.input_processor import InputProcessor
-except ImportError:
-    from vllm.v1.engine.processor import Processor as _VllmInputProcessor
-
-    class InputProcessor(_VllmInputProcessor):
-        def __init__(self, *, vllm_config, tokenizer=None, **kwargs):
-            if tokenizer is None and not vllm_config.model_config.skip_tokenizer_init:
-                tokenizer = cached_tokenizer_from_config(model_config=vllm_config.model_config)
-            super().__init__(vllm_config=vllm_config, tokenizer=tokenizer, **kwargs)
-            self.renderer = getattr(self.input_preprocessor, "renderer", None)
-
-        def process_inputs(self, *args, **kwargs):
-            result = _call_process_inputs_with_supported_kwargs(super().process_inputs, args, kwargs)
-            if isinstance(result, tuple) and len(result) == 2:
-                return result[1]
-            return result
-from vllm.v1.engine.utils import launch_core_engines
+from vllm.v1.engine.utils import get_engine_zmq_addresses, launch_core_engines
 
 from vllm_omni.diffusion.data import DiffusionParallelConfig
 from vllm_omni.distributed.omni_connectors.utils.initialization import (
@@ -82,6 +45,7 @@ from vllm_omni.engine import (
 )
 from vllm_omni.engine.orchestrator import Orchestrator
 from vllm_omni.engine.output_processor import MultimodalOutputProcessor
+from vllm_omni.engine.parallel_sampling_compat import make_parent_request
 from vllm_omni.engine.serialization import serialize_additional_information
 from vllm_omni.engine.stage_engine_core_client import StageEngineCoreClient
 from vllm_omni.engine.stage_init_utils import (
@@ -107,6 +71,10 @@ from vllm_omni.inputs.preprocess import OmniInputPreprocessor
 from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
+
+
+def _parallel_sampling_n(params: Any) -> int:
+    return int(getattr(params, "n", 1) or 1)
 
 
 def _inject_kv_stage_info(stage_cfg: Any, stage_id: int) -> None:
@@ -200,10 +168,6 @@ def _upgrade_to_omni_request(
         "additional_information": additional_information,
     }
     return OmniEngineCoreRequest(**{key: value for key, value in kwargs.items() if key in fields})
-
-
-def _parallel_sampling_n(params: Any) -> int:
-    return int(getattr(params, "n", 1) or 1)
 
 
 def _weak_shutdown_async_omni_engine(
@@ -383,10 +347,12 @@ class AsyncOmniEngine:
                         engine_args_dict,
                         stage_init_timeout,
                     )
+                    addresses = get_engine_zmq_addresses(vllm_config)
                     launch_cm = launch_core_engines(
                         vllm_config=vllm_config,
                         executor_class=executor_class,
                         log_stats=False,
+                        addresses=addresses,
                     )
                     engine_manager, coordinator, addresses = launch_cm.__enter__()
                     started_stage = StartedLlmStage(
@@ -464,8 +430,8 @@ class AsyncOmniEngine:
                 # mm_processor_kwargs (e.g. GLM-Image t2i target_h/target_w)
                 # still go through multimodal processor path.
                 input_processor.input_preprocessor = OmniInputPreprocessor(
-                    model_config=started.vllm_config.model_config,
-                    tokenizer=tokenizer,
+                    vllm_config=started.vllm_config,
+                    renderer=input_processor.renderer,
                 )
         except Exception:
             try:
@@ -734,7 +700,6 @@ class AsyncOmniEngine:
 
             n = _parallel_sampling_n(params)
             if n == 1:
-                # Register with stage 0's output processor.
                 self.output_processors[0].add_request(
                     request=request,
                     prompt=prompt,
@@ -744,7 +709,12 @@ class AsyncOmniEngine:
                 )
                 prompt = request
             else:
-                parent_req = ParentRequest(request_id, params)
+                parent_req = make_parent_request(
+                    ParentRequest,
+                    request_id=request_id,
+                    params=params,
+                    request=request,
+                )
                 child_requests = []
                 for idx in range(n):
                     child_request_id, child_params = parent_req.get_child_info(idx)

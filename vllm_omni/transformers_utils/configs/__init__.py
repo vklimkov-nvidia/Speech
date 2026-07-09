@@ -10,7 +10,6 @@ from __future__ import annotations
 import importlib
 
 _CLASS_TO_MODULE: dict[str, str] = {
-    "NemotronHConfig": "vllm_omni.transformers_utils.configs.nemotron_h",
     "Mammothmoda2Config": "vllm_omni.transformers_utils.configs.mammoth_moda2",
     "Mammothmoda2Qwen2_5_VLConfig": "vllm_omni.transformers_utils.configs.mammoth_moda2",
     "Mammothmoda2Qwen2_5_VLTextConfig": "vllm_omni.transformers_utils.configs.mammoth_moda2",
@@ -21,7 +20,6 @@ _CLASS_TO_MODULE: dict[str, str] = {
 }
 
 __all__ = [
-    "NemotronHConfig",
     "Mammothmoda2Config",
     "Mammothmoda2Qwen2_5_VLConfig",
     "Mammothmoda2Qwen2_5_VLTextConfig",
@@ -49,4 +47,3 @@ def __dir__():
 # run as soon as `vllm_omni.transformers_utils.configs` is imported.
 from vllm_omni.transformers_utils.configs import fish_speech as _fish_speech  # noqa: F401, E402
 from vllm_omni.transformers_utils.configs import mammoth_moda2 as _mammoth_moda2  # noqa: F401, E402
-from vllm_omni.transformers_utils.configs import nemotron_h as _nemotron_h  # noqa: F401, E402

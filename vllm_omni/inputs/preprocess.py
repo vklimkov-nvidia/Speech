@@ -5,10 +5,7 @@ from vllm.inputs.data import EmbedsInputs, SingletonInputs
 from vllm.inputs.preprocess import InputPreprocessor
 from vllm.logger import init_logger
 from vllm.multimodal.inputs import MultiModalInputs
-try:
-    from vllm.renderers.inputs import SingletonDictPrompt
-except ImportError:
-    SingletonDictPrompt = dict[str, Any]
+from vllm.renderers.inputs import SingletonDictPrompt
 
 from vllm_omni.inputs.data import (
     OmniEmbedsPrompt,
@@ -33,9 +30,6 @@ class OmniInputPreprocessor(InputPreprocessor):
         self,
         parsed_content: OmniTextPrompt,
         tokenization_kwargs: dict[str, Any] | None = None,
-        lora_request: Any | None = None,
-        return_mm_hashes: bool = False,
-        **ignored_kwargs: Any,
     ) -> OmniTokenInputs | MultiModalInputs:
         """Process text prompts with support for mm_processor_kwargs.
 
@@ -53,8 +47,6 @@ class OmniInputPreprocessor(InputPreprocessor):
                 multi_modal_data,
                 mm_processor_kwargs,
                 tokenization_kwargs=tokenization_kwargs,
-                lora_request=lora_request,
-                return_mm_hashes=return_mm_hashes,
             )
             prompt_embeds = parsed_content.get("prompt_embeds")
             if prompt_embeds is not None:
@@ -68,13 +60,10 @@ class OmniInputPreprocessor(InputPreprocessor):
                 {},
                 mm_processor_kwargs,
                 tokenization_kwargs=tokenization_kwargs,
-                lora_request=lora_request,
-                return_mm_hashes=return_mm_hashes,
             )
         else:
             prompt_token_ids = self._tokenize_prompt(
                 prompt_text,
-                lora_request=lora_request,
                 tokenization_kwargs=tokenization_kwargs,
             )
             inputs = token_inputs_omni(
@@ -97,11 +86,8 @@ class OmniInputPreprocessor(InputPreprocessor):
         self,
         parsed_content: OmniTokensPrompt,
         tokenization_kwargs: dict[str, Any] | None = None,
-        lora_request: Any | None = None,
-        return_mm_hashes: bool = False,
-        **ignored_kwargs: Any,
     ) -> OmniTokenInputs | MultiModalInputs:
-        prompt_token_ids = parsed_content["prompt_token_ids"]
+        prompt_token_ids = self._truncate_inputs(parsed_content["prompt_token_ids"], tokenization_kwargs)
         prompt_embeds = parsed_content.get("prompt_embeds")
         additional_information = parsed_content.get("additional_information")
 
@@ -115,8 +101,6 @@ class OmniInputPreprocessor(InputPreprocessor):
                 parsed_content.get("mm_processor_kwargs"),
                 tokenization_kwargs=tokenization_kwargs,
                 mm_uuids=parsed_content.get("multi_modal_uuids"),
-                lora_request=lora_request,
-                return_mm_hashes=return_mm_hashes,
             )
 
         else:
@@ -159,7 +143,6 @@ class OmniInputPreprocessor(InputPreprocessor):
         self,
         prompt: SingletonDictPrompt,
         tokenization_kwargs: dict[str, Any] | None = None,
-        **ignored_kwargs: Any,
     ) -> SingletonInputs:
         """
         Extract the singleton inputs from a prompt.
@@ -178,15 +161,12 @@ class OmniInputPreprocessor(InputPreprocessor):
         if "prompt_token_ids" in prompt:
             return self._process_tokens(
                 prompt,  # type: ignore[arg-type]
-                tokenization_kwargs=tokenization_kwargs,
-                **ignored_kwargs,
             )
 
         if "prompt" in prompt:
             return self._process_text(
                 prompt,  # type: ignore[arg-type]
                 tokenization_kwargs=tokenization_kwargs,
-                **ignored_kwargs,
             )
 
         assert_never(prompt)  # type: ignore[arg-type]

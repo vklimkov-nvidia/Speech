@@ -6,8 +6,8 @@ import traceback
 from itertools import chain
 from typing import TYPE_CHECKING
 
-from vllm.utils import resolve_obj_by_qualname
-from vllm.utils import supports_xccl
+from vllm.utils.import_utils import resolve_obj_by_qualname
+from vllm.utils.torch_utils import supports_xccl
 
 from vllm_omni.platforms.interface import OmniPlatform, OmniPlatformEnum
 from vllm_omni.plugins import (
@@ -23,7 +23,7 @@ def cuda_omni_platform_plugin() -> str | None:
     is_cuda = False
     logger.debug("Checking if CUDA OmniPlatform is available.")
     try:
-        from vllm.utils import import_pynvml
+        from vllm.utils.import_utils import import_pynvml
 
         pynvml = import_pynvml()
         pynvml.nvmlInit()

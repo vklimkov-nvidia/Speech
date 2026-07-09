@@ -6,110 +6,34 @@ and also outputs sampled tokens.
 
 from __future__ import annotations
 
-import contextlib
 from copy import copy
 from typing import Any, NamedTuple
 
 import numpy as np
 import torch
 from vllm.config import CUDAGraphMode
-try:
-    from vllm.distributed.ec_transfer import get_ec_transfer, has_ec_transfer
-except ImportError:
-    def has_ec_transfer() -> bool:
-        return False
-
-    def get_ec_transfer():
-        return None
+from vllm.distributed.ec_transfer import get_ec_transfer, has_ec_transfer
 from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_group
 from vllm.distributed.parallel_state import get_pp_group, get_tp_group
 from vllm.forward_context import set_forward_context as _vllm_set_forward_context
 from vllm.logger import init_logger
-try:
-    from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
-        RoutedExpertsCapturer,
-    )
-except ImportError:
-    class RoutedExpertsCapturer:
-        @staticmethod
-        def get_instance():
-            return None
-try:
-    from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
-except ImportError:
-    from vllm.v1.core.sched.output import SchedulerOutput
-    GrammarOutput = Any
-try:
-    from vllm.v1.outputs import AsyncModelRunnerOutput, make_empty_encoder_model_runner_output
-except ImportError:
-    from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT, ModelRunnerOutput
-    AsyncModelRunnerOutput = ModelRunnerOutput
-
-    def make_empty_encoder_model_runner_output(*args, **kwargs):
-        return EMPTY_MODEL_RUNNER_OUTPUT
-try:
-    from vllm.v1.spec_decode.draft_model import DraftModelProposer
-except ImportError:
-    class DraftModelProposer:
-        pass
-try:
-    from vllm.v1.spec_decode.eagle import EagleProposer
-except ImportError:
-    class EagleProposer:
-        pass
-try:
-    from vllm.v1.spec_decode.extract_hidden_states import ExtractHiddenStatesProposer
-except ImportError:
-    class ExtractHiddenStatesProposer:
-        pass
-try:
-    from vllm.v1.structured_output.utils import apply_grammar_bitmask
-except ImportError:
-    def apply_grammar_bitmask(*args, **kwargs):
-        return None
-try:
-    from vllm.v1.utils import record_function_or_nullcontext
-except ImportError:
-    def record_function_or_nullcontext(*args, **kwargs):
-        return contextlib.nullcontext()
+from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
+    RoutedExpertsCapturer,
+)
+from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
+from vllm.v1.outputs import AsyncModelRunnerOutput, make_empty_encoder_model_runner_output
+from vllm.v1.spec_decode.draft_model import DraftModelProposer
+from vllm.v1.spec_decode.eagle import EagleProposer
+from vllm.v1.spec_decode.extract_hidden_states import ExtractHiddenStatesProposer
+from vllm.v1.structured_output.utils import apply_grammar_bitmask
+from vllm.v1.utils import record_function_or_nullcontext
 from vllm.v1.worker.gpu_model_runner import (
     EMPTY_MODEL_RUNNER_OUTPUT,
+    AsyncGPUModelRunnerOutput,
     IntermediateTensors,
 )
-try:
-    from vllm.v1.worker.gpu_model_runner import AsyncGPUModelRunnerOutput
-except ImportError:
-    class AsyncGPUModelRunnerOutput:
-        def __init__(
-            self,
-            *,
-            model_runner_output,
-            sampled_token_ids=None,
-            logprobs_tensors=None,
-            invalid_req_indices=None,
-            async_output_copy_stream=None,
-            vocab_size=None,
-        ):
-            self.model_runner_output = model_runner_output
-            self.sampled_token_ids = sampled_token_ids
-            self.logprobs_tensors = logprobs_tensors
-            self.invalid_req_indices = invalid_req_indices or []
-            self.async_output_copy_stream = async_output_copy_stream
-            self.vocab_size = vocab_size
-            self.sampled_token_ids_cpu = (
-                sampled_token_ids.cpu() if isinstance(sampled_token_ids, torch.Tensor) else sampled_token_ids
-            )
-            self.async_copy_ready_event = None
-try:
-    from vllm.v1.worker.ubatch_utils import maybe_create_ubatch_slices
-except ImportError:
-    def maybe_create_ubatch_slices(*args, **kwargs):
-        return None, None
-try:
-    from vllm.v1.worker.utils import is_residual_scattered_for_sp
-except ImportError:
-    def is_residual_scattered_for_sp(*args, **kwargs) -> bool:
-        return False
+from vllm.v1.worker.ubatch_utils import maybe_create_ubatch_slices
+from vllm.v1.worker.utils import is_residual_scattered_for_sp
 
 from vllm_omni.distributed.omni_connectors.kv_transfer_manager import OmniKVTransferManager
 from vllm_omni.outputs import OmniModelRunnerOutput
@@ -120,7 +44,6 @@ logger = init_logger(__name__)
 
 def set_forward_context(*args, **kwargs):
     kwargs.pop("ubatch_slices", None)
-    kwargs.pop("slot_mapping", None)
     return _vllm_set_forward_context(*args, **kwargs)
 
 
@@ -354,7 +277,7 @@ class GPUARModelRunner(OmniGPUModelRunner):
 
             cascade_attn_prefix_lens = None
             # Disable cascade attention when using microbatching (DBO)
-            if self.cascade_attn_enabled and not getattr(self.parallel_config, "use_ubatching", False):
+            if self.cascade_attn_enabled and not self.parallel_config.use_ubatching:
                 # Pre-compute cascade attention prefix lengths
                 cascade_attn_prefix_lens = self._compute_cascade_attn_prefix_lens(
                     num_scheduled_tokens_np,
@@ -384,7 +307,7 @@ class GPUARModelRunner(OmniGPUModelRunner):
                 num_scheduled_tokens_np,
                 num_tokens_padded,
                 num_reqs_padded,
-                getattr(self.parallel_config, "num_ubatches", 1),
+                self.parallel_config.num_ubatches,
             )
 
             pad_attn = cudagraph_mode == CUDAGraphMode.FULL

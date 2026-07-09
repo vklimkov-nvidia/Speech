@@ -3,9 +3,6 @@
 
 # for now, it suffices to use vLLM's implementation directly
 # as this is a user-facing variable, defined here to so that user can directly import LoRAConfig from vllm_omni
-try:
-    from vllm.config import LoRAConfig
-except ImportError:
-    from vllm.config.lora import LoRAConfig
+from vllm.config.lora import LoRAConfig
 
 __all__ = ["LoRAConfig"]

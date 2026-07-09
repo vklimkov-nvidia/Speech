@@ -12,7 +12,7 @@ from enum import Enum, EnumMeta
 from typing import TYPE_CHECKING
 
 from vllm.logger import init_logger
-from vllm.utils import resolve_obj_by_qualname
+from vllm.utils.import_utils import resolve_obj_by_qualname
 
 if TYPE_CHECKING:
     from vllm_omni.diffusion.attention.backends.abstract import AttentionBackend

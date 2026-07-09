@@ -8,13 +8,7 @@ from typing import Any, NamedTuple
 
 import numpy as np
 import torch
-try:
-    import vllm.compilation.cuda_graph as _vllm_cuda_graph
-
-    CUDAGraphStat = _vllm_cuda_graph.CUDAGraphStat
-except (AttributeError, ImportError):
-    class CUDAGraphStat:
-        pass
+from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.config import CUDAGraphMode
 from vllm.distributed.ec_transfer import get_ec_transfer, has_ec_transfer
 from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_group

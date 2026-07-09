@@ -16,11 +16,7 @@ from vllm.engine.protocol import EngineClient
 from vllm.logger import init_logger
 from vllm.lora.request import LoRARequest
 from vllm.outputs import PoolingRequestOutput
-try:
-    from vllm.plugins.io_processors import get_io_processor
-except ImportError:
-    def get_io_processor(*args: Any, **kwargs: Any) -> None:
-        return None
+from vllm.plugins.io_processors import get_io_processor
 from vllm.pooling_params import PoolingParams
 from vllm.tasks import SupportedTask
 from vllm.v1.engine.exceptions import EngineDeadError
@@ -88,7 +84,7 @@ class AsyncOmni(EngineClient, OmniBase):
             self.io_processor = None
         else:
             vllm_config = self.engine.stage_vllm_configs[stage_index]
-            io_processor_plugin = getattr(vllm_config.model_config, "io_processor_plugin", None)
+            io_processor_plugin = vllm_config.model_config.io_processor_plugin
             self.io_processor = get_io_processor(vllm_config, io_processor_plugin)
 
     def _get_comprehension_stage_index(self) -> int | None:

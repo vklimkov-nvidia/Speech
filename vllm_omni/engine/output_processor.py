@@ -1,5 +1,3 @@
-from collections import defaultdict
-import inspect
 from typing import Any
 
 import numpy as np
@@ -7,10 +5,7 @@ import torch
 from vllm.logger import init_logger
 from vllm.outputs import PoolingRequestOutput
 from vllm.sampling_params import RequestOutputKind
-try:
-    from vllm.transformers_utils.tokenizer import TokenizerLike
-except ImportError:
-    from vllm.transformers_utils.tokenizer import AnyTokenizer as TokenizerLike
+from vllm.tokenizers import TokenizerLike
 from vllm.v1.engine import EngineCoreOutput, EngineCoreRequest, FinishReason
 from vllm.v1.engine.output_processor import OutputProcessor as VLLMOutputProcessor
 from vllm.v1.engine.output_processor import (
@@ -24,17 +19,6 @@ from vllm.v1.metrics.stats import IterationStats
 from vllm_omni.outputs import OmniRequestOutput
 
 logger = init_logger(__name__)
-
-
-def _call_with_supported_kwargs(func, kwargs: dict[str, Any]):
-    try:
-        signature = inspect.signature(func)
-    except (TypeError, ValueError):
-        return func(**kwargs)
-    if any(param.kind == inspect.Parameter.VAR_KEYWORD for param in signature.parameters.values()):
-        return func(**kwargs)
-    filtered = {key: value for key, value in kwargs.items() if key in signature.parameters}
-    return func(**filtered)
 
 
 class OmniRequestState(RequestState):
@@ -234,7 +218,7 @@ class OmniRequestState(RequestState):
                 new_token_ids = self.detokenizer.output_token_ids[self.sent_tokens_offset :]
                 self.sent_tokens_offset = self.detokenizer.num_output_tokens()
 
-        external_req_id = getattr(self, "external_req_id", self.request_id)
+        external_req_id = self.external_req_id
         output = self._new_completion_output(new_token_ids, finish_reason, stop_reason, routed_experts)
 
         if self.parent_req is None:
@@ -313,18 +297,12 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
                 (e.g., "image", "audio", "latent"). Used to tag multimodal
                 outputs with the correct modality key.
         """
-        _call_with_supported_kwargs(
-            super().__init__,
-            {
-                "tokenizer": tokenizer,
-                "log_stats": log_stats,
-                "stream_interval": stream_interval,
-                "tracing_enabled": tracing_enabled,
-            },
+        super().__init__(
+            tokenizer=tokenizer,
+            log_stats=log_stats,
+            stream_interval=stream_interval,
+            tracing_enabled=tracing_enabled,
         )
-        self.stream_interval = stream_interval
-        if not hasattr(self, "external_req_ids"):
-            self.external_req_ids = defaultdict(list)
         self.engine_core_output_type = engine_core_output_type
 
     def add_request(
@@ -356,22 +334,16 @@ class MultimodalOutputProcessor(VLLMOutputProcessor):
             self._update_streaming_request_state(req_state, request, prompt)
             return
 
-        req_state = _call_with_supported_kwargs(
-            OmniRequestState.from_new_request,
-            {
-                "tokenizer": self.tokenizer,
-                "request": request,
-                "prompt": prompt,
-                "parent_req": parent_req,
-                "request_index": request_index,
-                "queue": queue,
-                "log_stats": self.log_stats,
-                "stream_interval": self.stream_interval,
-            },
+        req_state = OmniRequestState.from_new_request(
+            tokenizer=self.tokenizer,
+            request=request,
+            prompt=prompt,
+            parent_req=parent_req,
+            request_index=request_index,
+            queue=queue,
+            log_stats=self.log_stats,
+            stream_interval=self.stream_interval,
         )
-        req_state.stream_interval = self.stream_interval
-        if not hasattr(req_state, "external_req_id"):
-            req_state.external_req_id = request_id
         self.request_states[request_id] = req_state
         if parent_req:
             self.parent_requests[parent_req.request_id] = parent_req

@@ -55,8 +55,8 @@ from vllm.multimodal.processing.processor import (
     TimingContext,
 )
 from vllm.sequence import IntermediateTensors
-from vllm.transformers_utils.tokenizer import cached_tokenizer_from_config
-from vllm.transformers_utils.tokenizers.mistral import MistralTokenizer
+from vllm.tokenizers import cached_tokenizer_from_config
+from vllm.tokenizers.mistral import MistralTokenizer
 
 weight_norm = torch.nn.utils.parametrizations.weight_norm
 

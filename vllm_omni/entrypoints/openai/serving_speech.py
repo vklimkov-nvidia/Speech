@@ -1100,7 +1100,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
         if ref_audio is not None and isinstance(ref_audio, str) and ref_audio.startswith("data:"):
             _, _, ref_audio = ref_audio.partition(",")
         if self._tts_tokenizer is None:
-            from vllm.transformers_utils.tokenizer import cached_tokenizer_from_config
+            from vllm.tokenizers import cached_tokenizer_from_config
 
             mistral_tokenizer = cached_tokenizer_from_config(self.engine_client.model_config)
             self._tts_tokenizer = mistral_tokenizer.instruct

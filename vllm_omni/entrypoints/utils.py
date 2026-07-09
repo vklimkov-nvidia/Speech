@@ -6,7 +6,8 @@ from pathlib import Path
 from typing import Any, get_args, get_origin
 
 from vllm.logger import init_logger
-from vllm.transformers_utils.config import file_or_path_exists, get_config, get_hf_file_to_dict
+from vllm.transformers_utils.config import get_config, get_hf_file_to_dict
+from vllm.transformers_utils.repo_utils import file_or_path_exists
 
 from vllm_omni.config.yaml_util import create_config, load_yaml_config, merge_configs
 from vllm_omni.entrypoints.stage_utils import _to_dict

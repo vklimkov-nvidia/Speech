@@ -1,37 +1,14 @@
-from dataclasses import MISSING, Field, field
+from dataclasses import MISSING, field
 from typing import Any
 
-from pydantic import TypeAdapter
+from pydantic import ConfigDict, TypeAdapter
 from vllm.config import ModelConfig
 from vllm.config.utils import config
 from vllm.logger import init_logger
 from vllm.transformers_utils.config import get_hf_text_config
-try:
-    from vllm.transformers_utils.model_arch_config_convertor import (
-        ModelArchConfigConvertorBase,
-    )
-except ImportError:
-    class ModelArchConfigConvertorBase:
-        def __init__(self, hf_config, hf_text_config):
-            self.hf_config = hf_config
-            self.hf_text_config = hf_text_config
-
-        def _normalize_quantization_config(self, config):
-            if config is None:
-                return None
-            if isinstance(config, dict):
-                return config.get("quantization_config")
-            return getattr(config, "quantization_config", None)
-
-        def get_quantization_config(self):
-            quant_cfg = self._normalize_quantization_config(self.hf_text_config)
-            if quant_cfg is not None:
-                return quant_cfg
-            return self._normalize_quantization_config(self.hf_config)
-
-        def convert(self):
-            quant_cfg = self.get_quantization_config()
-            return {"quantization_config": quant_cfg} if quant_cfg is not None else {}
+from vllm.transformers_utils.model_arch_config_convertor import (
+    ModelArchConfigConvertorBase,
+)
 
 import vllm_omni.model_executor.models as me_models
 
@@ -80,7 +57,7 @@ class OmniModelArchConfigConvertor(ModelArchConfigConvertorBase):
         return super().get_quantization_config()
 
 
-@config
+@config(config=ConfigDict(arbitrary_types_allowed=True))
 class OmniModelConfig(ModelConfig):
     """Configuration for Omni models, extending the base ModelConfig.
 
@@ -167,10 +144,7 @@ class OmniModelConfig(ModelConfig):
                 stage_config_name=self.hf_config_name,
             )
             return convertor.convert()
-        parent_get_model_arch_config = getattr(super(), "get_model_arch_config", None)
-        if callable(parent_get_model_arch_config):
-            return parent_get_model_arch_config()
-        return OmniModelArchConfigConvertor(self.hf_config, self.hf_text_config).convert()
+        return super().get_model_arch_config()
 
     def draw_hf_text_config(self):
         # transformers' get_text_config method is used to get the text config from thinker_config.
@@ -258,14 +232,6 @@ class OmniModelConfig(ModelConfig):
         return omni_cfg
 
     @classmethod
-    def _declared_config_fields(cls) -> set[str]:
-        return set(getattr(cls, "__dataclass_fields__", {})) | set(getattr(cls, "__annotations__", {}))
-
-    @classmethod
-    def _omni_field_names(cls) -> set[str]:
-        return cls._declared_config_fields() - set(getattr(ModelConfig, "__dataclass_fields__", {}))
-
-    @classmethod
     def _validate_omni_fields(cls, **omni_kwargs):
         """Validate omni-specific fields; we use TypeAdapters here to quickly
         validate only omni kwargs to avoid rerunning validation on the
@@ -274,19 +240,13 @@ class OmniModelConfig(ModelConfig):
         NOTE: This assumes add_defaults_to_omni_kwargs has already been called,
         so that all omni fields are present in the provided omni_kwargs.
         """
-        omni_fields = cls._omni_field_names()
-        field_defs = getattr(cls, "__dataclass_fields__", {})
-        annotations = getattr(cls, "__annotations__", {})
-        allowed_fields = cls._declared_config_fields()
+        omni_fields = set(cls.__dataclass_fields__) - set(ModelConfig.__dataclass_fields__)
 
         for key, value in omni_kwargs.items():
-            if key not in allowed_fields:
+            if key not in omni_fields:
                 raise ValueError(f"Unexpected omni kwarg: {key}")
 
-            if key in field_defs:
-                field_type = field_defs[key].type
-            else:
-                field_type = annotations[key]
+            field_type = cls.__dataclass_fields__[key].type
             if field_type is not Any:
                 TypeAdapter(field_type).validate_python(value)
 
@@ -306,16 +266,11 @@ class OmniModelConfig(ModelConfig):
 
         NOTE: omni_kwargs are mutated in place.
         """
-        omni_fields = cls._omni_field_names()
-        field_defs = getattr(cls, "__dataclass_fields__", {})
+        omni_fields = set(cls.__dataclass_fields__) - set(ModelConfig.__dataclass_fields__)
 
         for field_name in omni_fields - set(omni_kwargs.keys()):
-            field_def = field_defs.get(field_name)
-            if field_def is None:
-                field_def = getattr(cls, field_name, MISSING)
-            if isinstance(field_def, Field) and field_def.default_factory is not MISSING:
+            field_def = cls.__dataclass_fields__[field_name]
+            if field_def.default_factory is not MISSING:
                 omni_kwargs[field_name] = field_def.default_factory()
-            elif isinstance(field_def, Field) and field_def.default is not MISSING:
+            elif field_def.default is not MISSING:
                 omni_kwargs[field_name] = field_def.default
-            elif field_def is not MISSING:
-                omni_kwargs[field_name] = field_def

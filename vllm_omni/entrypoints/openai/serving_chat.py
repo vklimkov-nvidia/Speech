@@ -69,12 +69,9 @@ from vllm.reasoning import ReasoningParser
 from vllm.renderers import BaseRenderer, merge_kwargs
 from vllm.renderers.inputs import TokPrompt
 from vllm.sampling_params import SamplingParams
-try:
-    from vllm.transformers_utils.tokenizer import TokenizerLike
-except ImportError:
-    from vllm.transformers_utils.tokenizer import AnyTokenizer as TokenizerLike
-from vllm.transformers_utils.tokenizer import AnyTokenizer
-from vllm.transformers_utils.tokenizers.mistral import (
+from vllm.tokenizers import TokenizerLike
+from vllm.tokenizers import TokenizerLike as AnyTokenizer
+from vllm.tokenizers.mistral import (
     MistralTokenizer,
     maybe_serialize_tool_calls,
     truncate_tool_call_ids,

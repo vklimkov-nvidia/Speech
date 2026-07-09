@@ -4,17 +4,11 @@
 import math
 import time
 from collections import OrderedDict
-from typing import Literal, get_args
+from typing import get_args
 
 import torch
 import torch.nn as nn
-try:
-    from vllm.config import MaxLoRARanks
-except ImportError:
-    try:
-        from vllm.config.lora import MaxLoRARanks
-    except ImportError:
-        MaxLoRARanks = Literal[8, 16, 32, 64, 128, 256, 320, 512]
+from vllm.config.lora import MaxLoRARanks
 from vllm.logger import init_logger
 from vllm.lora.layers import BaseLayerWithLoRA
 from vllm.lora.lora_model import LoRAModel

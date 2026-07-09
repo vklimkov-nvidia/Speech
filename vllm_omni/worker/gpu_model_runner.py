@@ -10,48 +10,18 @@ from vllm.config import CUDAGraphMode
 from vllm.distributed.parallel_state import get_pp_group
 from vllm.forward_context import set_forward_context as _vllm_set_forward_context
 from vllm.logger import init_logger
-try:
-    from vllm.model_executor.models.interfaces import supports_mrope
-except ImportError:
-    def supports_mrope(model) -> bool:
-        return bool(getattr(model, "supports_mrope", False))
+from vllm.model_executor.models.interfaces import supports_mrope
 from vllm.model_executor.models.interfaces_base import VllmModelForPooling
 from vllm.sampling_params import SamplingType
-try:
-    from vllm.tracing import instrument
-except ImportError:
-    def instrument(*args, **kwargs):
-        def decorator(func):
-            return func
-        return decorator
-from vllm.utils import LazyLoader
-from vllm.utils import cdiv
-try:
-    from vllm.v1.spec_decode.draft_model import DraftModelProposer
-except ImportError:
-    class DraftModelProposer:
-        pass
-try:
-    from vllm.v1.spec_decode.eagle import EagleProposer
-except ImportError:
-    class EagleProposer:
-        pass
-try:
-    from vllm.v1.spec_decode.extract_hidden_states import ExtractHiddenStatesProposer
-except ImportError:
-    class ExtractHiddenStatesProposer:
-        pass
+from vllm.tracing import instrument
+from vllm.utils.import_utils import LazyLoader
+from vllm.utils.math_utils import cdiv
+from vllm.v1.spec_decode.draft_model import DraftModelProposer
+from vllm.v1.spec_decode.eagle import EagleProposer
+from vllm.v1.spec_decode.extract_hidden_states import ExtractHiddenStatesProposer
 from vllm.v1.worker.gpu_input_batch import CachedRequestState
-try:
-    from vllm.v1.worker.gpu_model_runner import GPUModelRunner, IntermediateTensors, PerLayerAttnMetadata
-except ImportError:
-    from vllm.v1.worker.gpu_model_runner import GPUModelRunner, IntermediateTensors
-    PerLayerAttnMetadata = Any
-try:
-    from vllm.v1.worker.ubatch_utils import maybe_create_ubatch_slices
-except ImportError:
-    def maybe_create_ubatch_slices(*args, **kwargs):
-        return None, None
+from vllm.v1.worker.gpu_model_runner import GPUModelRunner, IntermediateTensors, PerLayerAttnMetadata
+from vllm.v1.worker.ubatch_utils import maybe_create_ubatch_slices
 
 from vllm_omni.engine.serialization import deserialize_additional_information
 from vllm_omni.model_executor.layers.rotary_embedding.mrope import OmniMRotaryEmbedding as MRotaryEmbedding
@@ -69,61 +39,6 @@ else:
 
 logger = init_logger(__name__)
 
-
-_EASYMAGPIE_VLLM_ARCH = "EasyMagpieTTSForConditionalGeneration"
-_EASYMAGPIE_VLLM_TARGET = "easymagpie_vllm_omni.easymagpie:EasyMagpieTTSForConditionalGeneration"
-
-
-def _iter_easymagpie_vllm_registries(model_config=None):
-    try:
-        from vllm.model_executor import models as model_executor_models
-
-        yield model_executor_models.ModelRegistry
-    except Exception as exc:
-        logger.warning("Unable to inspect vLLM model_executor.models registry: %s", exc)
-    try:
-        from vllm.model_executor.models import registry as registry_module
-
-        yield registry_module.ModelRegistry
-    except Exception as exc:
-        logger.warning("Unable to inspect vLLM registry module: %s", exc)
-    if model_config is not None:
-        registry = getattr(model_config, "registry", None)
-        if registry is not None:
-            yield registry
-
-
-def _register_easymagpie_model_in_vllm(model_config=None, context: str = "worker") -> None:
-    registered = 0
-    seen: set[int] = set()
-    errors: list[str] = []
-    for registry in _iter_easymagpie_vllm_registries(model_config):
-        registry_id = id(registry)
-        if registry_id in seen:
-            continue
-        seen.add(registry_id)
-        try:
-            supported_archs = registry.get_supported_archs()
-            if _EASYMAGPIE_VLLM_ARCH not in supported_archs:
-                registry.register_model(_EASYMAGPIE_VLLM_ARCH, _EASYMAGPIE_VLLM_TARGET)
-            if _EASYMAGPIE_VLLM_ARCH in registry.get_supported_archs():
-                registered += 1
-            else:
-                errors.append(f"{type(registry).__name__} missing after register")
-        except Exception as exc:
-            errors.append(f"{type(registry).__name__}: {exc}")
-    if registered == 0:
-        raise RuntimeError(
-            "Unable to register EasyMagpie model in vLLM worker process "
-            f"({context}): {'; '.join(errors) or 'no registry candidates'}"
-        )
-    logger.warning(
-        "EasyMagpie vLLM registry ready in %s across %d registry object(s)",
-        context,
-        registered,
-    )
-
-
 _EASYMAGPIE_MAMBA_COMMON_BY_BUILDER_ID: dict[int, Any] = {}
 _EASYMAGPIE_MAMBA_CPU_FIELDS_BY_BUILDER_ID: dict[int, dict[str, torch.Tensor]] = {}
 _EASYMAGPIE_MAMBA_ACTIVE_COMMON: Any | None = None
@@ -132,7 +47,6 @@ _EASYMAGPIE_MAMBA_ACTIVE_CPU_FIELDS: dict[str, torch.Tensor] = {}
 
 def set_forward_context(*args, **kwargs):
     kwargs.pop("ubatch_slices", None)
-    kwargs.pop("slot_mapping", None)
     return _vllm_set_forward_context(*args, **kwargs)
 
 
@@ -969,14 +883,6 @@ class OmniGPUModelRunner(GPUModelRunner):
 
     @instrument(span_name="Loading (GPU)")
     def load_model(self, *args, **kwargs) -> None:
-        _register_easymagpie_model_in_vllm(
-            getattr(self, "model_config", None),
-            "gpu_model_runner.load_model.model_config",
-        )
-        _register_easymagpie_model_in_vllm(
-            getattr(getattr(self, "vllm_config", None), "model_config", None),
-            "gpu_model_runner.load_model.vllm_config",
-        )
         super().load_model(*args, **kwargs)
 
         # TODO move this model specific logic to a separate class
@@ -1674,7 +1580,7 @@ class OmniGPUModelRunner(GPUModelRunner):
             num_scheduled_tokens,
             num_tokens_padded,
             num_reqs_padded,
-            getattr(self.vllm_config.parallel_config, "num_ubatches", 1),
+            self.vllm_config.parallel_config.num_ubatches,
         )
         logger.debug(
             "ubatch_slices: %s, ubatch_slices_padded: %s",
@@ -1683,13 +1589,6 @@ class OmniGPUModelRunner(GPUModelRunner):
         )
 
         attn_metadata: PerLayerAttnMetadata | None = None
-
-        if (
-            is_profile
-            and getattr(getattr(self, "model", None), "has_preprocess", False)
-            and getattr(self, "kv_cache_config", None) is not None
-        ):
-            force_attention = True
 
         slot_mappings_by_group, slot_mappings = self._get_slot_mappings(
             num_tokens_padded=num_tokens,
@@ -1869,9 +1768,7 @@ class OmniGPUModelRunner(GPUModelRunner):
         # So it's safe to register hooks here. Hooks will be registered to
         # both compiled and uncompiled models but they will never
         # be called on the compiled model execution path.
-        register_layerwise_nvtx_hooks = getattr(self, "_register_layerwise_nvtx_hooks", None)
-        if callable(register_layerwise_nvtx_hooks):
-            register_layerwise_nvtx_hooks()
+        self._register_layerwise_nvtx_hooks()
 
         # This is necessary to avoid blocking DP.
         # For dummy runs, we typically skip EPLB since we don't have any real

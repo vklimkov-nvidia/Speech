@@ -560,11 +560,7 @@ async def omni_init_app_state(
         if vllm_config is not None:
             # Try to initialize processors if vllm_config is available
             try:
-                try:
-                    from vllm.plugins.io_processors import get_io_processor
-                except ImportError:
-                    def get_io_processor(*args: Any, **kwargs: Any) -> None:
-                        return None
+                from vllm.plugins.io_processors import get_io_processor
                 from vllm.v1.engine.input_processor import InputProcessor
 
                 tokenizer = await engine_client.get_tokenizer()

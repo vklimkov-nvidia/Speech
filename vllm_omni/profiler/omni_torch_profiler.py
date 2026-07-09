@@ -65,6 +65,7 @@ class OmniTorchProfilerWrapper(WorkerProfiler):
             logger.info_once(
                 "Omni torch profiling enabled. Traces will be saved to: %s",
                 self._trace_dir,
+                scope="local",
             )
 
         self.dump_cpu_time_total = "CPU" in activities and len(activities) == 1
@@ -211,7 +212,7 @@ def create_omni_profiler(
     Returns:
         Platform-specific profiler instance.
     """
-    from vllm.utils import resolve_obj_by_qualname
+    from vllm.utils.import_utils import resolve_obj_by_qualname
 
     from vllm_omni.platforms import current_omni_platform
 

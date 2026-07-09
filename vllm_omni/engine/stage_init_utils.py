@@ -20,11 +20,8 @@ from typing import Any, Literal
 from vllm.logger import init_logger
 from vllm.sampling_params import SamplingParams
 from vllm.usage.usage_lib import UsageContext
-try:
-    from vllm.v1.engine.input_processor import InputProcessor
-except ImportError:
-    from vllm.v1.engine.processor import Processor as InputProcessor
-from vllm.v1.executor.abstract import Executor
+from vllm.v1.engine.input_processor import InputProcessor
+from vllm.v1.executor import Executor
 
 from vllm_omni.engine.arg_utils import OmniEngineArgs
 from vllm_omni.entrypoints.stage_utils import _to_dict, set_stage_devices
@@ -33,13 +30,6 @@ from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniSamplingParam
 from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
-
-
-def _env_flag(name: str, default: bool = False) -> bool:
-    value = os.environ.get(name)
-    if value is None:
-        return default
-    return value.strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
 def _resolve_model_to_local_path(model: str) -> str:
@@ -252,9 +242,6 @@ def build_engine_args_dict(
     # Stage id must come from stage config instead of inherited CLI kwargs
     # (e.g. `--stage-id` defaulting to None).
     engine_args_dict["stage_id"] = stage_id
-    if stage_type != "diffusion" and _env_flag("EASYMAGPIE_VLLM_ENABLE_PREFIX_CACHING"):
-        engine_args_dict["enable_prefix_caching"] = True
-        logger.info("[stage_init] Enabled prefix caching for stage-%s from EASYMAGPIE_VLLM_ENABLE_PREFIX_CACHING", stage_id)
     if engine_args_dict.get("async_chunk", False):
         engine_args_dict["stage_connector_spec"] = dict(stage_connector_spec or {})
 

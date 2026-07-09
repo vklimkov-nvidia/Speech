@@ -7,7 +7,7 @@ import time
 
 import torch
 from vllm.logger import init_logger
-from vllm.utils import GiB_bytes, memory_profiling
+from vllm.utils.mem_utils import format_gib, memory_profiling
 from vllm.v1.worker.gpu_worker import Worker as GPUWorker
 
 from vllm_omni.entrypoints.utils import detect_pid_host
@@ -17,10 +17,6 @@ from vllm_omni.worker.gpu_memory_utils import (
 )
 
 logger = init_logger(__name__)
-
-
-def format_gib(value: int | float) -> str:
-    return f"{value / GiB_bytes:.2f}"
 
 
 class OmniGPUWorkerBase(GPUWorker):
@@ -38,7 +34,7 @@ class OmniGPUWorkerBase(GPUWorker):
         super().__init__(*args, **kwargs)
 
         # Replace vLLM's profiler with platform-specific profiler
-        profiler_config = getattr(self.vllm_config, "profiler_config", None)
+        profiler_config = self.vllm_config.profiler_config
         if profiler_config and profiler_config.profiler == "torch":
             from vllm_omni.profiler import create_omni_profiler
 
@@ -96,8 +92,7 @@ class OmniGPUWorkerBase(GPUWorker):
             If NVML is unavailable, falls back to profiling data:
             available = requested - (weights + activations + non_torch)
         """
-        kv_cache_memory_bytes = getattr(self.cache_config, "kv_cache_memory_bytes", None)
-        if kv_cache_memory_bytes:
+        if kv_cache_memory_bytes := self.cache_config.kv_cache_memory_bytes:
             self.model_runner.profile_run()
             logger.info(
                 "Using explicit kv_cache_memory_bytes: %s GiB",
@@ -134,6 +129,7 @@ class OmniGPUWorkerBase(GPUWorker):
             logger.info_once(
                 "Available KV cache memory: %s GiB (process-scoped)",
                 format_gib(self.available_kv_cache_memory_bytes),
+                scope="local",
             )
         else:
             # NVML unavailable: use profiling data as conservative fallback
@@ -154,6 +150,7 @@ class OmniGPUWorkerBase(GPUWorker):
             logger.info_once(
                 "Available KV cache memory: %s GiB (profiling fallback)",
                 format_gib(self.available_kv_cache_memory_bytes),
+                scope="local",
             )
 
         return int(self.available_kv_cache_memory_bytes)

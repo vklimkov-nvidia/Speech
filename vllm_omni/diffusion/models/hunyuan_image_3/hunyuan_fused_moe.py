@@ -4,7 +4,7 @@
 from typing import Any
 
 from vllm.model_executor.layers.fused_moe import SharedFusedMoE
-from vllm.utils import resolve_obj_by_qualname
+from vllm.utils.import_utils import resolve_obj_by_qualname
 
 from vllm_omni.platforms import current_omni_platform
 

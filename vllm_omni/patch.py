@@ -1,6 +1,66 @@
+import importlib
 import sys
+import types
 
 from aenum import extend_enum
+
+
+def _install_vllm_inputs_data_alias() -> None:
+    if "vllm.inputs.data" in sys.modules:
+        return
+    try:
+        import vllm.inputs as inputs
+    except Exception:
+        return
+
+    module = types.ModuleType("vllm.inputs.data")
+    module.__doc__ = "Compatibility aliases for input types exported from vllm.inputs."
+    module.__package__ = "vllm.inputs"
+    for name in dir(inputs):
+        if not name.startswith("__"):
+            setattr(module, name, getattr(inputs, name))
+    for old_name, new_name in {
+        "TokenInputs": "TokensInput",
+        "EmbedsInputs": "EmbedsInput",
+        "SingletonInputs": "SingletonInput",
+    }.items():
+        if not hasattr(module, old_name) and hasattr(inputs, new_name):
+            setattr(module, old_name, getattr(inputs, new_name))
+    sys.modules["vllm.inputs.data"] = module
+    sys.modules.setdefault("vllm.inputs.parse", module)
+    if not hasattr(inputs, "data"):
+        inputs.data = module
+    if not hasattr(inputs, "parse"):
+        inputs.parse = sys.modules["vllm.inputs.parse"]
+
+
+_install_vllm_inputs_data_alias()
+
+
+def _install_vllm_multimodal_inputs_alias() -> None:
+    try:
+        multimodal_inputs = importlib.import_module("vllm.multimodal.inputs")
+    except Exception:
+        return
+    if hasattr(multimodal_inputs, "MultiModalInputs"):
+        return
+
+    candidate = None
+    for name in ("MultiModalInputsV2", "MultiModalInput"):
+        candidate = getattr(multimodal_inputs, name, None)
+        if candidate is not None:
+            break
+    if candidate is None:
+        try:
+            inputs = importlib.import_module("vllm.inputs")
+            candidate = getattr(inputs, "MultiModalInput", None)
+        except Exception:
+            candidate = None
+    multimodal_inputs.MultiModalInputs = candidate or dict
+
+
+_install_vllm_multimodal_inputs_alias()
+
 from vllm.inputs.data import TokensPrompt as _OriginalTokensPrompt
 from vllm.model_executor.layers.rotary_embedding import (
     MRotaryEmbedding as _OriginalMRotaryEmbedding,
