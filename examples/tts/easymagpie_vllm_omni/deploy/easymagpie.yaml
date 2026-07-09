@@ -108,8 +108,15 @@ stages:
     async_scheduling: false
     enable_prefix_caching: false
     # In async_chunk mode each step is an independent prefill of one fixed window
-    # (Q * codec_fixed_chunk_frames = 16 * 15 = 240 tokens); 512 gives headroom.
-    max_num_batched_tokens: 512
+    # (Q * codec_fixed_chunk_frames = 16 * 15 = 240 tokens). The scheduler batches
+    # as many waiting windows per step as this token budget allows, so it MUST be
+    # large enough to coalesce the target concurrency: at 512 only floor(512/240)=2
+    # windows fit per step, which serializes the codec at high concurrency (observed
+    # mean decode batch ~2.5 at C=32). Size it to max_num_seqs windows so the whole
+    # backlog can be decoded in one batched graph replay: 32 * 240 = 7680 -> 8192
+    # (headroom). max_num_seqs (32) and the decode_cudagraph_batch_sizes (..,16,32)
+    # cap the effective batch, and the (B,15) codec graph handles it in one replay.
+    max_num_batched_tokens: 8192
     max_model_len: 512
     devices: "0"
     input_connectors:

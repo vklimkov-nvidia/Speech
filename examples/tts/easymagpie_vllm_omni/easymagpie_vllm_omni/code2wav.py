@@ -206,6 +206,12 @@ class EasyMagpieCode2Wav(nn.Module):
         # many frames so the codec always runs a single shape (one CUDA graph).
         # Resolved from connector config in load_weights().
         self._fixed_chunk_frames = 0
+        # Diagnostics: histogram of actual codec decode batch sizes. Logged every
+        # EASYMAGPIE_CODEC_BATCH_LOG_EVERY decode calls (0 disables). Tells us
+        # whether concurrent streams are actually being batched at Stage 1.
+        self._decode_batch_hist: dict[int, int] = defaultdict(int)
+        self._decode_calls = 0
+        self._decode_log_every = int(os.environ.get("EASYMAGPIE_CODEC_BATCH_LOG_EVERY", "50"))
 
     # ------------------------------------------------------------------
     # vLLM runner shims
@@ -367,9 +373,34 @@ class EasyMagpieCode2Wav(nn.Module):
 
     def _decode_codes(self, codes_bfq: torch.Tensor) -> torch.Tensor:
         assert self.decode_module is not None, "EasyMagpieCode2Wav.load_weights was not called"
+        self._log_decode_batch(int(codes_bfq.shape[0]), int(codes_bfq.shape[1]))
         if self._graph is not None:
             return self._graph.decode(codes_bfq)
         return self.decode_module(codes_bfq)
+
+    def _log_decode_batch(self, batch_size: int, frames: int) -> None:
+        """Accumulate a batch-size histogram and emit it periodically.
+
+        A distribution dominated by batch=1 means concurrent streams are NOT being
+        coalesced at Stage 1 (the codec is running serialized), which is the main
+        high-concurrency bottleneck vs. a dynamic-batched (Triton) codec.
+        """
+        if self._decode_log_every <= 0:
+            return
+        self._decode_batch_hist[batch_size] += 1
+        self._decode_calls += 1
+        if self._decode_calls % self._decode_log_every != 0:
+            return
+        total = sum(self._decode_batch_hist.values())
+        weighted = sum(b * c for b, c in self._decode_batch_hist.items())
+        hist = ", ".join(f"b{b}:{c}" for b, c in sorted(self._decode_batch_hist.items()))
+        logger.info(
+            "EasyMagpie Code2Wav decode batch histogram (%d decodes, last frames=%d): %s | mean_batch=%.2f",
+            total,
+            frames,
+            hist,
+            weighted / max(total, 1),
+        )
 
     def make_omni_output(self, model_outputs: torch.Tensor | OmniOutput | tuple, **_: Any) -> OmniOutput:
         if isinstance(model_outputs, OmniOutput):
