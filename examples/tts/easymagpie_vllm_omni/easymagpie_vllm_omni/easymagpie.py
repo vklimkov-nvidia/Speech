@@ -348,6 +348,7 @@ class EasyMagpieTTSForConditionalGeneration(
         self._dec_audio_valid = torch.zeros(max_num_tokens, dtype=torch.long)
         # CFG roles: 0=ordinary request, 1=conditional, 2=unconditional.
         self._cfg_roles = torch.zeros(max_num_tokens, dtype=torch.long)
+        self._cfg_pair_indices = torch.full((max_num_tokens,), -1, dtype=torch.long)
         self._cfg_step_active = False
         self._cfg_step_num_outputs = 0
         self._cfg_step_scale = 1.0
@@ -712,20 +713,7 @@ class EasyMagpieTTSForConditionalGeneration(
             else:
                 valid = decode_idx[:num_req]
             cfg_n = int(getattr(self, "_cfg_step_num_outputs", 0))
-            roles = self._cfg_roles[valid]
-            conditional_rows = valid[roles == 1]
-            unconditional_rows = valid[roles == 2]
-            if (
-                cfg_n <= 0
-                or int(conditional_rows.numel()) <= 0
-                or int(conditional_rows.numel()) != int(unconditional_rows.numel())
-            ):
-                raise RuntimeError(
-                    "EasyMagpie CFG decode rows are not complete pairs: "
-                    f"conditional={int(conditional_rows.numel())}, "
-                    f"unconditional={int(unconditional_rows.numel())}, outputs={cfg_n}"
-                )
-            ordered = torch.cat([conditional_rows, unconditional_rows], dim=0)
+            ordered = self._ordered_cfg_rows(valid, cfg_n)
             ctx = get_forward_context()
             orig_bd = ctx.batch_descriptor
             ctx.batch_descriptor = BatchDescriptor(num_tokens=int(ordered.numel()))
@@ -792,6 +780,44 @@ class EasyMagpieTTSForConditionalGeneration(
             previous_content_frames = decode_offset - int(self.speech_delay)
             eos = eos & (previous_content_frames >= min_content_frames)
         self._token_stop[idx] = eos
+
+    def _ordered_cfg_rows(self, valid: torch.Tensor, cfg_n: int) -> torch.Tensor:
+        """Return logical CFG pairs as conditional rows followed by companions."""
+
+        roles = self._cfg_roles[valid]
+        conditional_rows = valid[roles == 1]
+        unconditional_rows = valid[roles == 2]
+        if (
+            cfg_n <= 0
+            or int(conditional_rows.numel()) <= 0
+            or int(conditional_rows.numel()) != int(unconditional_rows.numel())
+        ):
+            raise RuntimeError(
+                "EasyMagpie CFG decode rows are not complete pairs: "
+                f"conditional={int(conditional_rows.numel())}, "
+                f"unconditional={int(unconditional_rows.numel())}, outputs={cfg_n}"
+            )
+
+        conditional_pairs = self._cfg_pair_indices[conditional_rows]
+        unconditional_pairs = self._cfg_pair_indices[unconditional_rows]
+        conditional_order = torch.argsort(conditional_pairs)
+        unconditional_order = torch.argsort(unconditional_pairs)
+        conditional_rows = conditional_rows[conditional_order]
+        unconditional_rows = unconditional_rows[unconditional_order]
+        conditional_pairs = conditional_pairs[conditional_order]
+        unconditional_pairs = unconditional_pairs[unconditional_order]
+        if (
+            bool((conditional_pairs < 0).any())
+            or bool((conditional_pairs >= cfg_n).any())
+            or int(torch.unique(conditional_pairs).numel()) != int(conditional_pairs.numel())
+            or not torch.equal(conditional_pairs, unconditional_pairs)
+        ):
+            raise RuntimeError(
+                "EasyMagpie CFG decode rows have inconsistent logical pair indices: "
+                f"conditional={conditional_pairs.tolist()}, "
+                f"unconditional={unconditional_pairs.tolist()}, outputs={cfg_n}"
+            )
+        return torch.cat([conditional_rows, unconditional_rows], dim=0)
 
     def _assemble_decode_embeddings(self, combined: torch.Tensor, idx) -> None:
         """Add ``text + phoneme + audio`` embeddings into ``combined`` at ``idx``."""
@@ -1086,6 +1112,7 @@ class EasyMagpieTTSForConditionalGeneration(
         )
         minus_one_names = (
             "_decode_offsets",
+            "_cfg_pair_indices",
         )
         for name in zero_names:
             value = getattr(self, name, None)
@@ -1388,6 +1415,13 @@ class EasyMagpieTTSForConditionalGeneration(
             cfg_scale = float(info_dict.get("cfg_scale", 1.0) or 1.0)
             if cfg_n <= 0:
                 raise RuntimeError("EasyMagpie CFG request is missing cfg_num_outputs")
+            pair_index_value = self._coerce_opt_int(info_dict.get("cfg_pair_index"))
+            pair_index = -1 if pair_index_value is None else int(pair_index_value)
+            if pair_index < 0 or pair_index >= cfg_n:
+                raise RuntimeError(
+                    "EasyMagpie CFG request has invalid pair index "
+                    f"{pair_index} for outputs={cfg_n}"
+                )
             if self._cfg_step_active and (
                 cfg_n != self._cfg_step_num_outputs or cfg_scale != self._cfg_step_scale
             ):
@@ -1396,6 +1430,7 @@ class EasyMagpieTTSForConditionalGeneration(
             self._cfg_step_num_outputs = cfg_n
             self._cfg_step_scale = cfg_scale
             self._cfg_roles[start] = 1 if role == "conditional" else 2
+            self._cfg_pair_indices[start] = pair_index
         self._decode_offsets[start] = decode_offset
 
         # ── Text channel ── (delay 0: one subword per step from step 0). The text
@@ -1554,6 +1589,7 @@ class EasyMagpieTTSForConditionalGeneration(
             "_dec_text_mask",
             "_dec_audio_codes",
             "_dec_audio_valid",
+            "_cfg_roles",
             "_out_codes",
             "_out_code_logprobs",
             "_out_code_sampling_logprobs",
@@ -1568,6 +1604,8 @@ class EasyMagpieTTSForConditionalGeneration(
                 value.zero_()
         if isinstance(getattr(self, "_decode_offsets", None), torch.Tensor):
             self._decode_offsets.fill_(-1)
+        if isinstance(getattr(self, "_cfg_pair_indices", None), torch.Tensor):
+            self._cfg_pair_indices.fill_(-1)
 
     # Checkpoint prefixes (EasyMagpieTTS state dict) → in-model paths.
     # ``decoder.*`` is fed to the vLLM backbone loader separately (it understands

@@ -541,7 +541,11 @@ class EasyMagpieCodePredictor(nn.Module):
         forbidden = self.forbidden_mask
         scale = float(cfg_scale)
         for k in range(self.num_codebooks):
-            hidden = self(buf_run)
+            # CFG is a runtime-only branch, so vLLM's startup warmup never
+            # captures the decorated inner module for this call site. Calling
+            # ``forward`` directly keeps the paired branch eager and avoids a
+            # forbidden lazy CUDA-graph capture after engine startup.
+            hidden = self.local_transformer.forward(buf_run)
             row = self.local_transformer_audio_out_projection(hidden[:num_tokens, k, :])
             logits = self.local_transformer_out_projections[k](row)
             guided_logits = logits.clone()

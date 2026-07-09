@@ -263,19 +263,93 @@ class EasyMagpieARAsyncScheduler(_OmniARBaseScheduler):
         request._easymagpie_cfg_parent_id = parent_id
         request._easymagpie_cfg_pair_index = pair_index
         request._easymagpie_cfg_role = role
+        request._easymagpie_cfg_num_outputs = cfg_n
 
     def _annotate_cfg_requests(self) -> None:
         for request in list(self.waiting or []) + list(self.running or []):
             self._annotate_cfg_request(request)
 
+    def _requests_by_id(self) -> dict[str, Request]:
+        requests: dict[str, Request] = {}
+        request_map = getattr(self, "requests", None)
+        if isinstance(request_map, dict):
+            requests.update(
+                (self._request_id(request), request)
+                for request in request_map.values()
+            )
+        for queue_name in ("running", "waiting", "skipped_waiting"):
+            for request in list(getattr(self, queue_name, None) or []):
+                requests[self._request_id(request)] = request
+        return requests
+
+    @staticmethod
+    def _cfg_pair_key(request: Request) -> tuple[str, int] | None:
+        parent_id = getattr(request, "_easymagpie_cfg_parent_id", None)
+        if not parent_id:
+            return None
+        return (
+            str(parent_id),
+            int(getattr(request, "_easymagpie_cfg_pair_index", -1)),
+        )
+
+    def _defer_incomplete_cfg_waiting_parents(self):
+        active = list(getattr(self, "running", None) or []) + list(
+            getattr(self, "waiting", None) or []
+        )
+        parents: dict[str, dict[str, object]] = {}
+        for request in active:
+            key = self._cfg_pair_key(request)
+            if key is not None:
+                parent_id, pair_index = key
+                parent = parents.setdefault(
+                    parent_id,
+                    {
+                        "expected": int(
+                            getattr(request, "_easymagpie_cfg_num_outputs", 0)
+                        ),
+                        "pairs": {},
+                    },
+                )
+                pair_roles = parent["pairs"].setdefault(pair_index, set())
+                pair_roles.add(
+                    str(getattr(request, "_easymagpie_cfg_role", ""))
+                )
+        incomplete_parents = set()
+        for parent_id, parent in parents.items():
+            expected = int(parent["expected"])
+            pairs = parent["pairs"]
+            if (
+                expected <= 0
+                or set(pairs) != set(range(expected))
+                or any(
+                    pair_roles != {"conditional", "unconditional"}
+                    for pair_roles in pairs.values()
+                )
+            ):
+                incomplete_parents.add(parent_id)
+        if not incomplete_parents:
+            return None
+
+        ready = create_request_queue(self.policy)
+        deferred = create_request_queue(self.policy)
+        for request in list(self.waiting or []):
+            key = self._cfg_pair_key(request)
+            target = (
+                deferred
+                if key is not None and key[0] in incomplete_parents
+                else ready
+            )
+            target.add_request(request)
+        if not deferred:
+            return None
+        self.waiting = ready
+        return deferred
+
     def _assert_complete_cfg_decode_pairs(self, schedule_output) -> None:
         scheduled = getattr(schedule_output, "num_scheduled_tokens", None)
         if not isinstance(scheduled, dict):
             return
-        requests = {
-            self._request_id(request): request
-            for request in list(self.running or []) + list(self.waiting or [])
-        }
+        requests = self._requests_by_id()
         pairs: dict[tuple[str, int], set[str]] = {}
         for request_id, token_count in scheduled.items():
             request = requests.get(str(request_id))
@@ -294,7 +368,72 @@ class EasyMagpieARAsyncScheduler(_OmniARBaseScheduler):
             pairs.setdefault(key, set()).add(str(request._easymagpie_cfg_role))
         incomplete = {key: sorted(roles) for key, roles in pairs.items() if roles != {"conditional", "unconditional"}}
         if incomplete:
-            raise RuntimeError(f"EasyMagpie scheduler split CFG decode pairs: {incomplete}")
+            request_state = {}
+            for request_id, request in requests.items():
+                key = (
+                    str(getattr(request, "_easymagpie_cfg_parent_id", "")),
+                    int(getattr(request, "_easymagpie_cfg_pair_index", -1)),
+                )
+                if key not in incomplete:
+                    continue
+                request_state[request_id] = {
+                    "role": str(getattr(request, "_easymagpie_cfg_role", "")),
+                    "scheduled_tokens": int(scheduled.get(request_id, 0) or 0),
+                    "num_computed_tokens": int(getattr(request, "num_computed_tokens", 0) or 0),
+                    "num_prompt_tokens": int(getattr(request, "num_prompt_tokens", 0) or 0),
+                    "status": str(getattr(request, "status", "")),
+                }
+            raise RuntimeError(
+                "EasyMagpie scheduler split CFG decode pairs: "
+                f"pairs={incomplete} request_state={request_state} "
+                f"scheduled_request_count={len(scheduled)} "
+                f"known_requests={len(requests)} running={self._safe_len(self.running)} "
+                f"waiting={self._safe_len(self.waiting)} "
+                f"skipped_waiting={self._safe_len(getattr(self, 'skipped_waiting', None))}"
+            )
+
+    def _assert_cfg_sampled_token_pairs(self, schedule_output, model_runner_output) -> None:
+        scheduled = getattr(schedule_output, "num_scheduled_tokens", None)
+        sampled = getattr(model_runner_output, "sampled_token_ids", None)
+        req_id_to_index = getattr(model_runner_output, "req_id_to_index", None)
+        if not isinstance(scheduled, dict) or not sampled or not isinstance(req_id_to_index, dict):
+            return
+
+        requests = self._requests_by_id()
+        pairs: dict[tuple[str, int], dict[str, tuple[str, tuple[int, ...]]]] = {}
+        for request_id in scheduled:
+            request = requests.get(str(request_id))
+            parent_id = getattr(request, "_easymagpie_cfg_parent_id", None)
+            if request is None or not parent_id or request_id not in req_id_to_index:
+                continue
+            token_ids = sampled[req_id_to_index[request_id]]
+            if not token_ids:
+                continue
+            if isinstance(token_ids, int):
+                normalized = (int(token_ids),)
+            else:
+                normalized = tuple(int(token_id) for token_id in token_ids)
+            key = (str(parent_id), int(request._easymagpie_cfg_pair_index))
+            pairs.setdefault(key, {})[str(request._easymagpie_cfg_role)] = (
+                str(request_id),
+                normalized,
+            )
+
+        mismatched = {
+            key: roles
+            for key, roles in pairs.items()
+            if set(roles) == {"conditional", "unconditional"}
+            and roles["conditional"][1] != roles["unconditional"][1]
+        }
+        if mismatched:
+            raise RuntimeError(
+                "EasyMagpie CFG pair sampled different stop tokens: "
+                f"{mismatched}"
+            )
+
+    def update_from_output(self, scheduler_output, model_runner_output):  # type: ignore[override]
+        self._assert_cfg_sampled_token_pairs(scheduler_output, model_runner_output)
+        return super().update_from_output(scheduler_output, model_runner_output)
 
     def _finalize_schedule(self, result):
         self._assert_complete_cfg_decode_pairs(result)
@@ -325,6 +464,17 @@ class EasyMagpieARAsyncScheduler(_OmniARBaseScheduler):
 
     def schedule(self):  # type: ignore[override]
         self._annotate_cfg_requests()
+        deferred_cfg = self._defer_incomplete_cfg_waiting_parents()
+        try:
+            return self._schedule_ready_requests()
+        finally:
+            if deferred_cfg:
+                self.waiting = self._restore_deferred_waiting(
+                    self.waiting,
+                    deferred_cfg,
+                )
+
+    def _schedule_ready_requests(self):
         post_refit_waiting = self._has_waiting_post_refit_request()
         if post_refit_waiting:
             logger.info(

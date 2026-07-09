@@ -346,6 +346,60 @@ def test_easy_scheduler_annotates_parallel_cfg_children(monkeypatch):
     assert unconditional._easymagpie_cfg_pair_index == 3
 
 
+def test_easy_scheduler_defers_cfg_parent_until_all_children_arrive(monkeypatch):
+    scheduler_mod = _load_scheduler_with_stubs(monkeypatch)
+    scheduler = object.__new__(scheduler_mod.EasyMagpieARAsyncScheduler)
+    scheduler.policy = "fcfs"
+    conditional = _cfg_request(3)
+    scheduler_mod.EasyMagpieARAsyncScheduler._annotate_cfg_request(conditional)
+    scheduler.running = []
+    scheduler.waiting = _FakeQueue([conditional])
+
+    deferred = scheduler._defer_incomplete_cfg_waiting_parents()
+
+    assert list(scheduler.waiting) == []
+    assert list(deferred) == [conditional]
+
+
+def test_easy_scheduler_admits_complete_cfg_parent_together(monkeypatch):
+    scheduler_mod = _load_scheduler_with_stubs(monkeypatch)
+    scheduler = object.__new__(scheduler_mod.EasyMagpieARAsyncScheduler)
+    scheduler.policy = "fcfs"
+    conditional = _cfg_request(0, outputs=1)
+    unconditional = _cfg_request(1, outputs=1)
+    scheduler_mod.EasyMagpieARAsyncScheduler._annotate_cfg_request(conditional)
+    scheduler_mod.EasyMagpieARAsyncScheduler._annotate_cfg_request(unconditional)
+    scheduler.running = []
+    scheduler.waiting = _FakeQueue([conditional, unconditional])
+
+    deferred = scheduler._defer_incomplete_cfg_waiting_parents()
+
+    assert deferred is None
+    assert list(scheduler.waiting) == [conditional, unconditional]
+
+
+def test_easy_scheduler_keeps_multi_output_cfg_parent_atomic(monkeypatch):
+    scheduler_mod = _load_scheduler_with_stubs(monkeypatch)
+    scheduler = object.__new__(scheduler_mod.EasyMagpieARAsyncScheduler)
+    scheduler.policy = "fcfs"
+    children = [_cfg_request(index, outputs=2) for index in range(4)]
+    for child in children:
+        scheduler_mod.EasyMagpieARAsyncScheduler._annotate_cfg_request(child)
+    scheduler.running = []
+    scheduler.waiting = _FakeQueue([children[0], children[2]])
+
+    deferred = scheduler._defer_incomplete_cfg_waiting_parents()
+
+    assert list(scheduler.waiting) == []
+    assert list(deferred) == [children[0], children[2]]
+
+    scheduler.waiting = _FakeQueue(children)
+    deferred = scheduler._defer_incomplete_cfg_waiting_parents()
+
+    assert deferred is None
+    assert list(scheduler.waiting) == children
+
+
 def test_easy_scheduler_accepts_complete_cfg_decode_pair(monkeypatch):
     scheduler_mod = _load_scheduler_with_stubs(monkeypatch)
     scheduler = object.__new__(scheduler_mod.EasyMagpieARAsyncScheduler)
@@ -376,4 +430,26 @@ def test_easy_scheduler_rejects_split_cfg_decode_pair(monkeypatch):
     with pytest.raises(RuntimeError, match="split CFG decode pairs"):
         scheduler._assert_complete_cfg_decode_pairs(
             SimpleNamespace(num_scheduled_tokens={conditional.request_id: 1})
+        )
+
+
+def test_easy_scheduler_rejects_cfg_stop_token_mismatch(monkeypatch):
+    scheduler_mod = _load_scheduler_with_stubs(monkeypatch)
+    scheduler = object.__new__(scheduler_mod.EasyMagpieARAsyncScheduler)
+    conditional = _cfg_request(3)
+    unconditional = _cfg_request(11)
+    scheduler_mod.EasyMagpieARAsyncScheduler._annotate_cfg_request(conditional)
+    scheduler_mod.EasyMagpieARAsyncScheduler._annotate_cfg_request(unconditional)
+    scheduler.running = [conditional, unconditional]
+    scheduler.waiting = _FakeQueue()
+
+    with pytest.raises(RuntimeError, match="sampled different stop tokens"):
+        scheduler._assert_cfg_sampled_token_pairs(
+            SimpleNamespace(
+                num_scheduled_tokens={conditional.request_id: 1, unconditional.request_id: 1}
+            ),
+            SimpleNamespace(
+                sampled_token_ids=[[0], [1]],
+                req_id_to_index={conditional.request_id: 0, unconditional.request_id: 1},
+            ),
         )

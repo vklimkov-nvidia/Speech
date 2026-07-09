@@ -218,6 +218,17 @@ def test_cfg_unconditional_decode_keeps_audio_but_masks_text():
     assert torch.equal(combined[1], torch.tensor([3.0, 4.0]))
 
 
+def test_cfg_rows_are_ordered_by_logical_pair_index():
+    model = EasyMagpieTTSForConditionalGeneration.__new__(EasyMagpieTTSForConditionalGeneration)
+    torch.nn.Module.__init__(model)
+    model._cfg_roles = torch.tensor([1, 2, 1, 2], dtype=torch.long)
+    model._cfg_pair_indices = torch.tensor([4, 3, 3, 4], dtype=torch.long)
+
+    ordered = model._ordered_cfg_rows(torch.tensor([0, 1, 2, 3]), cfg_n=8)
+
+    assert torch.equal(ordered, torch.tensor([2, 0, 1, 3]))
+
+
 def test_non_text_refit_allows_static_backbone_and_text_targets():
     model = _minimal_refit_model()
     model._easymagpie_allow_missing_text_tables_refit = True
