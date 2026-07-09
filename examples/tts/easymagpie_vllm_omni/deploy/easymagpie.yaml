@@ -57,7 +57,12 @@ connectors:
       # Padding is on the right (causal codec) and its audio is sliced off after
       # decode. Defaults to codec_left_context_frames + codec_chunk_frames.
       codec_fixed_chunk_frames: 15
-      decode_cudagraph_capture_frames: [15]   # single capture size (no-op under enforce_eager)
+      # Codec decode CUDA graph: one frame bucket (15, the fixed chunk) x several
+      # batch buckets. Stage 1 groups same-frame requests into a (B, F, q) batch and
+      # the wrapper pads B up to the nearest captured batch bucket (e.g. 3 requests
+      # reuse the (4, 15) graph). Keep the bucket set small to bound capture memory.
+      decode_cudagraph_capture_frames: [15]
+      decode_cudagraph_batch_sizes: [1, 2, 4, 8, 16, 32]
 
 stages:
   # IMPORTANT: do NOT nest tuning fields under an ``engine_args:`` sub-block.
@@ -67,15 +72,15 @@ stages:
   # siblings. Keep everything flat at the stage level; unknown keys (e.g.
   # mamba_ssm_cache_dtype) are passed through to vLLM EngineArgs as engine_extras.
   - stage_id: 0
-    max_num_seqs: 8
-    gpu_memory_utilization: 0.45
-    # enforce_eager disables vLLM's own CUDA-graph capture (the ~51 PIECEWISE
-    # graphs) — set true for now to avoid capture-time OOM while confirming the
-    # pipeline runs. Flip back to false later to regain talker throughput.
-    enforce_eager: true
+    max_num_seqs: 32
+    gpu_memory_utilization: 0.5
+    enforce_eager: false
     async_scheduling: true
     enable_prefix_caching: false
-    max_num_batched_tokens: 4096
+    # Chunked prefill capped at 512 tokens/step keeps per-step batches small and
+    # bounds the prefill graph shapes.
+    enable_chunked_prefill: true
+    max_num_batched_tokens: 512
     max_model_len: 4096
     devices: "0"
     output_connectors:
@@ -91,19 +96,21 @@ stages:
       max_tokens: 2048
 
   - stage_id: 1
-    max_num_seqs: 8
+    max_num_seqs: 32
     gpu_memory_utilization: 0.35
-    # enforce_eager disables vLLM's own CUDA-graph capture for the code2wav stage
-    # (the ~31 graphs). NOTE: it also disables the codec decode CUDA graph, so
-    # decode_cudagraph_capture_frames above is a no-op while this is true — the
-    # codec decodes eagerly. Flip to false to re-enable the single 15-frame codec
-    # graph once you've confirmed correctness.
+    # Stage-1 (codec) is a no-KV-cache model, so vLLM's own cudagraph capture does
+    # nothing useful; keep it eager to avoid vLLM's warmup cost. The hand-captured
+    # codec graph is independent of this flag.
     enforce_eager: true
-    async_scheduling: true
+    # Keep async_scheduling OFF for the codec stage: the codec graph replays into a
+    # single shared static_input/static_output buffer per shape, so overlapping
+    # Stage-1 steps would overwrite those buffers mid-replay -> corrupted audio.
+    async_scheduling: false
     enable_prefix_caching: false
-    # Prefill length is Q * num_frames (e.g. 16 * 2048 = 32768); keep headroom.
-    max_num_batched_tokens: 65536
-    max_model_len: 65536
+    # In async_chunk mode each step is an independent prefill of one fixed window
+    # (Q * codec_fixed_chunk_frames = 16 * 15 = 240 tokens); 512 gives headroom.
+    max_num_batched_tokens: 512
+    max_model_len: 512
     devices: "0"
     input_connectors:
       from_stage_0: connector_of_shared_memory

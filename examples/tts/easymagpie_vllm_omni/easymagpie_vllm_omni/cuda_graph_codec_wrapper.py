@@ -26,8 +26,8 @@ the EasyMagpie decode module (see :class:`easymagpie_vllm_omni.code2wav`):
   ``(batch, frames, num_stacked_codebooks)`` (int64) and returns a waveform of
   shape ``(batch, frames * samples_per_frame)`` (fp32).
 * Capture happens per ``(batch_size, frames)`` bucket; at decode time the actual
-  frame count is padded up to the nearest captured bucket and the replayed
-  output is trimmed back to ``actual_frames * samples_per_frame``.
+  batch/frame count is padded up to the nearest captured bucket and the replayed
+  output is trimmed back to the real ``(batch_size, actual_frames)``.
 * Any shape without a captured bucket (e.g. an unusually long non-streaming
   sequence) falls back to eager decode, so correctness never depends on a graph
   being present.
@@ -86,10 +86,20 @@ class CUDAGraphCodecDecoder:
         self.static_outputs: dict[tuple[int, int], torch.Tensor] = {}
         self._warmed_up = False
         self._device: torch.device | None = None
+        # When armed, capture is deferred to the first real decode so it runs in
+        # the serving runtime context (after vLLM init / kv-cache setup, which can
+        # otherwise free and reuse the captured buffers -> corrupted replay).
+        self._lazy_warmup_device: torch.device | None = None
+        self._graph_pool = None
 
     # ------------------------------------------------------------------
     # capture / warmup
     # ------------------------------------------------------------------
+    def arm_lazy_warmup(self, device: torch.device) -> None:
+        """Defer capture to the first real decode."""
+        self._lazy_warmup_device = device
+        logger.info("EasyMagpie Code2Wav CUDA Graph: lazy capture armed (first real decode).")
+
     def warmup(self, device: torch.device) -> None:
         if device.type != "cuda" or not self.enabled or self._warmed_up:
             return
@@ -98,8 +108,11 @@ class CUDAGraphCodecDecoder:
             self._warmed_up = True
             return
 
+        from vllm.platforms import current_platform
+
         self._device = device
         self.decode_module.eval()
+        self._graph_pool = current_platform.get_global_graph_pool()
         shapes = sorted({(bs, f) for bs in self.capture_batch_sizes for f in self.capture_frames})
 
         logger.info(
@@ -110,10 +123,13 @@ class CUDAGraphCodecDecoder:
         )
         start_s = time.perf_counter()
 
-        # Eager warmup so lazy allocations happen before capture.
+        # Eager warmup so lazy allocations happen before capture. autocast is forced
+        # OFF: the codec runs in fp32, but vLLM may have a bf16 autocast context
+        # active. If autocast leaked into the capture the graph would bake bf16
+        # codec convs and replay would diverge from the fp32 eager fallback.
         for bs, frames in shapes:
             dummy = torch.zeros(bs, frames, self.num_stacked_codebooks, dtype=torch.long, device=device)
-            with torch.no_grad():
+            with torch.no_grad(), torch.autocast(device.type, enabled=False):
                 _ = self.decode_module(dummy)
         torch.cuda.synchronize(device)
 
@@ -132,17 +148,17 @@ class CUDAGraphCodecDecoder:
         )
 
     def _capture(self, batch_size: int, frames: int, device: torch.device) -> None:
-        from vllm.platforms import current_platform
-
         key = (batch_size, frames)
         static_input = torch.zeros(batch_size, frames, self.num_stacked_codebooks, dtype=torch.long, device=device)
-        with torch.no_grad():
+        # autocast OFF so we bake fp32 codec kernels regardless of any ambient
+        # bf16 autocast context (see warmup()).
+        with torch.no_grad(), torch.autocast(device.type, enabled=False):
             _ = self.decode_module(static_input)
         torch.cuda.synchronize(device)
 
         graph = CUDAGraph()
-        with torch.no_grad():
-            with torch.cuda.graph(graph, pool=current_platform.get_global_graph_pool()):
+        with torch.no_grad(), torch.autocast(device.type, enabled=False):
+            with torch.cuda.graph(graph, pool=self._graph_pool):
                 static_output = self.decode_module(static_input)
 
         self.graphs[key] = graph
@@ -159,12 +175,18 @@ class CUDAGraphCodecDecoder:
             return self.capture_frames[idx]
         return None
 
+    def _padded_batch(self, actual_batch: int) -> int | None:
+        idx = bisect.bisect_left(self.capture_batch_sizes, actual_batch)
+        if idx < len(self.capture_batch_sizes):
+            return self.capture_batch_sizes[idx]
+        return None
+
     @torch.no_grad()
     def decode(self, codes: torch.Tensor) -> torch.Tensor:
         """Decode ``codes`` of shape ``(B, frames, Q)`` -> ``(B, frames*spf)``.
 
-        Uses a captured graph when a matching ``(batch, padded_frames)`` bucket
-        exists, otherwise falls back to eager decode.
+        Uses a captured graph when a matching ``(batch, frames)`` bucket exists,
+        otherwise falls back to eager decode.
         """
         if codes.dim() != 3:
             raise ValueError(f"EasyMagpie Code2Wav expects (B, frames, Q) codes, got {tuple(codes.shape)}")
@@ -174,29 +196,48 @@ class CUDAGraphCodecDecoder:
         if actual_frames == 0:
             return codes.new_zeros((batch_size, 0), dtype=torch.float32)
 
-        # Inner replay is illegal while an outer stream capture is active
-        # (e.g. vLLM full-cudagraph warmup on the Stage-1 runner).
+        # Lazy capture: warm up now, on the first real decode, so capture runs in
+        # the serving runtime context. Skip while an outer capture is active.
         if (
-            not self.enabled
-            or not self._warmed_up
-            or torch.cuda.is_current_stream_capturing()
+            self._lazy_warmup_device is not None
+            and not self._warmed_up
+            and self.enabled
+            and not torch.cuda.is_current_stream_capturing()
         ):
-            return self.decode_module(codes)
+            dev = self._lazy_warmup_device
+            self._lazy_warmup_device = None
+            with torch.autocast(dev.type, enabled=False):
+                self.warmup(dev)
 
-        padded = self._padded_frames(actual_frames)
-        key = (batch_size, padded) if padded is not None else None
+        # Inner replay is illegal while an outer stream capture is active (e.g.
+        # vLLM full-cudagraph warmup on the Stage-1 runner). Eager fallbacks run
+        # fp32 (autocast off) so they match the fp32-captured graph.
+        if not self.enabled or not self._warmed_up or torch.cuda.is_current_stream_capturing():
+            with torch.autocast(codes.device.type, enabled=False):
+                return self.decode_module(codes)
+
+        # Pad both batch and frames up to the nearest captured bucket; the input is
+        # zero-padded into the captured static buffer and the replayed output is
+        # sliced back to the real (batch_size, frames). This lets e.g. 3 requests
+        # reuse a captured (4, 15) graph.
+        padded_f = self._padded_frames(actual_frames)
+        padded_b = self._padded_batch(batch_size)
+        key = (padded_b, padded_f) if (padded_b is not None and padded_f is not None) else None
         if key is None or key not in self.graphs:
-            return self.decode_module(codes)
+            with torch.autocast(codes.device.type, enabled=False):
+                return self.decode_module(codes)
 
         static_input = self.static_inputs[key]
-        if actual_frames == padded:
+        if batch_size == padded_b and actual_frames == padded_f:
             static_input.copy_(codes)
         else:
+            # Zero the whole buffer so padded rows/frames are deterministic (the
+            # codec is causal, so right/extra rows never affect the real output).
             static_input.zero_()
-            static_input[:, :actual_frames, :] = codes
+            static_input[:batch_size, :actual_frames, :] = codes
         self.graphs[key].replay()
 
         out = self.static_outputs[key]
         keep = actual_frames * self.samples_per_frame
         keep = min(keep, int(out.shape[-1]))
-        return out[..., :keep].clone()
+        return out[:batch_size, :keep].clone()

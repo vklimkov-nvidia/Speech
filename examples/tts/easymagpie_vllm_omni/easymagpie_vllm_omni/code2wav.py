@@ -38,7 +38,9 @@ Analogous to ``qwen3_tts/qwen3_tts_code2wav.py`` but adapted to the NeMo codec.
 """
 from __future__ import annotations
 
+import math
 import os
+from collections import defaultdict
 from collections.abc import Iterable
 from typing import Any
 
@@ -54,6 +56,47 @@ from easymagpie_vllm_omni.config import EasyMagpieOmniArch
 from easymagpie_vllm_omni.cuda_graph_codec_wrapper import CUDAGraphCodecDecoder
 
 logger = init_logger(__name__)
+
+
+def _patch_codec_for_cudagraph(module: nn.Module) -> int:
+    """Make the NeMo codec's causal convs safe to capture in a CUDA graph.
+
+    ``CausalConv1dNorm`` derives its pad amounts from CUDA int64 buffers and
+    passes those tensors to ``F.pad``, which materializes them via ``.item()`` --
+    a device->host sync that is illegal during CUDA-graph capture. The pad amount
+    only depends on the (static) input length, so we rebind each such module's
+    ``forward`` to compute it on the host from the shape and constant conv
+    geometry. Numerically identical to the original forward; returns the number of
+    modules patched (mutates this codec instance only).
+    """
+    from nemo.collections.common.parts.utils import mask_sequence_tensor
+
+    def _make_forward(mod: nn.Module):
+        # Resolve the constant conv geometry to Python ints once, at patch time
+        # (these are CUDA int64 buffers, so int(...) syncs -- fine here, not in forward).
+        kernel_size = int(mod.kernel_size)
+        stride = int(mod.stride)
+        padding_total = int(mod.padding_total)
+
+        def forward(inputs: torch.Tensor, input_len: torch.Tensor) -> torch.Tensor:
+            length = int(inputs.shape[-1])
+            n_frames = math.ceil((length - kernel_size + padding_total) / stride)
+            ideal_length = n_frames * stride + kernel_size - padding_total
+            extra_padding = ideal_length - length
+            hidden_states = mod._pad1d(inputs, (padding_total, extra_padding), mode=mod.extra_pad_mode)
+            hidden_states = mod.conv(hidden_states)
+            hidden_states = mod.activation(hidden_states)
+            hidden_states = mask_sequence_tensor(hidden_states, input_len)
+            return hidden_states
+
+        return forward
+
+    patched = 0
+    for m in module.modules():
+        if type(m).__name__ == "CausalConv1dNorm":
+            m.forward = _make_forward(m)
+            patched += 1
+    return patched
 
 
 def _codec_ids_from_payload_or_input(
@@ -240,6 +283,12 @@ class EasyMagpieCode2Wav(nn.Module):
         audios: list[torch.Tensor] = [empty] * num_req
         srs = [sr_tensor] * num_req
 
+        # Phase 1: parse + right-pad each request up to the fixed chunk size so the
+        # codec always decodes a captured shape. Padding replicates the last real
+        # frame on the right; the codec is causal so it cannot change real frames'
+        # audio, and the extra audio is sliced off in phase 3.
+        # Each job is (request_index, codes (F, q), padded_frame_count, pad_frames).
+        jobs: list[tuple[int, torch.Tensor, int, int]] = []
         for i, req_ids in enumerate(request_ids_list):
             runtime_info = runtime_infos[i] if i < len(runtime_infos) else None
             flat = _codec_ids_from_payload_or_input(req_ids, runtime_info)
@@ -253,21 +302,15 @@ class EasyMagpieCode2Wav(nn.Module):
                     )
                 continue
             frames = n // q
-            # codebook-major flat [q*F] -> (q, F) -> (F, q) -> (1, F, q)
-            codes_fq = flat.reshape(q, frames).transpose(0, 1).contiguous().unsqueeze(0)
+            # codebook-major flat [q*F] -> (q, F) -> (F, q)
+            codes_fq = flat.reshape(q, frames).transpose(0, 1).contiguous()
 
-            # Fixed-size codec chunks: right-pad short windows (streaming ramp-up
-            # and the EOS tail are < fixed) up to the fixed frame count so the codec
-            # ALWAYS decodes the same shape -> a single CUDA-graph size. Pad on the
-            # RIGHT (replicating the last real frame) because the codec is causal:
-            # frames appended after the real ones cannot change the real frames'
-            # audio, and the extra audio they generate is sliced off below.
             pad_frames = 0
             fixed = self._fixed_chunk_frames
             if fixed and frames < fixed:
                 pad_frames = fixed - frames
-                pad = codes_fq[:, -1:, :].expand(-1, pad_frames, -1)
-                codes_fq = torch.cat([codes_fq, pad], dim=1).contiguous()
+                pad = codes_fq[-1:, :].expand(pad_frames, -1)
+                codes_fq = torch.cat([codes_fq, pad], dim=0).contiguous()
 
             if not self._logged_codec_stats:
                 self._logged_codec_stats = True
@@ -280,9 +323,33 @@ class EasyMagpieCode2Wav(nn.Module):
                     int(codes_fq.min().item()),
                     int(codes_fq.max().item()),
                 )
+            jobs.append((i, codes_fq, int(codes_fq.shape[0]), pad_frames))
 
-            wav = self._decode_codes(codes_fq)[0]  # (L,)
-            # Drop the audio generated from the right padding (keep only real frames).
+        # Phase 2: batch-decode. Group requests by (padded) frame count, stack each
+        # group into a single (B, F, q) decode chunked to the largest captured batch
+        # size; the wrapper pads the batch up to the nearest captured bucket.
+        wavs: dict[int, torch.Tensor] = {}
+        if jobs:
+            max_batch = 1
+            if self._graph is not None and self._graph.capture_batch_sizes:
+                max_batch = max(self._graph.capture_batch_sizes)
+            groups: dict[int, list[tuple[int, torch.Tensor, int, int]]] = defaultdict(list)
+            for job in jobs:
+                groups[job[2]].append(job)
+            for group in groups.values():
+                for k in range(0, len(group), max_batch):
+                    chunk = group[k : k + max_batch]
+                    batch = torch.stack([c for (_, c, _, _) in chunk], dim=0)  # (b, F, q)
+                    out = self._decode_codes(batch)  # (b, L)
+                    for row, (idx, _, _, _) in enumerate(chunk):
+                        wavs[idx] = out[row]
+
+        # Phase 3: per-request trim -- drop the audio generated from the right
+        # padding (keep only real frames), then drop the left-context overlap.
+        for i, _codes, _pf, pad_frames in jobs:
+            wav = wavs.get(i)
+            if wav is None:
+                continue
             if pad_frames > 0 and spf > 0:
                 keep = max(0, wav.shape[0] - pad_frames * spf)
                 wav = wav[:keep]
@@ -366,6 +433,11 @@ class EasyMagpieCode2Wav(nn.Module):
                 left,
                 hop,
             )
+
+        # Make the codec's causal convs capture-safe (host-int pad amounts) so the
+        # decode CUDA graph can be captured without a device sync inside F.pad.
+        n_patched = _patch_codec_for_cudagraph(self.decode_module)
+        logger.info("EasyMagpie Code2Wav: patched %d CausalConv1dNorm modules for CUDA-graph capture.", n_patched)
 
         self._maybe_enable_cudagraph(device)
         # The codec (decode_module.*) params are loaded from the bundled .nemo in
@@ -467,14 +539,20 @@ class EasyMagpieCode2Wav(nn.Module):
             return 0
 
     def _maybe_enable_cudagraph(self, device: torch.device) -> None:
-        model_cfg = getattr(self.vllm_config, "model_config", None)
-        if device.type != "cuda" or getattr(model_cfg, "enforce_eager", False):
-            logger.info("EasyMagpie Code2Wav CUDA Graph disabled (cpu or enforce_eager).")
+        if device.type != "cuda":
+            logger.info("EasyMagpie Code2Wav CUDA Graph disabled (cpu).")
             return
         if self._samples_per_frame <= 0:
             return
 
         extra_cfg = self._connector_extra()
+
+        # The codec decode graph is decoupled from vLLM's enforce_eager: the codec
+        # decode is the expensive part of Stage 1, so it can be replayed even when
+        # the (trivial) vLLM model runs eager. Disable via `codec_cudagraph: false`.
+        if not bool(extra_cfg.get("codec_cudagraph", True)):
+            logger.info("EasyMagpie Code2Wav codec CUDA Graph disabled via connector config.")
+            return
         capture_frames = self._int_list(extra_cfg.get("decode_cudagraph_capture_frames"))
         if not capture_frames:
             # With a fixed chunk every decode is exactly that many frames, so a
@@ -492,8 +570,13 @@ class EasyMagpieCode2Wav(nn.Module):
             capture_frames=capture_frames,
             capture_batch_sizes=capture_batch_sizes,
         )
+        # Capture lazily on the first real decode. Stage 1 (codec) has no KV cache,
+        # so vLLM never pins a graph pool for it; capturing during load_weights lands
+        # the graph buffers on memory that vLLM's later profile/kv-cache/warmup frees
+        # and reuses -> corrupted replay. Deferring capture runs it in the stable
+        # serving context.
         try:
-            self._graph.warmup(device)
+            self._graph.arm_lazy_warmup(device)
         except Exception:
             logger.warning("EasyMagpie Code2Wav CUDA Graph warmup failed; falling back to eager.", exc_info=True)
             self._graph = None
