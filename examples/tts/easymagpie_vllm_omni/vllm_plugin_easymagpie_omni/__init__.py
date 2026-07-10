@@ -75,32 +75,44 @@ def register() -> None:
 
     if omni_available:
         _register_pipeline()
+        _register_serving_adapter()
+
+
+def _register_serving_adapter() -> None:
+    """Install ``/v1/audio/speech`` support so the model can be served with
+    ``vllm serve`` (vLLM-Omni >= 0.24's TTS adapter framework).
+
+    Self-guards to the API-server (front-end) process and swallows failures, so
+    it is a no-op on engine-core / worker processes and on vllm-omni versions
+    without the adapter framework (e.g. 0.21rc1) — model/pipeline registration
+    above is unaffected either way.
+    """
+    import logging
+
+    try:
+        from easymagpie_vllm_omni.serving_adapter import apply_serving_patches
+
+        apply_serving_patches()
+    except Exception:  # pragma: no cover - serving support is best-effort
+        logging.getLogger(__name__).exception(
+            "EasyMagpie: /v1/audio/speech serving support could not be installed "
+            "(model + pipeline registration still succeeded)."
+        )
 
 
 def _register_pipeline() -> None:
     """Register the two-stage EasyMagpie pipeline (idempotent).
 
-    ``register_pipeline`` lives in ``vllm_omni.config.stage_config`` (the
-    ``pipeline_registry`` module only holds the in-tree ``_OMNI_PIPELINES`` lazy
-    map). It writes into ``_PIPELINE_REGISTRY`` unconditionally, so calling it
-    every time is safe.
+    ``register_pipeline`` (``vllm_omni.config.pipeline_registry``, vLLM-Omni
+    0.24) writes the pipeline into the ``OMNI_PIPELINES`` map unconditionally,
+    so calling it every time is safe.
 
-    A failure here is fatal for the two-stage pipeline: if the ``easymagpie``
-    key is never registered, ``StageConfigFactory`` cannot resolve it and
-    silently falls back to vLLM-Omni's default single-stage **diffusion** stage
-    (``create_default_diffusion``) — which then fails trying to load the talker
-    as a diffusion model. So surface the error loudly instead of swallowing it.
+    If the ``easymagpie`` key is never registered, ``StageConfigFactory`` cannot
+    resolve it and silently falls back to vLLM-Omni's default single-stage
+    **diffusion** stage (``create_default_diffusion``) — which then fails trying
+    to load the talker as a diffusion model. So let any error surface loudly.
     """
-    import logging
-
-    try:
-        from vllm_omni.config.stage_config import register_pipeline
-    except Exception:  # pragma: no cover - very old vllm_omni without the registry
-        logging.getLogger(__name__).exception(
-            "vllm_omni has no register_pipeline; the two-stage EasyMagpie pipeline "
-            "cannot be registered and the engine will fall back to a diffusion stage."
-        )
-        raise
+    from vllm_omni.config.pipeline_registry import register_pipeline
 
     from easymagpie_vllm_omni.pipeline import EASYMAGPIE_PIPELINE
 

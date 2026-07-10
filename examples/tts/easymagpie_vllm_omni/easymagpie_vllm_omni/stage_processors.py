@@ -172,17 +172,19 @@ def talker2code2wav_token_only(
     return code2wav_inputs
 
 
-def talker2code2wav_full_payload(transfer_manager, pooling_output, request, is_finished: bool = False):
+def talker2code2wav_full_payload(transfer_manager, multimodal_output, request, is_finished: bool = False):
     """Worker-connector producer for the non-async-chunk data plane.
 
-    Reads accumulated codec from ``pooling_output["codes.audio"]`` (CONCAT across
-    AR steps via ``flatten_payload``), filters control/padding frames, and ships
-    the codebook-major flat stream to Stage 1.
+    Reads accumulated codec from ``multimodal_output["codes.audio"]`` (CONCAT
+    across AR steps via ``flatten_payload``), filters control/padding frames, and
+    ships the codebook-major flat stream to Stage 1.
 
-    ``is_finished`` is accepted because the installed chunk_transfer_adapter
-    always passes it as a keyword (unused here — this producer ships the full
-    accumulated payload in one shot).
+    ``is_finished`` is accepted because the chunk_transfer_adapter always passes
+    it as a keyword (unused here — this producer ships the full accumulated
+    payload in one shot). vLLM-Omni 0.24 passes the payload as the keyword
+    ``multimodal_output``.
     """
+    pooling_output = multimodal_output
     del transfer_manager, is_finished
     rid = getattr(request, "request_id", "?")
     if not isinstance(pooling_output, dict):
@@ -304,7 +306,7 @@ def _is_warmup_frame(request: Any, transfer_manager: Any) -> bool:
 
 def talker2code2wav_async_chunk(
     transfer_manager: Any,
-    pooling_output: OmniPayload | dict[str, Any] | None,
+    multimodal_output: OmniPayload | dict[str, Any] | None,
     request: Any,
     is_finished: bool = False,
 ) -> OmniPayloadStruct | None:
@@ -318,16 +320,16 @@ def talker2code2wav_async_chunk(
     channel masked); they carry throw-away codes and are dropped here before
     accumulation so they never reach the codec.
 
-    NOTE: the installed vllm_omni chunk_transfer_adapter calls this as
-    ``func(transfer_manager=..., pooling_output=..., request=..., is_finished=...)``
-    — the second arg must be named ``pooling_output`` (it is the per-step
-    accumulated payload with nested ``codes.audio``).
+    NOTE: vLLM-Omni 0.24's chunk_transfer_adapter calls this as
+    ``func(transfer_manager=..., multimodal_output=..., request=..., is_finished=...)``
+    — the second arg must be named ``multimodal_output`` (it is the per-step
+    payload, already ``unflatten_payload``-ed, with nested ``codes.audio``).
     """
     request_id = request.external_req_id
     finished = bool(is_finished or request.is_finished())
 
-    if isinstance(pooling_output, Mapping):
-        frame = _extract_last_frame(pooling_output)
+    if isinstance(multimodal_output, Mapping):
+        frame = _extract_last_frame(multimodal_output)
         if frame is not None and not _is_warmup_frame(request, transfer_manager):
             transfer_manager.code_prompt_token_ids[request_id].append(frame.cpu().tolist())
     elif not finished:
