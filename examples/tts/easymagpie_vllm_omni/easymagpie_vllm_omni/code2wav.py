@@ -196,8 +196,11 @@ class EasyMagpieCode2Wav(nn.Module):
         self._stacking = int(self.arch.frame_stacking_factor)
         self._codebook_size = int(self.arch.codebook_size)
 
-        # Built in load_weights() (needs NeMo, only available in the Stage-1 worker).
+        # Built in load_weights(). The vendored (NeMo-free) path is preferred when
+        # the converted model dir carries codec/decoder.safetensors + codec_config.json;
+        # otherwise we fall back to loading the bundled codec .nemo (needs NeMo).
         self.decode_module: _EasyMagpieCodecDecoder | None = None
+        self._codec_is_vendored = False
         self._graph: CUDAGraphCodecDecoder | None = None
         self._samples_per_frame = 0
         self._output_sample_rate = int(getattr(self.hf_config, "codec_output_sample_rate", 22050))
@@ -466,9 +469,15 @@ class EasyMagpieCode2Wav(nn.Module):
             )
 
         # Make the codec's causal convs capture-safe (host-int pad amounts) so the
-        # decode CUDA graph can be captured without a device sync inside F.pad.
-        n_patched = _patch_codec_for_cudagraph(self.decode_module)
-        logger.info("EasyMagpie Code2Wav: patched %d CausalConv1dNorm modules for CUDA-graph capture.", n_patched)
+        # decode CUDA graph can be captured without a device sync inside F.pad. The
+        # vendored codec's CausalConv1dNorm is already capture-safe by construction
+        # (and patching it would re-introduce a NeMo import), so patch only the
+        # NeMo-loaded codec.
+        if self._codec_is_vendored:
+            logger.info("EasyMagpie Code2Wav: vendored codec convs are capture-safe; skipping monkey-patch.")
+        else:
+            n_patched = _patch_codec_for_cudagraph(self.decode_module)
+            logger.info("EasyMagpie Code2Wav: patched %d CausalConv1dNorm modules for CUDA-graph capture.", n_patched)
 
         self._maybe_enable_cudagraph(device)
         # The codec (decode_module.*) params are loaded from the bundled .nemo in
@@ -479,6 +488,96 @@ class EasyMagpieCode2Wav(nn.Module):
         return {name for name, _ in self.named_parameters()}
 
     def _build_codec(self, device: torch.device):
+        """Build the codec decode stack (vendored NeMo-free path preferred).
+
+        If the converted model dir carries the standalone artifacts
+        (``codec/decoder.safetensors`` + ``codec/codec_config.json``, produced by
+        ``scripts/easy_magpietts_convert_to_vllm.py``), build the pure-torch
+        decoder + FSQ stack with **no NeMo import**. Otherwise fall back to
+        restoring the bundled ``codec.nemo`` via NeMo's ``AudioCodecModel``.
+        """
+        cfg_path = self._resolve_optional_artifact(
+            getattr(self.hf_config, "codec_config", None), default_name="codec/codec_config.json"
+        )
+        weights_path = self._resolve_optional_artifact(
+            getattr(self.hf_config, "codec_decoder_weights", None), default_name="codec/decoder.safetensors"
+        )
+        if cfg_path is not None and weights_path is not None:
+            return self._build_codec_vendored(cfg_path, weights_path, device)
+        logger.info("EasyMagpie Code2Wav: no vendored codec artifacts found; falling back to NeMo codec .nemo.")
+        return self._build_codec_nemo(device)
+
+    def _build_codec_vendored(self, cfg_path: str, weights_path: str, device: torch.device):
+        """Build the standalone pure-torch codec (no ``nemo`` import)."""
+        import json
+
+        from safetensors.torch import load_file
+
+        from easymagpie_vllm_omni.codec_modules import (
+            GroupFiniteScalarQuantizer,
+            ResNetDecoder,
+            VectorQuantizerIndexConverter,
+            VendoredAudioCodec,
+        )
+
+        with open(cfg_path) as f:
+            codec_cfg = json.load(f)
+
+        dec_cfg = dict(codec_cfg["audio_decoder"])
+        dec_cfg.pop("_target_", None)
+        decoder = ResNetDecoder(**dec_cfg)
+        state = load_file(weights_path)
+        missing, unexpected = decoder.load_state_dict(state, strict=False)
+        if missing:
+            # Missing keys => convs left at random init (silent garbage audio). This
+            # usually means the exported weights still carry weight-norm
+            # parametrizations; re-run the converter (which folds them).
+            raise RuntimeError(
+                f"Vendored codec decoder is missing {len(missing)} weights (e.g. {list(missing)[:3]}); "
+                f"unexpected={list(unexpected)[:3]}. The decoder.safetensors export is incompatible - "
+                "re-run scripts/easy_magpietts_convert_to_vllm.py to regenerate it."
+            )
+        if unexpected:
+            logger.warning("Vendored codec decoder ignored %d unexpected keys.", len(unexpected))
+        decoder = decoder.to(device).eval().float()
+
+        def _make_group_fsq(cfg: dict) -> GroupFiniteScalarQuantizer:
+            cfg = dict(cfg)
+            cfg.pop("_target_", None)
+            num_groups = int(cfg.pop("num_groups"))
+            num_levels_per_group = list(cfg.pop("num_levels_per_group"))
+            return GroupFiniteScalarQuantizer(
+                num_groups=num_groups, num_levels_per_group=num_levels_per_group, **cfg
+            ).to(device).eval()
+
+        vq_native = _make_group_fsq(codec_cfg["vector_quantizer_native"])
+        sample_rate = int(codec_cfg.get("output_sample_rate", 22050))
+        codec = VendoredAudioCodec(vq_native, decoder, sample_rate).to(device).eval()
+
+        converter = None
+        model_vq_cfg = codec_cfg.get("vector_quantizer_model")
+        if model_vq_cfg is not None:
+            vq_new = _make_group_fsq(model_vq_cfg)
+            if int(vq_new.num_codebooks) != int(vq_native.num_codebooks):
+                converter = (
+                    VectorQuantizerIndexConverter(
+                        vector_quantizer_original=vq_native, vector_quantizer_new=vq_new
+                    )
+                    .to(device)
+                    .eval()
+                )
+
+        self._codec_is_vendored = True
+        clamp_max = self._codebook_size - 1
+        logger.info(
+            "EasyMagpie Code2Wav: built NeMo-free vendored codec (native_codebooks=%d convert=%s sr=%d).",
+            int(vq_native.num_codebooks),
+            converter is not None,
+            sample_rate,
+        )
+        return codec, converter, self._stacking, clamp_max, sample_rate
+
+    def _build_codec_nemo(self, device: torch.device):
         """Restore the bundled NeMo codec + FSQ index converter."""
         from nemo.collections.tts.models import AudioCodecModel
 
