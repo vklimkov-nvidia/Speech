@@ -11,27 +11,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Stage input processors for the EasyMagpieTTS pipeline: Talker -> Code2Wav.
+"""Transfer stacked acoustic codes from the talker to Code2Wav.
 
-The talker (Stage 0) emits per-frame stacked acoustic codes under
-``multimodal_outputs["codes"]["audio"]`` (shape ``[num_frames, Q]``, where
-``Q = num_audio_codebooks * frame_stacking_factor``). These functions turn that
-tensor into the codebook-major flat stream (``[Q * num_frames]``) the Stage-1
-``EasyMagpieCode2Wav`` consumes:
-
-* :func:`talker2code2wav` / :func:`talker2code2wav_token_only` — orchestrator
-  side (sync / non-async-chunk). ``token_only`` ships a length-only placeholder;
-  the real codec payload arrives via the worker connector.
-* :func:`talker2code2wav_full_payload` — worker-connector producer for the
-  non-async-chunk path. Reads the accumulated ``codes.audio`` (CONCAT across AR
-  steps via ``flatten_payload``) and ships the flat codec stream.
-* :func:`talker2code2wav_async_chunk` — chunked/streaming producer: emits a
-  bounded left-context window each ``codec_chunk_frames`` frames.
-
-Mirrors ``vllm_omni/model_executor/stage_input_processors/qwen3_tts.py`` but
-without the reference-audio (voice-clone-via-codes) machinery — EasyMagpie
-conditions on speaker *embeddings* at the talker, so Code2Wav needs only the
-generated acoustic codes.
+Stage 0 emits ``[frames, codebooks]`` codes. Stage 1 consumes the corresponding
+codebook-major flat stream.
 """
 from __future__ import annotations
 
@@ -40,28 +23,17 @@ from typing import Any
 
 import torch
 from vllm.logger import init_logger
-
-from vllm_omni.data_entry_keys import (
-    CodesStruct,
-    MetaStruct,
-    OmniPayload,
-    OmniPayloadStruct,
-)
+from vllm_omni.data_entry_keys import CodesStruct, MetaStruct, OmniPayload, OmniPayloadStruct
 
 logger = init_logger(__name__)
 
-# Base codebook size (excluding the trailing special-token block). Frames whose
-# codes reach into / above the special block (audio bos/eos/mask) or that are
-# all-zero padding are dropped before decode. Matches the reference
-# EasyMagpieTTS SmallMamba profile (``EasyMagpieOmniArch.codebook_size``).
+# Base codebook size, excluding control tokens.
 _CODEBOOK_SIZE = 1024
-# Q = num_audio_codebooks (8) * frame_stacking_factor (2) for the reference profile.
 _NUM_QUANTIZERS_DEFAULT = 16
 
 
 def _empty_finished_payload() -> dict[str, Any]:
-    """Empty-but-finished payload so the Stage-1 wait gate releases instead of
-    hanging when the talker produced no usable codec frames."""
+    """Release Stage 1 when no usable codec frames were produced."""
     return {
         "codes": {"audio": torch.zeros(0, dtype=torch.long)},
         "meta": {"finished": torch.tensor(True, dtype=torch.bool)},
@@ -78,9 +50,7 @@ def _filter_audio_codes(audio_codes: torch.Tensor) -> torch.Tensor:
     if not isinstance(audio_codes, torch.Tensor) or audio_codes.numel() == 0 or audio_codes.ndim != 2:
         return audio_codes
     valid_mask = (
-        (audio_codes >= 0).all(dim=1)
-        & audio_codes.any(dim=1)
-        & (audio_codes.max(dim=1).values < _CODEBOOK_SIZE)
+        (audio_codes >= 0).all(dim=1) & audio_codes.any(dim=1) & (audio_codes.max(dim=1).values < _CODEBOOK_SIZE)
     )
     return audio_codes[valid_mask]
 
@@ -173,16 +143,9 @@ def talker2code2wav_token_only(
 
 
 def talker2code2wav_full_payload(transfer_manager, multimodal_output, request, is_finished: bool = False):
-    """Worker-connector producer for the non-async-chunk data plane.
+    """Send accumulated codec frames through the worker connector.
 
-    Reads accumulated codec from ``multimodal_output["codes.audio"]`` (CONCAT
-    across AR steps via ``flatten_payload``), filters control/padding frames, and
-    ships the codebook-major flat stream to Stage 1.
-
-    ``is_finished`` is accepted because the chunk_transfer_adapter always passes
-    it as a keyword (unused here — this producer ships the full accumulated
-    payload in one shot). vLLM-Omni 0.24 passes the payload as the keyword
-    ``multimodal_output``.
+    ``is_finished`` is part of the transfer-adapter callback contract.
     """
     pooling_output = multimodal_output
     del transfer_manager, is_finished
@@ -251,23 +214,12 @@ def _extract_last_frame(multimodal_output: OmniPayload | dict[str, Any]) -> torc
 
 
 def _resolve_speech_delay(transfer_manager: Any) -> int:
-    """Number of leading warm-up frames the EasyMagpie talker emits before real audio.
-
-    The talker offsets its audio channel by ``streaming_speech_delay`` decode steps
-    (the channel is masked until then); those leading frames carry throw-away codes
-    and must be dropped by the caller — this is the same warm-up the Triton backend
-    skips via ``head = prompt_len + speech_delay``. Resolved once from the Stage-0
-    model's ``hf_config`` (the converter bakes ``streaming_speech_delay`` into
-    ``config.json``) and cached on the transfer manager.
-    """
+    """Return and cache the number of non-audio frames before speech starts."""
     cached = getattr(transfer_manager, "_easymagpie_speech_delay", None)
     if cached is not None:
         return cached
 
-    # The chunk transfer adapter stores the Stage-0 model_config as ``.config``
-    # (OmniTransferAdapterBase.__init__); the model-runner mixin instead exposes
-    # ``_get_model_config()``. Try both so this works regardless of which object
-    # the connector passes as ``transfer_manager``.
+    # Transfer managers expose model configuration through either interface.
     model_config = getattr(transfer_manager, "config", None)
     if getattr(model_config, "hf_config", None) is None:
         getter = getattr(transfer_manager, "_get_model_config", None)
@@ -288,15 +240,7 @@ def _resolve_speech_delay(transfer_manager: Any) -> int:
 
 
 def _is_warmup_frame(request: Any, transfer_manager: Any) -> bool:
-    """Whether the newest talker frame is still within the leading
-    ``streaming_speech_delay`` warm-up window.
-
-    Stateless: uses the request's own generated-token count as the decode-step
-    index (each decode step emits exactly one backbone token and one audio frame),
-    so there is nothing to store or clean up per request. The frame at decode step
-    ``k`` (0-indexed) is warm-up iff ``k < speech_delay``; ``output_token_ids``
-    already includes the current step's token, hence ``len <= speech_delay``.
-    """
+    """Check whether the newest frame precedes the configured speech start."""
     speech_delay = _resolve_speech_delay(transfer_manager)
     if speech_delay <= 0:
         return False
@@ -310,20 +254,10 @@ def talker2code2wav_async_chunk(
     request: Any,
     is_finished: bool = False,
 ) -> OmniPayloadStruct | None:
-    """Chunked/streaming producer: emit a bounded left-context codec window.
+    """Emit a codec window with bounded left context.
 
-    Accumulates per-step frames, and every ``codec_chunk_frames`` frames emits a
-    window of ``codec_left_context_frames + chunk`` frames with
-    ``meta.left_context_size`` set so Stage 1 trims the overlap after decode.
-
-    The leading ``streaming_speech_delay`` frames are the talker's warm-up (audio
-    channel masked); they carry throw-away codes and are dropped here before
-    accumulation so they never reach the codec.
-
-    NOTE: vLLM-Omni 0.24's chunk_transfer_adapter calls this as
-    ``func(transfer_manager=..., multimodal_output=..., request=..., is_finished=...)``
-    — the second arg must be named ``multimodal_output`` (it is the per-step
-    payload, already ``unflatten_payload``-ed, with nested ``codes.audio``).
+    ``multimodal_output`` must retain this name because the transfer adapter
+    passes it by keyword.
     """
     request_id = request.external_req_id
     finished = bool(is_finished or request.is_finished())

@@ -11,29 +11,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Stage-1 Code2Wav model for the EasyMagpieTTS vLLM-Omni pipeline.
+"""Decode EasyMagpieTTS acoustic codes to audio in pipeline stage 1.
 
-This is the second stage of the two-stage EasyMagpie pipeline (see
-:mod:`easymagpie_vllm_omni.pipeline`): it turns the acoustic codes predicted by
-the Stage-0 talker (:class:`easymagpie_vllm_omni.easymagpie.EasyMagpieTTSForConditionalGeneration`)
-into a waveform, entirely in-engine — no external Triton / TRT codec service.
-
-The codec math mirrors ``scripts/export_codec_decoder_onnx.py``'s
-``CodecDecoderWrapper``:
-
-    stacked model codes (B, T, C*S)
-        -> clamp special tokens to [0, codebook_size-1]
-        -> unstack (B, C*S, T) -> (B, C, T*S)
-        -> FSQ index convert (model regrouped space -> codec native space)
-        -> AudioCodecModel.decode -> waveform
-
-The converter captures the original NeMo codec and index converter in a
-``torch.export.ExportedProgram``. This stage loads that artifact with PyTorch
-only, then optionally captures its fixed-frame graph with a CUDA graph for
-streaming latency
-(:class:`easymagpie_vllm_omni.cuda_graph_codec_wrapper.CUDAGraphCodecDecoder`).
-
-Analogous to ``qwen3_tts/qwen3_tts_code2wav.py`` but adapted to the NeMo codec.
+The codec clamps control tokens, unstacks frames, converts FSQ indices, and
+decodes a waveform. Fixed frame shapes can use a CUDA graph.
 """
 from __future__ import annotations
 
@@ -118,11 +99,7 @@ def _codec_ids_from_payload_or_input(
 
 
 class _EasyMagpieCodecDecoder(nn.Module):
-    """Static decode graph: stacked model codes ``(B, T, Q)`` -> waveform ``(B, L)``.
-
-    Reproduces ``scripts/export_codec_decoder_onnx.py``'s ``CodecDecoderWrapper``
-    so the in-engine decode matches the exported/served reference bit-for-bit.
-    """
+    """Decode stacked model codes ``[B, T, Q]`` to waveform ``[B, L]``."""
 
     def __init__(
         self,
@@ -401,12 +378,7 @@ class EasyMagpieCode2Wav(nn.Module):
         return self.decode_module(codes_bfq)
 
     def _log_decode_batch(self, batch_size: int, frames: int) -> None:
-        """Accumulate a batch-size histogram and emit it periodically.
-
-        A distribution dominated by batch=1 means concurrent streams are NOT being
-        coalesced at Stage 1 (the codec is running serialized), which is the main
-        high-concurrency bottleneck vs. a dynamic-batched (Triton) codec.
-        """
+        """Accumulate a batch-size histogram and emit it periodically."""
         if self._decode_log_every <= 0:
             return
         self._decode_batch_hist[batch_size] += 1
@@ -697,11 +669,7 @@ class EasyMagpieCode2Wav(nn.Module):
             capture_frames=capture_frames,
             capture_batch_sizes=capture_batch_sizes,
         )
-        # Capture lazily on the first real decode. Stage 1 (codec) has no KV cache,
-        # so vLLM never pins a graph pool for it; capturing during load_weights lands
-        # the graph buffers on memory that vLLM's later profile/kv-cache/warmup frees
-        # and reuses -> corrupted replay. Deferring capture runs it in the stable
-        # serving context.
+        # Capture after engine initialization so graph buffers retain stable storage.
         try:
             self._graph.arm_lazy_warmup(device)
         except Exception:

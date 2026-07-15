@@ -11,24 +11,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""EasyMagpieTTS pipeline: Talker (text -> stacked acoustic codes) -> Code2Wav
-(codes -> audio), fully in-engine (no external codec service).
+"""Two-stage EasyMagpieTTS pipeline from text to acoustic codes to audio.
 
-Structured exactly like the Qwen3-TTS reference pipeline
-(``vllm_omni/model_executor/models/qwen3_tts/pipeline.py``): a Stage-0
-autoregressive talker followed by a Stage-1 generative Code2Wav. Chunked vs
-end-to-end mode is dispatched from ``deploy.async_chunk``.
-
-The talker's HF config reports ``model_type="nemotron_h"`` (a generic backbone
-type), so this pipeline is routed by ``hf_architectures`` — the
-``StageConfigFactory`` matches ``config.architectures`` against it. A deploy YAML
-may also force routing with ``pipeline: easymagpie``.
+The talker reports the generic ``model_type="nemotron_h"``, so routing uses its
+HF architecture or an explicit ``pipeline: easymagpie`` deployment setting.
 """
-from vllm_omni.config.stage_config import (
-    PipelineConfig,
-    StageExecutionType,
-    StagePipelineConfig,
-)
+from vllm_omni.config.stage_config import PipelineConfig, StageExecutionType, StagePipelineConfig
 
 _PROC = "easymagpie_vllm_omni.stage_processors"
 
@@ -54,12 +42,6 @@ EASYMAGPIE_PIPELINE = PipelineConfig(
             engine_output_type="latent",
             async_chunk_process_next_stage_input_func=f"{_PROC}.talker2code2wav_async_chunk",
             custom_process_next_stage_input_func=f"{_PROC}.talker2code2wav_full_payload",
-            # NOTE: The installed vllm_omni (0.21.0rc1) StagePipelineConfig has no
-            # ``scheduler_cls`` field — the AR scheduler is resolved from
-            # ``execution_type`` + ``async_scheduling`` (LLM_AR -> OmniARAsyncScheduler).
-            # The custom EasyMagpieARAsyncScheduler is only needed for the
-            # streaming-text (multi-chunk StreamingInput) path, which the two-stage
-            # synthesis flow does not use, so it is intentionally not wired here.
             sampling_constraints={
                 "detokenize": False,
                 "stop_token_ids": [_AUDIO_EOS_STOP_TOKEN_ID],
@@ -74,10 +56,7 @@ EASYMAGPIE_PIPELINE = PipelineConfig(
             final_output_type="audio",
             engine_output_type="audio",
             model_arch="EasyMagpieCode2Wav",
-            # Sync (non-async-chunk) mode: a length-only placeholder input; the
-            # bulk codec payload ships via the worker connector from Stage 0's
-            # ``talker2code2wav_full_payload`` producer. Under async_chunk mode
-            # chunks are delivered directly to the consumer.
+            # Sync mode uses a length-only prompt; the connector carries codec data.
             sync_process_input_func=f"{_PROC}.talker2code2wav_token_only",
             sampling_constraints={"detokenize": True},
         ),

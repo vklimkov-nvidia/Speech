@@ -1,14 +1,5 @@
 #!/bin/bash
-# Launch EasyMagpieTTS two-stage pipeline (talker -> code2wav) via `vllm serve`.
-# Serves OpenAI-compatible POST /v1/audio/speech with in-engine codec decode.
-#
 # Requires vLLM / vLLM-Omni 0.24+.
-#
-# Usage:
-#   ./run_server.sh <model_dir> [port]
-#
-# Example:
-#   ./run_server.sh ../converted_model_multiturn 8091
 set -e
 
 MODEL="${1:?Usage: run_server.sh <model_dir> [port]}"

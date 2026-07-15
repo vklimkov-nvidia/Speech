@@ -11,23 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Validity tests for the vLLM-Omni EasyMagpieTTS local transformer.
-
-The headline test is a **numerical parity check against the reference NeMo
-implementation** (``transformer_2501.Transformer`` + the projection / embedding
-heads, exactly as wired in ``EasyMagpieTTSInferenceModel``): random NeMo weights
-are copied 1:1 into the vLLM ``EasyMagpieCodePredictor`` and both stacks are run
-teacher-forced on identical inputs; the per-codebook logits must match to fp32
-tolerance with identical argmax. This is the pytest port of
-``debug_local_transformer.py`` and guards against the re-implementation silently
-drifting from the training-time math.
-
-The remaining tests assert the autoregressive sampler's contract (output shape /
-dtype / value range, forbidden-token masking, and seeded determinism).
-
-Everything runs as plain PyTorch on CPU via the tiny stand-in config from
-``conftest.py`` — no model directory, no vLLM engine, no GPU.
-"""
+"""Tests for local-transformer parity and sampling contracts."""
 from __future__ import annotations
 
 import pytest
@@ -41,9 +25,7 @@ from easymagpie_vllm_omni.config import EasyMagpieOmniArch  # noqa: E402
 from easymagpie_vllm_omni.local_transformer import EasyMagpieCodePredictor  # noqa: E402
 from torch import nn  # noqa: E402
 
-# Two arch profiles: one where all widths are equal (in/out projections are
-# Identity, matching the real checkpoint) and one where they differ (projections
-# are real Linears) — so the weight-copy + parity covers both code paths.
+# Cover identity and linear projection paths.
 ARCH_PROFILES = {
     "equal_dims": dict(
         hidden_dim=64,
@@ -63,12 +45,7 @@ ARCH_PROFILES = {
 
 
 class NeMoLocalTransformerStack(nn.Module):
-    """Reference NeMo local-transformer submodules, named to match the vLLM code predictor.
-
-    Mirrors the wiring in ``EasyMagpieTTSInferenceModel.__init__`` (the
-    ``local_transformer*`` / ``audio_*`` heads). Attribute names match
-    :class:`EasyMagpieCodePredictor` so a state-dict copy is 1:1.
-    """
+    """NeMo local-transformer modules with matching state-dict names."""
 
     def __init__(self, arch: EasyMagpieOmniArch) -> None:
         super().__init__()
@@ -104,12 +81,7 @@ class NeMoLocalTransformerStack(nn.Module):
 
     @torch.no_grad()
     def teacher_forced_logits(self, dec_hidden: torch.Tensor, codes: torch.Tensor) -> torch.Tensor:
-        """Per-codebook logits given a hidden state and teacher-forced previous codes.
-
-        Replicates ``LocalTransformerHelper.compute_logits`` (AR layout): the input
-        sequence is ``[dec_hidden, emb(code_0), ..., emb(code_{N-1})]``; row ``k`` of
-        the causal output predicts codebook ``k``, and the trailing row is dropped.
-        """
+        """Return logits for teacher-forced previous codes."""
         seq = [dec_hidden]
         for k in range(self.n_codebooks):
             seq.append(self.audio_in_projection(self.audio_embeddings[k](codes[:, k])))
@@ -126,12 +98,7 @@ class NeMoLocalTransformerStack(nn.Module):
 def _vllm_teacher_forced_logits(
     cp: EasyMagpieCodePredictor, dec_hidden: torch.Tensor, codes: torch.Tensor
 ) -> torch.Tensor:
-    """Per-codebook logits from the vLLM code predictor, teacher-forced.
-
-    Mirrors :meth:`EasyMagpieCodePredictor.generate_codes` buffer layout (``N``
-    rows; row 0 = ``in_proj(dec_hidden)``, row ``k+1`` = projected embedding of
-    ``codes[:, k]``), but reads the logits for every row instead of sampling.
-    """
+    """Return teacher-forced logits from the vLLM code predictor."""
     num_tokens = dec_hidden.shape[0]
     n = cp.num_codebooks
     lt_hidden = cp.lt_hidden
@@ -155,9 +122,7 @@ def _copy_nemo_into_vllm(nemo: NeMoLocalTransformerStack, cp: EasyMagpieCodePred
     for name, param in cp.named_parameters():
         if name in nemo_sd:
             src = nemo_sd[name]
-            # The FFN ships as kernel-1 Conv1d (``[out, in, 1]``) in NeMo but is a
-            # plain ``nn.Linear`` (``[out, in]``) here; squeeze the conv dim to
-            # match (mirrors ``EasyMagpieTTS.load_weights``).
+            # NeMo stores kernel-1 weights with a trailing singleton dimension.
             if src.ndim == param.ndim + 1 and src.shape[-1] == 1:
                 src = src.squeeze(-1)
             assert param.shape == src.shape, f"shape mismatch {name}"
@@ -187,7 +152,7 @@ def _build_pair(profile_kwargs: dict, seed: int = 0):
 @pytest.mark.unit
 @pytest.mark.parametrize("profile", list(ARCH_PROFILES), ids=list(ARCH_PROFILES))
 def test_local_transformer_matches_nemo(profile):
-    """vLLM re-implementation must equal the NeMo reference in fp32 (teacher-forced)."""
+    """vLLM and NeMo paths must produce equal teacher-forced logits."""
     cp, nemo, arch = _build_pair(ARCH_PROFILES[profile])
 
     torch.manual_seed(1234)

@@ -11,30 +11,16 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Architecture constants for the EasyMagpieTTS vLLM-Omni model.
-
-These mirror the values baked into the reference EasyMagpieTTS SmallMamba
-checkpoint (Nemotron-H hybrid Mamba2 + attention + MoE backbone, 8 codebooks,
-frame-stacking ×2, 3-layer autoregressive local transformer).
-
-The vLLM-Omni model reads the bulk of its configuration from the
-``hf_config`` provided by vLLM at construction time; this dataclass captures
-the TTS-specific scalars that are *not* part of a standard HF text-LM config
-and provides a single, well-documented default profile.
-"""
+"""EasyMagpieTTS architecture configuration for vLLM-Omni."""
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Any
 
-# Number of trailing special tokens appended to every audio codebook.
-# Matches ``len(SpecialAudioToken)`` in
-# ``nemo.collections.tts.modules.magpietts_modules`` (BOS, EOS, CONTEXT_BOS,
-# CONTEXT_EOS, MASK, RESERVED_1..3).
+# Each audio codebook appends BOS, EOS, context, mask, and reserved tokens.
 NUM_SPECIAL_AUDIO_TOKENS: int = 8
 
-# Offsets of the special audio tokens *within* the trailing special-token block
-# (i.e. ``codebook_size + <offset>`` is the real embedding-table id).
+# Offsets within the trailing special-token block.
 SPECIAL_AUDIO_BOS: int = 0
 SPECIAL_AUDIO_EOS: int = 1
 SPECIAL_AUDIO_CONTEXT_BOS: int = 2
@@ -44,22 +30,7 @@ SPECIAL_AUDIO_MASK: int = 4
 
 @dataclass
 class EasyMagpieOmniArch:
-    """Static architecture description for an EasyMagpieTTS checkpoint.
-
-    Attributes:
-        hidden_dim: Backbone hidden size (``cfg.hidden_dim``).
-        embedding_dim: Embedding size feeding the backbone (``cfg.embedding_dim``).
-        audio_embedding_dim: Per-codebook audio embedding size
-            (``cfg.audio_embedding_dim``); may differ from ``embedding_dim``.
-        num_audio_codebooks: Number of codec codebooks (``C``).
-        codebook_size: Base codec codebook size (excluding special tokens).
-        frame_stacking_factor: Frame stacking factor (``S``). The model treats
-            the audio stream as ``C * S`` independent "stacked" codebooks.
-        phoneme_stacking_factor: Phoneme stacking factor.
-        phoneme_vocab_size: Phoneme tokenizer vocabulary size.
-        local_transformer_n_layers / _n_heads / _hidden_dim: local-transformer
-            (intra-frame codebook predictor) sizing.
-    """
+    """Static architecture description for an EasyMagpieTTS checkpoint."""
 
     hidden_dim: int = 1536
     embedding_dim: int = 1536
@@ -72,7 +43,6 @@ class EasyMagpieOmniArch:
     phoneme_stacking_factor: int = 1
     phoneme_vocab_size: int = 2051
 
-    # ── Streaming delays (per the checkpoint's default inference mode) ──
     # The text/phoneme/audio streams are temporally offset: at decode step ``k``
     # the text channel consumes ``text_tokens[k]``, the phoneme channel starts at
     # ``k == streaming_phonemes_delay`` (seeded with phoneme BOS), and the audio
@@ -89,25 +59,20 @@ class EasyMagpieOmniArch:
     phoneme_unk_id: int | None = None
     phoneme_confidence_unk_threshold: float = 0.0
 
-    # Number of multi-mode task ("service token") embeddings. The reference model
-    # prepends a single learned per-mode embedding to the prefill context when
-    # trained with >1 mode (``cfg.training_modes``); 0 disables it (single-mode
-    # checkpoints have no ``task_embedding`` table).
+    # Number of task embeddings; zero disables task conditioning.
     num_task_embeddings: int = 0
 
     local_transformer_n_layers: int = 3
     local_transformer_n_heads: int = 12
     local_transformer_hidden_dim: int = 1536
 
-    # Optional per-checkpoint overrides for backward compatibility (legacy
-    # checkpoints sometimes forced special-token ids).
+    # Optional checkpoint-specific special-token ids.
     forced_audio_bos_id: int | None = None
     forced_audio_eos_id: int | None = None
     forced_mask_token_id: int | None = None
 
     extra: dict[str, Any] = field(default_factory=dict)
 
-    # ── Derived quantities ───────────────────────────────────────────
     @property
     def num_stacked_codebooks(self) -> int:
         """Number of independent codebooks the model autoregresses over (``C * S``)."""
@@ -158,10 +123,8 @@ class EasyMagpieOmniArch:
     def from_hf_config(cls, hf_config: Any) -> "EasyMagpieOmniArch":
         """Build an arch description from a vLLM ``hf_config``.
 
-        Any attribute present on ``hf_config`` overrides the default profile;
-        unknown attributes are ignored. This lets a converted checkpoint carry
-        its own ``easymagpie`` block in ``config.json`` while still working
-        out-of-the-box on the reference SmallMamba profile.
+        Attributes present on ``hf_config`` override the defaults; unknown
+        attributes are ignored.
         """
         defaults = cls()
         kwargs: dict[str, Any] = {}
@@ -199,5 +162,4 @@ class EasyMagpieOmniArch:
         return cls(**merged)
 
 
-# Reference profile: Nemotron-H SmallMamba EasyMagpieTTS checkpoint.
 EASYMAGPIE_SMALLMAMBA = EasyMagpieOmniArch()

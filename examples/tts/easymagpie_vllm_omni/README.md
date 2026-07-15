@@ -15,10 +15,6 @@ Model definition and pipeline registration live in
 [`vllm_plugin_easymagpie_omni/`](vllm_plugin_easymagpie_omni/).
 Deployment knobs are in [`deploy/easymagpie.yaml`](deploy/easymagpie.yaml).
 
-A sample converted checkpoint is included at
-[`converted_model_multiturn/`](converted_model_multiturn/) (talker weights +
-bundled codec).
-
 ### Setup
 
 Requires **vLLM / vLLM-Omni 0.24+**, a GPU, and this package installed into that env:
@@ -30,19 +26,18 @@ pip install -e examples/tts/easymagpie_vllm_omni
 ### Quick start — offline synthesis
 
 Open [`scripts/offline_demo.ipynb`](scripts/offline_demo.ipynb).
-It loads `converted_model_multiturn/`, runs both stages in one `AsyncOmni`
-engine, writes `out.wav`, and plays it in the notebook.
+Set `MODEL_PATH` to a converted checkpoint. The notebook runs both stages in
+one `AsyncOmni` engine, writes `out.wav`, and plays it.
 
 ### Serve over HTTP
 
 ```bash
 cd examples/tts/easymagpie_vllm_omni/scripts
-./run_server.sh ../converted_model_multiturn 8091
+./run_server.sh /path/to/converted-model 8091
 ```
 
 This starts `vllm serve` with the EasyMagpie plugin on port 8091.
-Query it from [`scripts/server_request.ipynb`](scripts/server_request.ipynb)
-or any OpenAI-compatible client:
+Query it from any OpenAI-compatible client:
 
 ```bash
 curl -X POST http://localhost:8091/v1/audio/speech \
@@ -75,12 +70,9 @@ and the HTTP benchmark client. No GPU or model directory required for most tests
 easymagpie_vllm_omni/          # model + pipeline + codec stage
 vllm_plugin_easymagpie_omni/   # vLLM plugin entry point
 deploy/easymagpie.yaml         # two-stage deploy config
-converted_model_multiturn/     # sample converted checkpoint
 scripts/
   offline_demo.ipynb           # offline synthesis demo
   run_server.sh                # HTTP server
-  server_request.ipynb         # single streaming request demo
   benchmark_server.py          # throughput / latency benchmark
 tests/                         # unit tests
-todel/                         # archived conversion, Triton, and dev artifacts
 ```

@@ -1,32 +1,10 @@
-# EasyMagpieTTS two-stage deploy: talker (text -> stacked acoustic codes) ->
-# code2wav (codes -> audio), fully in-engine (no external codec service).
-#
-# Mirrors vllm_omni/deploy/qwen3_tts.yaml. Pass this file to `vllm serve`
-# (see scripts/run_server.sh) or to AsyncOmni(model=..., deploy_config=<this>)
-# (see scripts/offline_demo.ipynb). The `pipeline: easymagpie` key forces
-# routing to EASYMAGPIE_PIPELINE (the talker's HF config reports the generic
-# model_type "nemotron_h", so it cannot be auto-detected by model_type alone).
-#
-# Stage 0 (talker) runs the Nemotron-H hybrid-Mamba backbone + local
-# transformer; Stage 1 (code2wav) decodes the bundled NeMo codec under
-# <model_dir>/codec/ (shipped with the converted checkpoint).
+# Stage 0 produces stacked acoustic codes; stage 1 decodes them to audio.
+# Explicit routing is required because the talker reports model_type "nemotron_h".
 pipeline: easymagpie
 
-# MUST be true for this pipeline. In the installed vllm_omni (0.21.0rc1) the
-# non-async ("full_payload") data plane that ships the talker's codes to Stage 1
-# is hard-coded to Qwen3-Omni only (see
-# omni_connector_model_runner_mixin._should_accumulate_full_payload_output, which
-# returns False for any model_arch != "Qwen3OmniMoeForConditionalGeneration").
-# With async_chunk=false our Stage 1 therefore never receives real codes and
-# decodes the zero placeholder (symptom: "codec ... range=[0,0]"). The async_chunk
-# path (talker2code2wav_async_chunk -> chunk_transfer_adapter) is model-agnostic
-# and is what actually delivers the codes. codec_chunk_frames below sets the
-# fixed 15-frame streaming window. The engine's output_processor accumulates the
-# per-chunk audio into mm["audio"] and concatenates it on the finished output,
-# which offline_demo.ipynb reads.
+# Required for streaming code transfer between the two stages.
 async_chunk: true
 
-# Pipeline-wide engine settings applied to every stage.
 trust_remote_code: true
 dtype: float16
 
@@ -38,57 +16,30 @@ connectors:
       connector_get_sleep_s: 0.01
       connector_get_max_wait_first_chunk: 3000
       connector_get_max_wait: 300
-      # Streaming (async_chunk: true) codec windowing. codec_left_context_frames
-      # overlaps prior frames into each window; code2wav trims the overlap after
-      # decode (meta.left_context_size). Set left context > 0 only if the codec
-      # shows chunk-boundary artifacts.
-      # Sliding codec window: hop of 3 NEW frames + 12 overlap frames reused from
-      # the previous inference as left context. code2wav trims the first 12 frames'
-      # audio (meta.left_context_size) so only the 3 new frames are kept — the
-      # overlap smooths chunk-boundary artifacts. The producer's window ramps up
-      # (1,4,7,10,13,15,...) since there is no history to reuse at the start, but
-      # code2wav then right-pads every short window to codec_fixed_chunk_frames so
-      # the codec ALWAYS decodes exactly 15 frames (one CUDA-graph size).
-      codec_chunk_frames: 3                # hop: new frames emitted per inference
-      codec_left_context_frames: 12        # reused overlap -> window = 12 + 3 = 15
-      initial_codec_chunk_frames: 1        # first emission after 1 frame (low TTFA)
-      # Fixed codec chunk: Stage 1 right-pads every window (the ramp-up and the EOS
-      # tail are < 15) up to this many frames so the codec always runs one shape.
-      # Padding is on the right (causal codec) and its audio is sliced off after
-      # decode. Defaults to codec_left_context_frames + codec_chunk_frames.
+      # Windows contain 3 new frames plus 12 frames of left context. Stage 1
+      # trims the context and right-padding after decoding.
+      codec_chunk_frames: 3
+      codec_left_context_frames: 12
+      initial_codec_chunk_frames: 1
       codec_fixed_chunk_frames: 15
-      # Codec decode CUDA graph: one frame bucket (15, the fixed chunk) x several
-      # batch buckets. Stage 1 groups same-frame requests into a (B, F, q) batch and
-      # the wrapper pads B up to the nearest captured batch bucket (e.g. 3 requests
-      # reuse the (4, 15) graph). Keep the bucket set small to bound capture memory.
       decode_cudagraph_capture_frames: [15]
       decode_cudagraph_batch_sizes: [1, 2, 4, 8, 16, 32]
 
 stages:
-  # IMPORTANT: do NOT nest tuning fields under an ``engine_args:`` sub-block.
-  # vllm_omni's _parse_stage_deploy, when a stage has an ``engine_args`` key,
-  # reads recognized fields (enforce_eager, max_num_seqs, gpu_memory_utilization,
-  # max_model_len, ...) ONLY from inside that sub-block and ignores the top-level
-  # siblings. Keep everything flat at the stage level; unknown keys (e.g.
-  # mamba_ssm_cache_dtype) are passed through to vLLM EngineArgs as engine_extras.
+  # Keep engine settings flat at the stage level; nested settings are not parsed.
   - stage_id: 0
     max_num_seqs: 32
     gpu_memory_utilization: 0.5
     enforce_eager: false
     async_scheduling: true
     enable_prefix_caching: false
-    # Chunked prefill capped at 512 tokens/step keeps per-step batches small and
-    # bounds the prefill graph shapes.
     enable_chunked_prefill: true
     max_num_batched_tokens: 512
     max_model_len: 4096
     devices: "0"
     output_connectors:
       to_stage_1: connector_of_shared_memory
-    # EasyMagpie talker engine specifics (hybrid Mamba + inputs_embeds path),
-    # flat so they are parsed (passed through as engine_extras -> EngineArgs).
     mamba_ssm_cache_dtype: float32
-    attention_backend: TRITON_ATTN
     skip_tokenizer_init: true
     default_sampling_params:
       temperature: 0.0
@@ -98,24 +49,11 @@ stages:
   - stage_id: 1
     max_num_seqs: 32
     gpu_memory_utilization: 0.35
-    # Stage-1 (codec) is a no-KV-cache model, so vLLM's own cudagraph capture does
-    # nothing useful; keep it eager to avoid vLLM's warmup cost. The hand-captured
-    # codec graph is independent of this flag.
     enforce_eager: true
-    # Keep async_scheduling OFF for the codec stage: the codec graph replays into a
-    # single shared static_input/static_output buffer per shape, so overlapping
-    # Stage-1 steps would overwrite those buffers mid-replay -> corrupted audio.
+    # Codec graph replays share static buffers and must not overlap.
     async_scheduling: false
     enable_prefix_caching: false
-    # In async_chunk mode each step is an independent prefill of one fixed window
-    # (Q * codec_fixed_chunk_frames = 16 * 15 = 240 tokens). The scheduler batches
-    # as many waiting windows per step as this token budget allows, so it MUST be
-    # large enough to coalesce the target concurrency: at 512 only floor(512/240)=2
-    # windows fit per step, which serializes the codec at high concurrency (observed
-    # mean decode batch ~2.5 at C=32). Size it to max_num_seqs windows so the whole
-    # backlog can be decoded in one batched graph replay: 32 * 240 = 7680 -> 8192
-    # (headroom). max_num_seqs (32) and the decode_cudagraph_batch_sizes (..,16,32)
-    # cap the effective batch, and the (B,15) codec graph handles it in one replay.
+    # 32 sequences × 16 codebooks × 15 frames require at least 7680 tokens.
     max_num_batched_tokens: 8192
     max_model_len: 512
     devices: "0"

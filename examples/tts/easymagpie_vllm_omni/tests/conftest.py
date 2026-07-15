@@ -11,28 +11,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Shared pytest fixtures for the EasyMagpieTTS vLLM-Omni tests.
-
-The model definition (``easymagpie_vllm_omni.local_transformer`` etc.) is plain
-PyTorch: the ``@support_torch_compile`` decorator short-circuits to eager when
-``compilation_config.mode == CompilationMode.NONE``, and the modules only read a
-handful of scalars off the ``VllmConfig``. So the whole stack can be exercised as
-ordinary PyTorch with a tiny stand-in config — **no model directory, no engine,
-no GPU required** — which is what these fixtures provide.
-
-All heavy imports (torch / vllm) are done lazily inside the fixture so test
-collection never fails on machines where those packages are absent; the
-dependent tests ``importorskip`` them and are skipped instead.
-"""
+"""Shared fixtures for CPU-only EasyMagpieTTS tests."""
 from __future__ import annotations
 
 import types
 
 import pytest
 
-# A deliberately tiny architecture so the tests run fast on CPU. Dimensions are
-# kept equal by default (so the in/out projections collapse to ``nn.Identity``,
-# matching the reference SmallMamba checkpoint where everything is 1536-wide).
+# Equal dimensions exercise the identity projection path.
 _DEFAULT_ARCH: dict = dict(
     hidden_dim=64,
     embedding_dim=64,
@@ -47,19 +33,7 @@ _DEFAULT_ARCH: dict = dict(
 
 
 def build_vllm_config(**arch_overrides):
-    """Build a minimal stand-in ``VllmConfig`` for the code predictor.
-
-    Returns a ``types.SimpleNamespace`` exposing exactly the attributes the
-    EasyMagpie modules touch at construction time:
-
-    * ``model_config.hf_config`` — arch scalars (read via ``from_hf_config``);
-    * ``model_config.dtype`` — buffer dtype;
-    * ``scheduler_config.max_num_batched_tokens`` — scratch-buffer length;
-    * ``compilation_config.mode`` — ``CompilationMode.NONE`` so the
-      ``@support_torch_compile`` wrapper stays in eager mode.
-
-    Any keyword overrides are merged into the default tiny arch profile.
-    """
+    """Build a minimal eager ``VllmConfig`` for the code predictor."""
     import torch
     from vllm.config import CompilationMode
 

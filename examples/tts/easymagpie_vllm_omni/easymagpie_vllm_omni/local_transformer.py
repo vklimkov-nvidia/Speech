@@ -11,58 +11,25 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Autoregressive local transformer for EasyMagpieTTS on vLLM-Omni.
-
-EasyMagpieTTS predicts the ``C * S`` stacked audio codebooks of one frame
-*autoregressively* with a small causal transformer conditioned on the backbone's
-per-frame hidden state. This module implements that local transformer so it can
-run as a single compiled CUDA graph:
-
-* :class:`EasyMagpieLocalTransformer` is a causal transformer stack with
-  learnable positional embeddings, using ``scaled_dot_product_attention`` and no
-  KV cache. It is decorated with ``@support_torch_compile`` so vLLM captures one
-  CUDA graph for the fixed ``(num_tokens, num_stacked_codebooks, hidden)`` input
-  shape. Its layer/weight layout matches the training checkpoint so weights load
-  1:1.
-* :class:`EasyMagpieCodePredictor` owns the persistent, address-stable scratch
-  buffers and runs the per-frame autoregressive loop, re-invoking the compiled
-  transformer once per codebook over the **same** buffer (replaying one
-  fixed-shape graph N times is faster and simpler than capturing N separate
-  graphs).
-
-All sampling is CUDA-graph safe (Gumbel-max + ``topk`` + ``masked_fill`` only;
-no host syncs, no ``multinomial`` on possibly-degenerate warmup data).
-"""
+"""Autoregressive intra-frame codebook predictor for EasyMagpieTTS."""
 from __future__ import annotations
 
 import torch
+from easymagpie_vllm_omni.config import EasyMagpieOmniArch
 from torch import nn
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
-
-from easymagpie_vllm_omni.config import EasyMagpieOmniArch
-
 
 # Default top-k width for audio-codebook sampling. Because ``torch.topk``'s ``k``
 # shapes tensors inside the captured graph, this becomes a capture-time constant.
 _DEFAULT_TOP_K = 80
 
-# Minimum sampling temperature used inside the compiled graph. The old eager
-# sampler special-cased ``temperature <= 0`` as exact argmax, but a
-# data-dependent branch is illegal inside a captured graph, so we clamp to a tiny
-# value (near-argmax) and always take the Gumbel-top-k path.
+# A positive floor avoids data-dependent branches in the captured graph.
 _MIN_SAMPLING_TEMPERATURE = 1e-4
 
 
 class EasyMagpieLTSelfAttention(nn.Module):
-    """Causal self-attention.
-
-    Fused QKV projection (``qkv_net``) and output projection (``o_net``), both
-    bias-free, with ``d_head ** -0.5`` scaling computed via
-    ``scaled_dot_product_attention`` with ``is_causal=True``. No KV cache: the
-    autoregressive loop re-runs the full (short, fixed-length) sequence each
-    step, which is what makes the whole thing CUDA-graph capturable.
-    """
+    """Bias-free causal self-attention without a KV cache."""
 
     def __init__(self, d_model: int, n_heads: int) -> None:
         super().__init__()
@@ -81,9 +48,7 @@ class EasyMagpieLTSelfAttention(nn.Module):
         q = q.transpose(1, 2)
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
-        attn = torch.nn.functional.scaled_dot_product_attention(
-            q, k, v, is_causal=True, scale=self.scale
-        )
+        attn = torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal=True, scale=self.scale)
         attn = attn.transpose(1, 2).contiguous().view(b, t, -1)
         return self.o_net(attn)
 
@@ -91,15 +56,8 @@ class EasyMagpieLTSelfAttention(nn.Module):
 class EasyMagpieLTFeedForward(nn.Module):
     """Positionwise feed-forward network.
 
-    A ``Conv1d(kernel_size=1)`` over the channel dim is mathematically identical
-    to an ``nn.Linear`` applied on the last dim, but the conv form forces a
-    ``[b, t, c] -> [b, c, t]`` transpose on the way in and out (which torch
-    cannot fuse away and which showed up as ``*_transpose_*`` /
-    ``*_convolution_*`` triton kernels in profiling). We therefore use plain
-    bias-free ``nn.Linear`` layers and operate directly on the ``[b, t, c]``
-    layout. The ``conv`` submodule attribute is kept so the kernel-1 conv
-    weights from the training checkpoint (shape ``[out, in, 1]``) still map 1:1;
-    :meth:`EasyMagpieTTS.load_weights` squeezes the trailing singleton dim.
+    ``conv`` parameter names preserve checkpoint compatibility, while the
+    kernel-1 operations use equivalent linear projections on ``[B, T, C]``.
     """
 
     def __init__(self, d_model: int, d_ffn: int) -> None:
@@ -109,7 +67,6 @@ class EasyMagpieLTFeedForward(nn.Module):
         self.act = nn.GELU(approximate="tanh")
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: [b, t, c]; no transpose needed for a kernel-1 conv == linear.
         return self.o_net(self.act(self.proj(x)))
 
 
@@ -170,14 +127,8 @@ class EasyMagpieLocalTransformer(nn.Module):
         max_len = arch.num_stacked_codebooks + 2
 
         self.position_embeddings = nn.Embedding(max_len, d_model)
-        # Cache a constant ``arange`` so we don't re-materialize it (and re-run an
-        # embedding gather) on every autoregressive step. The positional table is
-        # tiny and fixed; gathering once per forward over a cached index avoids
-        # the ``arange + embedding`` triton kernel seen in profiling.
         self.register_buffer("_positions", torch.arange(max_len), persistent=False)
-        self.layers = nn.ModuleList(
-            [EasyMagpieLTLayer(d_model, d_ffn, n_heads) for _ in range(n_layers)]
-        )
+        self.layers = nn.ModuleList([EasyMagpieLTLayer(d_model, d_ffn, n_heads) for _ in range(n_layers)])
         self.norm_out = nn.Identity()
 
     def forward(self, inputs_embeds: torch.Tensor) -> torch.Tensor:
@@ -197,30 +148,10 @@ class EasyMagpieLocalTransformer(nn.Module):
 # and ``gumbel_noise`` are ``[num_tokens, ...]`` -> dim 0 (num_tokens) is dynamic.
 @support_torch_compile(dynamic_arg_dims={"dec_hidden": 0, "gumbel_noise": 0})
 class EasyMagpieCodeLoop(nn.Module):
-    """Compiled single-graph autoregressive codebook loop.
+    """Compiled per-frame codebook loop.
 
-    Runs the *entire* per-frame loop — transformer stack, per-codebook projection
-    heads, and (graph-safe) sampling — under one ``@support_torch_compile`` graph,
-    so vLLM captures a single CUDA graph replayed once per frame instead of
-    replaying the transformer ``N`` times with eager projection / sampling in
-    between. (Total FLOPs are unchanged — this removes per-step Python and
-    kernel-launch overhead, which dominates at low concurrency.)
-
-    It owns **no parameters**: the projection / embedding / out-projection modules
-    and the forbidden mask live on the parent :class:`EasyMagpieCodePredictor` (so
-    the checkpoint still loads 1:1) and are reached through a non-registered
-    reference set by :meth:`bind_predictor`.
-
-    Sampling is kept graph-safe by construction:
-
-    * the Gumbel noise is drawn eagerly *outside* the graph and injected as
-      ``gumbel_noise`` — running ``uniform_`` inside the capture would otherwise
-      reuse the captured random numbers on every replay;
-    * ``temperature`` is a runtime tensor, so per-request temperature works
-      without recompiling;
-    * ``top_k`` shapes the ``topk`` / noise tensors and is therefore a
-      **capture-time constant** (per-request ``top_k`` changes are not honored
-      once the graph is captured).
+    Gumbel noise is supplied at runtime for fresh samples. Temperature is
+    dynamic, while ``top_k`` is fixed when the graph is captured.
     """
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
@@ -279,26 +210,7 @@ class EasyMagpieCodeLoop(nn.Module):
 
 
 class EasyMagpieCodePredictor(nn.Module):
-    """Autoregressive intra-frame codebook predictor (the "local transformer").
-
-    Given the backbone's per-frame hidden state, predicts all ``C * S`` stacked
-    audio codebooks one at a time. Owns the codebook input embeddings (shared
-    with the outer model for building decode-step input embeddings) and all the
-    projection heads, plus the persistent scratch buffers required for
-    CUDA-graph replay.
-
-    Per frame (``generate_codes``):
-
-    1. Position 0 of the input buffer holds ``in_proj(dec_hidden)``.
-    2. For codebook ``k`` in ``0 .. N-1``: run the compiled transformer over the
-       whole buffer, read row ``k`` of the output, project to codebook-``k``
-       logits, sample, and (if ``k < N-1``) write ``in_proj(audio_emb_k(code))``
-       into buffer row ``k + 1``.
-
-    The buffer is zeroed once per frame and filled incrementally; because the
-    transformer is causal, rows ``> k`` never influence row ``k``, so replaying
-    the same fixed-shape graph N times yields the correct autoregressive result.
-    """
+    """Predict all stacked audio codebooks from each backbone hidden state."""
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()

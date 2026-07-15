@@ -11,26 +11,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""CUDA-Graph wrapper for the EasyMagpieTTS codec decoder.
+"""CUDA-graph wrapper for fixed-shape EasyMagpieTTS codec decoding.
 
-The EasyMagpie codec decode path (clamp specials -> unstack -> FSQ index
-convert -> ``AudioCodecModel.decode``) is a static, data-independent graph for a
-fixed frame count, so it is a good CUDA-graph capture target: replaying a
-captured graph removes the per-launch kernel overhead that dominates the small
-per-chunk decodes issued in streaming (async-chunk) mode.
-
-This mirrors ``qwen3_tts/cuda_graph_decoder_wrapper.py`` but is specialized to
-the EasyMagpie decode module (see :class:`easymagpie_vllm_omni.code2wav`):
-
-* The captured module consumes **stacked model codes** of shape
-  ``(batch, frames, num_stacked_codebooks)`` (int64) and returns a waveform of
-  shape ``(batch, frames * samples_per_frame)`` (fp32).
-* Capture happens per ``(batch_size, frames)`` bucket; at decode time the actual
-  batch/frame count is padded up to the nearest captured bucket and the replayed
-  output is trimmed back to the real ``(batch_size, actual_frames)``.
-* Any shape without a captured bucket (e.g. an unusually long non-streaming
-  sequence) falls back to eager decode, so correctness never depends on a graph
-  being present.
+Inputs are stacked codes shaped ``[batch, frames, codebooks]``. Uncaptured
+shapes fall back to eager decoding.
 """
 from __future__ import annotations
 

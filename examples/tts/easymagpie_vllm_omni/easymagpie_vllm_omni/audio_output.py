@@ -19,12 +19,7 @@ from typing import Any, Optional
 
 
 def extract_audio_from_stage_output(stage_output) -> Optional[tuple[Any, int]]:
-    """Pull (waveform numpy array, sample_rate) from a final-stage OmniRequestOutput.
-
-    In async_chunk mode Stage 1 emits one audio tensor per codec window; the engine's
-    output_processor renames ``model_outputs`` -> ``audio`` and accumulates per-chunk
-    tensors into a list, consolidating them on the finished output.
-    """
+    """Return ``(waveform, sample_rate)`` from a final-stage output."""
     import torch
 
     if isinstance(stage_output, (list, tuple)):

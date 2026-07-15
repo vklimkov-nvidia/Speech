@@ -11,28 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""``/v1/audio/speech`` serving support for EasyMagpieTTS (vLLM-Omni >= 0.24).
-
-vLLM-Omni's OpenAI speech layer builds the per-request engine prompt through a
-registry of *TTS adapters* (RFC #4327), resolved by a model-type string that
-``OmniOpenAIServingSpeech._detect_tts_model_type`` derives from the deployed
-stage. EasyMagpie is an out-of-tree model, so upstream neither detects it nor
-ships an adapter — hence ``vllm serve`` cannot construct EasyMagpie's prompt
-(``prompt_token_ids`` placeholder + ``additional_information``) and the request
-falls through to a raw-text prompt that the talker rejects.
-
-This module closes both gaps at serving time, without forking vllm-omni:
-
-* registers an :class:`EasyMagpieTTSAdapter` under the model-type ``"easymagpie"``
-  which builds the exact same prompt as ``scripts/offline_demo.ipynb``;
-* teaches the TTS-stage lookup + ``_detect_tts_model_type`` to recognise the
-  ``easymagpie`` talker stage so that adapter is resolved.
-
-The patch is applied only in the API-server (front-end) process — the one that
-imports ``serving_speech`` — so engine-core / worker processes are untouched.
-It is idempotent and defensive: any failure is logged and left non-fatal so a
-vllm-omni version whose internals moved cannot break model/pipeline loading.
-"""
+"""``/v1/audio/speech`` support for EasyMagpieTTS on vLLM-Omni 0.24+."""
 from __future__ import annotations
 
 import logging
@@ -40,15 +19,11 @@ from typing import TYPE_CHECKING, Any, Callable
 
 logger = logging.getLogger(__name__)
 
-#: Registry key + model-type discriminator for this model.
 MODEL_TYPE = "easymagpie"
-#: Stage-0 (talker) ``model_stage`` and ``model_arch`` from ``pipeline.py``.
 _TALKER_STAGE = "easymagpie"
 _TALKER_ARCH = "EasyMagpieTTSForConditionalGeneration"
-#: The front-end serving module; its presence marks the API-server process.
 _SERVING_MODULE = "vllm_omni.entrypoints.openai.serving_speech"
 
-# Request defaults mirror scripts/offline_demo.ipynb.
 _DEFAULT_SPEAKER = "eng"
 _DEFAULT_CONTEXT_TEXT = "[EN]"
 _DEFAULT_TEMPERATURE = 0.7
@@ -63,22 +38,7 @@ def _build_adapter_cls() -> type:
     from vllm_omni.entrypoints.openai.tts_adapters.base import ARTTSAdapter, PreparedRequest
 
     class EasyMagpieTTSAdapter(ARTTSAdapter):
-        """Serve the two-stage EasyMagpieTTS pipeline via ``/v1/audio/speech``.
-
-        Maps the OpenAI speech request onto EasyMagpie's engine prompt:
-
-        * ``input``            -> ``additional_information.text``
-        * ``voice`` / ``speaker`` -> ``additional_information.speaker_id``
-          (default ``"eng"``)
-        * ``extra_params`` may override ``temperature`` / ``top_k`` /
-          ``context_text`` (the local-transformer sampling controls, forwarded
-          via ``additional_information``).
-
-        ``prompt_token_ids`` is a ``[0] * prompt_len`` placeholder whose length
-        must equal the assembled speaker-conditioned prefill; it is resolved per
-        speaker from the checkpoint via
-        ``EasyMagpieTTSForConditionalGeneration.get_prompt_len`` (cached).
-        """
+        """Build speaker-conditioned prompts for ``/v1/audio/speech`` requests."""
 
         name = MODEL_TYPE
         stage_keys = frozenset({_TALKER_STAGE})
@@ -96,7 +56,6 @@ def _build_adapter_cls() -> type:
             model_config = getattr(engine_client, "model_config", None)
             path = getattr(model_config, "model", None)
             if not path:
-                # Fallback: the talker stage's own engine args carry the path.
                 for stage in getattr(engine_client, "stage_configs", None) or []:
                     stage_path = getattr(getattr(stage, "engine_args", None), "model", None)
                     if stage_path:
@@ -171,11 +130,8 @@ def _register_adapter() -> None:
 def _patch_detection() -> None:
     from vllm_omni.entrypoints.openai import serving_speech as ss
 
-    # 1) Make _find_tts_stage / _is_tts recognise the easymagpie talker stage
-    #    (``_TTS_MODEL_STAGES`` is a ``set[str]`` in vLLM-Omni 0.24).
     ss._TTS_MODEL_STAGES.add(_TALKER_STAGE)
 
-    # 2) Map that stage/arch to our model-type in the detection helper (once).
     detect = ss.OmniOpenAIServingSpeech._detect_tts_model_type
     if getattr(detect, "_easymagpie_patched", False):
         return
@@ -196,12 +152,7 @@ def _patch_detection() -> None:
 
 
 def apply_serving_patches(force: bool = False) -> None:
-    """Install EasyMagpie ``/v1/audio/speech`` support in the current process.
-
-    No-op unless the serving module is already imported (i.e. we are in the
-    API-server front-end), so worker / engine-core processes stay clean. Pass
-    ``force=True`` to apply regardless (useful from an explicit launcher).
-    """
+    """Install speech support in the API-server process."""
     import sys
 
     if not force and _SERVING_MODULE not in sys.modules:
