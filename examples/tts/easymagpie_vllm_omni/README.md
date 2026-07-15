@@ -13,10 +13,10 @@ during prefill/mixed) lives in
 There are **two ways** to turn the talker's acoustic codes into a waveform:
 
 * **In-engine two-stage pipeline (recommended, no external service)** — a
-  Stage-1 `EasyMagpieCode2Wav` runs the NeMo codec decoder directly inside
-  vLLM-Omni (optionally CUDA-graphed), exactly like Qwen3-TTS's `code2wav`
-  stage. See [In-engine two-stage pipeline](#in-engine-two-stage-pipeline)
-  below.
+  Stage-1 `EasyMagpieCode2Wav` loads a `torch.export` capture of the original
+  NeMo codec decoder inside vLLM-Omni (optionally CUDA-graphed). NeMo is needed
+  for conversion but not serving. See
+  [In-engine two-stage pipeline](#in-engine-two-stage-pipeline) below.
 * **Triton + TensorRT codec service** — a Triton ensemble wraps the talker
   together with a TensorRT codec decoder for gRPC streaming. See
   [Triton service pipeline](#triton-service-pipeline) below.
@@ -31,9 +31,9 @@ generative) with the same structure as the Qwen3-TTS reference pipeline:
 - **Stage 0** — the existing talker; emits stacked acoustic codes under
   `codes.audio`.
 - **Stage 1** — [`easymagpie_vllm_omni/code2wav.py`](easymagpie_vllm_omni/code2wav.py)
-  reproduces the `export_codec_decoder_onnx.py` decode path (clamp specials →
-  unstack → FSQ index-convert → `AudioCodecModel.decode`) and optionally
-  captures it as a CUDA graph
+  loads the exported original decode path (clamp specials → unstack → FSQ
+  index-convert → `AudioCodecModel.decode`) and optionally captures the loaded
+  `ExportedProgram` as a CUDA graph
   ([`cuda_graph_codec_wrapper.py`](easymagpie_vllm_omni/cuda_graph_codec_wrapper.py)).
 - **Stage plumbing** — [`stage_processors.py`](easymagpie_vllm_omni/stage_processors.py)
   turns the talker's per-frame codes into the codebook-major flat stream the
@@ -42,9 +42,9 @@ generative) with the same structure as the Qwen3-TTS reference pipeline:
 
 Steps:
 
-1. **Convert with the codec bundled** (the `--bundle_codec` default copies the
-   codec `.nemo` and the FSQ `vector_quantizer` config into `<model>/codec/`, so
-   Stage 1 is self-contained):
+1. **Convert with the codec exported** (the `--bundle_codec` default writes
+   `<model>/codec/codec_decoder.pt2` and its metadata, so Stage 1 is
+   self-contained and has no NeMo dependency):
 
    ```bash
    python examples/tts/easymagpie_vllm_omni/scripts/easy_magpietts_convert_to_vllm.py \
@@ -53,6 +53,22 @@ Steps:
        --outdir examples/tts/easymagpie_vllm_omni/easymp_vllm_model \
        --context_audio english_sample.wav --speaker_name eng \
        --phoneme_tokenizer_path <ckpt>/bpe_ipa_tokenizer_2048_en_de_es_fr_hi_it_vi_zh_ko-KR_pt-BR_ar.json
+   ```
+
+   The default export fixes the codec input at 15 model frames and allows
+   dynamic batches up to 32. Override these with `--codec_export_frames` and
+   `--codec_export_max_batch_size`; the frame count must match
+   `codec_fixed_chunk_frames` in `deploy/easymagpie.yaml`.
+
+   To validate a checkpoint's export and CUDA-graph capture in the `emp`
+   environment before conversion:
+
+   ```bash
+   conda run -n emp python \
+       examples/tts/easymagpie_vllm_omni/scripts/debug_codec_export.py \
+       --nemo_file <ckpt>/2605_EMTTS_SmallMamba_Step150k_posttrained_epoch12.nemo \
+       --codec_model_path <ckpt>/25fps_spectral_codec_with_bandwidth_extension.nemo \
+       --frames 15 --batches 1 2 4
    ```
 
 2. **Offline synthesis** (single engine, both stages):

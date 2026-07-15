@@ -34,6 +34,7 @@ import argparse
 import asyncio
 import json
 import logging
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, Optional
 
@@ -48,10 +49,9 @@ DEFAULT_DEPLOY = str(Path(__file__).resolve().parent.parent / "deploy" / "easyma
 
 
 def _load_meta(model_dir: str, speaker_id: str):
-    from transformers import AutoTokenizer
-
     from easymagpie_vllm_omni.config import EasyMagpieOmniArch
     from easymagpie_vllm_omni.easymagpie import EasyMagpieTTSForConditionalGeneration
+    from transformers import AutoTokenizer
 
     config = json.loads((Path(model_dir) / "config.json").read_text())
     arch = EasyMagpieOmniArch.from_hf_config(type("Cfg", (), config))
@@ -94,12 +94,25 @@ def _extract_audio(stage_output) -> Optional[tuple[Any, int]]:
     """
     import torch
 
-    ro = getattr(stage_output, "request_output", stage_output)
-    outputs = getattr(ro, "outputs", None)
-    if not outputs:
+    # AsyncOmni may yield a list containing the final pipeline output.
+    if isinstance(stage_output, (list, tuple)):
+        for item in reversed(stage_output):
+            extracted = _extract_audio(item)
+            if extracted is not None:
+                return extracted
         return None
-    mm = getattr(outputs[0], "multimodal_output", None)
-    if not isinstance(mm, dict):
+
+    # OmniRequestOutput exposes a multimodal_output property that already
+    # navigates to the completion output. Prefer it so nested pipeline outputs
+    # and the newer MultimodalPayload Mapping are both handled.
+    mm = getattr(stage_output, "multimodal_output", None)
+    ro = getattr(stage_output, "request_output", stage_output)
+    if not isinstance(mm, Mapping):
+        outputs = getattr(ro, "outputs", None)
+        if not outputs:
+            return None
+        mm = getattr(outputs[0], "multimodal_output", None)
+    if not isinstance(mm, Mapping):
         return None
     # Framework surfaces audio under "audio" (preferred) or the raw "model_outputs".
     audio_data = mm.get("audio")

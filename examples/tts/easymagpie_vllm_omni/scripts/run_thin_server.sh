@@ -29,9 +29,16 @@ echo "Starting EasyMagpieTTS via vllm serve: model=${MODEL} deploy=${DEPLOY_CONF
 # VLLM_PLUGINS ensures the EasyMagpie plugin (model + pipeline + TTS adapter) is
 # loaded in the API-server process. --trust-remote-code is required for the
 # Nemotron-H config; --omni enables the multi-stage pipeline runtime.
+#
+# Per-request StageRequestStats tables and Uvicorn access lines are disabled:
+# formatting/writing them is noisy and can distort high-concurrency benchmarks.
+# Warnings and errors remain visible.
 VLLM_PLUGINS=easymagpie_omni vllm serve "$MODEL" \
     --deploy-config "$DEPLOY_CONFIG" \
     --host 0.0.0.0 \
     --port "$PORT" \
     --trust-remote-code \
+    --disable-log-stats \
+    --disable-uvicorn-access-log \
+    --uvicorn-log-level warning \
     --omni

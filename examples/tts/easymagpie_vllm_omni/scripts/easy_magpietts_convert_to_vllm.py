@@ -30,13 +30,14 @@ It contains:
 * ``speaker_embeddings/<name>.pt`` (optional) — pre-computed speaker-encoder
   outputs for one or more reference audio files, used as the ``speaker_embedding``
   input at inference time.
-* ``codec/`` (optional, on by default) — the bundled audio codec so the
+* ``codec/`` (optional, on by default) — the exported audio codec so the
   in-engine two-stage pipeline's Code2Wav stage
   (:class:`easymagpie_vllm_omni.code2wav.EasyMagpieCode2Wav`) can decode acoustic
   codes to a waveform without an external Triton/TRT codec service. The default
-  ``--codec_bundle_mode vendored`` writes a **NeMo-free** decode bundle
-  (``codec/decoder.safetensors`` + ``codec/codec_config.json``) that serves with
-  only vLLM / vLLM-Omni installed. ``--codec_bundle_mode nemo`` instead copies
+  ``--codec_bundle_mode exported`` uses ``torch.export`` to serialize the original
+  NeMo decode graph as ``codec/codec_decoder.pt2``. It serves with only PyTorch,
+  vLLM, and vLLM-Omni installed; no codec reimplementation or NeMo runtime is
+  required. ``--codec_bundle_mode nemo`` instead copies
   ``codec/codec.nemo`` + ``codec/vector_quantizer.yaml`` (Code2Wav loads it via
   NeMo at serve time); ``both`` writes both. Disable with ``--no_bundle_codec``
   when serving the talker only (single-stage / external codec).
@@ -65,6 +66,7 @@ import shutil
 
 import torch
 import tqdm
+from codec_export import export_codec_decoder
 from omegaconf import OmegaConf
 from safetensors.torch import save_file
 
@@ -175,12 +177,30 @@ def parse_args():
     )
     parser.add_argument(
         "--codec_bundle_mode",
-        choices=["vendored", "nemo", "both"],
-        default="vendored",
-        help="How to bundle the codec (when --bundle_codec is set). 'vendored' (default) "
-        "exports standalone decoder weights + config json so serving needs only "
-        "vLLM / vLLM-Omni (no NeMo). 'nemo' copies the codec .nemo + vector_quantizer.yaml "
+        choices=["exported", "nemo", "both"],
+        default="exported",
+        help="How to bundle the codec (when --bundle_codec is set). 'exported' (default) "
+        "serializes the original NeMo decode graph with torch.export so serving needs only "
+        "PyTorch / vLLM / vLLM-Omni. 'nemo' copies the codec .nemo + vector_quantizer.yaml "
         "(Code2Wav loads it via NeMo at serve time). 'both' writes both.",
+    )
+    parser.add_argument(
+        "--codec_export_frames",
+        type=int,
+        default=15,
+        help="Fixed model-frame input length for the exported codec (must match codec_fixed_chunk_frames).",
+    )
+    parser.add_argument(
+        "--codec_export_max_batch_size",
+        type=int,
+        default=32,
+        help="Maximum dynamic batch size accepted by the exported codec.",
+    )
+    parser.add_argument(
+        "--codec_export_atol",
+        type=float,
+        default=2e-3,
+        help="Absolute tolerance for the post-save exported-codec parity check.",
     )
     parser.add_argument("--context_audio_duration", type=float, default=5.0)
     parser.add_argument(
@@ -405,92 +425,32 @@ def select_weights(state_dict: dict, hidden_dim: int, dtype: torch.dtype) -> dic
     return weights
 
 
-def _remove_weight_norm_recursive(module) -> int:
-    """Fold weight-norm parametrizations so exported convs hold plain ``weight`` tensors.
-
-    NeMo's codec convs use the new ``nn.utils.parametrizations.weight_norm`` API,
-    which stores ``conv.parametrizations.weight.original0/original1`` rather than a
-    plain ``conv.weight`` (their own ``remove_weight_norm`` calls the *legacy*
-    ``nn.utils.remove_weight_norm`` and raises on the parametrized form). We fold
-    it directly via the parametrize API with ``leave_parametrized=True`` so the
-    effective weight-norm weight becomes a plain ``weight`` parameter that the
-    vendored (parametrization-free) modules can load. Returns the count folded.
-    """
-    import torch.nn.utils.parametrize as P
-
-    folded = 0
-    for child in module.modules():
-        if P.is_parametrized(child, "weight"):
-            P.remove_parametrizations(child, "weight", leave_parametrized=True)
-            folded += 1
-    return folded
-
-
-def export_vendored_codec(model, outdir: str) -> dict:
-    """Export a NeMo-free codec decode bundle (decoder weights + config json).
-
-    Produces ``codec/decoder.safetensors`` (the ``ResNetDecoder`` weights with
-    weight-norm folded away) and ``codec/codec_config.json`` (the decoder init
-    kwargs, the codec's native FSQ ``vector_quantizer`` config, the model's
-    regrouped FSQ config, and the output sample rate). The Stage-1 Code2Wav
-    worker rebuilds the decode path from these with only vLLM / vLLM-Omni
-    installed (see ``easymagpie_vllm_omni/codec_modules.py``) -- no ``nemo``
-    import at serve time.
-
-    Returns the config.json fragment referencing the bundled artifacts.
-    """
-    codec = model._codec_model  # AudioCodecModel loaded alongside the talker
+def export_codec(model, outdir: str, *, frames: int, max_batch_size: int, device: str, atol: float) -> dict:
+    """Serialize the original NeMo codec decode path as a NeMo-free ExportedProgram."""
     codec_dir = os.path.join(outdir, "codec")
     os.makedirs(codec_dir, exist_ok=True)
-
-    # The vendored decode path (easymagpie_vllm_omni/codec_modules.py) ports only
-    # ResNetDecoder + (Group)FiniteScalarQuantizer. Fail loudly on anything else so
-    # a mismatched codec isn't silently mis-ported; use --codec_bundle_mode nemo.
-    dec_target = str(codec.cfg.audio_decoder.get("_target_", ""))
-    vq_target = str(codec.cfg.vector_quantizer.get("_target_", ""))
-    if not dec_target.endswith("ResNetDecoder"):
-        raise ValueError(
-            f"Vendored codec export only supports ResNetDecoder, got audio_decoder._target_='{dec_target}'. "
-            "Re-run with --codec_bundle_mode nemo to bundle the codec .nemo instead."
-        )
-    if not vq_target.endswith("GroupFiniteScalarQuantizer"):
-        raise ValueError(
-            f"Vendored codec export only supports GroupFiniteScalarQuantizer, got "
-            f"vector_quantizer._target_='{vq_target}'. Re-run with --codec_bundle_mode nemo instead."
-        )
-
-    decoder = codec.audio_decoder
-    n_folded = _remove_weight_norm_recursive(decoder)
-    logging.info(f"Folded weight-norm on {n_folded} codec decoder conv layers")
-    decoder_state = {
-        key: value.detach().cpu().float().contiguous() for key, value in decoder.state_dict().items()
-    }
-    decoder_path = os.path.join(codec_dir, "decoder.safetensors")
-    save_file(decoder_state, decoder_path, metadata={"format": "pt"})
-    logging.info(f"Saved vendored codec decoder ({len(decoder_state)} tensors) -> {decoder_path}")
-
-    def _clean(cfg) -> dict:
-        container = OmegaConf.to_container(cfg, resolve=True)
-        container.pop("_target_", None)
-        return container
-
-    codec_config = {
-        "audio_decoder": _clean(codec.cfg.audio_decoder),
-        "vector_quantizer_native": _clean(codec.cfg.vector_quantizer),
-        "output_sample_rate": int(getattr(codec, "output_sample_rate", getattr(codec, "sample_rate", 22050))),
-    }
-    model_vq_cfg = model.cfg.get("vector_quantizer")
-    if model_vq_cfg is not None:
-        codec_config["vector_quantizer_model"] = _clean(model_vq_cfg)
-
-    config_path = os.path.join(codec_dir, "codec_config.json")
-    with open(config_path, "w") as f:
-        json.dump(codec_config, f, indent=2)
-    logging.info(f"Saved vendored codec config -> {config_path}")
-
+    program_path = os.path.join(codec_dir, "codec_decoder.pt2")
+    metadata_path = os.path.join(codec_dir, "codec_export.json")
+    metadata = export_codec_decoder(
+        model,
+        program_path,
+        metadata_path,
+        frames=frames,
+        max_batch_size=max_batch_size,
+        device=torch.device(device),
+        atol=atol,
+    )
+    logging.info(
+        "Saved codec ExportedProgram -> %s (frames=%d, max_batch=%d, samples_per_frame=%d, parity=%g)",
+        program_path,
+        metadata["frames"],
+        metadata["max_batch_size"],
+        metadata["samples_per_frame"],
+        metadata["parity_max_abs_diff"],
+    )
     return {
-        "codec_decoder_weights": "codec/decoder.safetensors",
-        "codec_config": "codec/codec_config.json",
+        "codec_exported_program": "codec/codec_decoder.pt2",
+        "codec_export_metadata": "codec/codec_export.json",
     }
 
 
@@ -571,11 +531,20 @@ def convert(args) -> None:
     config = build_config(model, vocab_size, args.dtype)
     # Bundle the codec so the in-engine two-stage Code2Wav can decode acoustic
     # codes to a waveform (writes into codec/ and records relative paths in
-    # config.json). The default 'vendored' mode produces a NeMo-free decode
+    # config.json). The default 'exported' mode produces a NeMo-free decode
     # bundle; 'nemo' copies the codec .nemo; 'both' writes both.
     if args.bundle_codec:
-        if args.codec_bundle_mode in ("vendored", "both"):
-            config.update(export_vendored_codec(model, args.outdir))
+        if args.codec_bundle_mode in ("exported", "both"):
+            config.update(
+                export_codec(
+                    model,
+                    args.outdir,
+                    frames=args.codec_export_frames,
+                    max_batch_size=args.codec_export_max_batch_size,
+                    device=args.device,
+                    atol=args.codec_export_atol,
+                )
+            )
         if args.codec_bundle_mode in ("nemo", "both"):
             config.update(bundle_codec(model, args.codec_model_path, args.outdir))
     with open(os.path.join(args.outdir, "config.json"), "w") as f:

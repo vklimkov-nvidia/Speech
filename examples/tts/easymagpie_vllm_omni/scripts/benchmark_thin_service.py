@@ -12,12 +12,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Benchmark the EasyMagpieTTS thin HTTP server (scripts/tts_server.py).
+"""Benchmark EasyMagpieTTS served by ``scripts/run_thin_server.sh``.
 
 Sends requests from ``-c`` parallel *processes* against the server's streaming
-``POST /tts`` endpoint and reports throughput (requests/second) and time-to-first
--audio (TTFA). Each line of the text file is ``<uttid>\\t<text>``; a text is
-sampled at random per request. Multiple concurrency levels can be run in sequence.
+OpenAI-compatible ``POST /v1/audio/speech`` endpoint and reports throughput
+(requests/second) and time-to-first-audio (TTFA). The response is raw mono
+16-bit PCM, matching ``run_thin_service_request.ipynb``. Each line of the text
+file is ``<uttid>\\t<text>``; a text is sampled at random per request. Multiple
+concurrency levels can be run in sequence.
 
 Usage:
     python benchmark_thin_service.py --text-file vctk_subset.txt -n 100 -c 8
@@ -27,8 +29,6 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import base64
-import json
 import random
 import time
 import wave
@@ -68,12 +68,13 @@ def _do_request(task: dict) -> RequestResult:
     url = task["url"]
     uttid = task["uttid"]
     payload = {
-        "text": task["text"],
+        "input": task["text"],
+        "voice": task["speaker_id"] or "eng",
+        "response_format": "pcm",
         "stream": True,
+        "stream_format": "audio",
         "max_new_tokens": task["max_new_tokens"],
     }
-    if task["speaker_id"]:
-        payload["speaker_id"] = task["speaker_id"]
 
     t0 = time.perf_counter()
     t_first: float | None = None
@@ -81,34 +82,34 @@ def _do_request(task: dict) -> RequestResult:
     chunk_arrivals: list[float] = []
     chunk_durations: list[float] = []
     num_samples = 0
-    sr = 22050
+    sr = int(task["sample_rate"])
+    trailing_byte = b""
     try:
-        with requests.post(f"{url}/tts", json=payload, stream=True, timeout=task["timeout"]) as resp:
+        with requests.post(f"{url}/v1/audio/speech", json=payload, stream=True, timeout=task["timeout"]) as resp:
             resp.raise_for_status()
-            for line in resp.iter_lines(decode_unicode=True):
-                if not line:
+            for chunk in resp.iter_content(chunk_size=None):
+                if not chunk:
                     continue
-                obj = json.loads(line)
-                kind = obj.get("type")
-                if kind == "audio":
-                    now = time.perf_counter()
-                    if t_first is None:
-                        t_first = now
-                    pcm = np.frombuffer(base64.b64decode(obj["pcm_b64"]), dtype=np.float32)
-                    num_samples += pcm.size
-                    sr = int(obj.get("sr", sr))
-                    chunk_arrivals.append(now - t0)
-                    chunk_durations.append(pcm.size / sr if sr else 0.0)
-                    if task["output_dir"]:
-                        chunks.append(pcm)
-                elif kind == "error":
-                    return RequestResult(uttid=uttid, elapsed_s=time.perf_counter() - t0, error=obj.get("message"))
-                elif kind == "done":
-                    sr = int(obj.get("sr", sr))
+                now = time.perf_counter()
+                data = trailing_byte + chunk
+                even_bytes = len(data) - (len(data) % 2)
+                trailing_byte = data[even_bytes:]
+                if even_bytes == 0:
+                    continue
+                if t_first is None:
+                    t_first = now
+                pcm = np.frombuffer(data[:even_bytes], dtype="<i2").astype(np.float32) / 32768.0
+                num_samples += pcm.size
+                chunk_arrivals.append(now - t0)
+                chunk_durations.append(pcm.size / sr if sr else 0.0)
+                if task["output_dir"]:
+                    chunks.append(pcm)
     except Exception as exc:  # noqa: BLE001 - report any client/server failure
         return RequestResult(uttid=uttid, elapsed_s=time.perf_counter() - t0, error=repr(exc))
 
     elapsed = time.perf_counter() - t0
+    if num_samples == 0:
+        return RequestResult(uttid=uttid, sr=sr, elapsed_s=elapsed, error="empty audio response")
     ttfa = (t_first - t0) if t_first is not None else elapsed
     if task["output_dir"] and num_samples > 0:
         _save_wav(Path(task["output_dir"]) / f"{uttid}.wav", np.concatenate(chunks), sr)
@@ -140,7 +141,7 @@ def _load_items(text_file: str) -> list[tuple[str, str]]:
     return items
 
 
-def _make_tasks(items, n, url, speaker_id, max_new_tokens, timeout, output_dir) -> list[dict]:
+def _make_tasks(items, n, url, speaker_id, max_new_tokens, sample_rate, timeout, output_dir) -> list[dict]:
     tasks = []
     for _ in range(n):
         uttid, text = random.choice(items)
@@ -151,6 +152,7 @@ def _make_tasks(items, n, url, speaker_id, max_new_tokens, timeout, output_dir) 
                 "text": text,
                 "speaker_id": speaker_id,
                 "max_new_tokens": max_new_tokens,
+                "sample_rate": sample_rate,
                 "timeout": timeout,
                 "output_dir": output_dir,
             }
@@ -283,6 +285,7 @@ def main() -> None:
     parser.add_argument("--url", default="http://localhost:8091", help="Server base URL (default: %(default)s)")
     parser.add_argument("--speaker-id", default=None, help="Speaker id (default: server default)")
     parser.add_argument("--max-new-tokens", type=int, default=1024)
+    parser.add_argument("--sample-rate", type=int, default=22050, help="Raw PCM sample rate (default: %(default)s)")
     parser.add_argument("--timeout", type=float, default=300, help="Per-request timeout, s (default: 300)")
     parser.add_argument("--no-warmup", action="store_true", help="Skip warmup phase (concurrency requests)")
     parser.add_argument("--output-dir", default=None, help="If set, write each waveform to <output-dir>/<uttid>.wav")
@@ -298,16 +301,34 @@ def main() -> None:
         Path(args.output_dir).mkdir(parents=True, exist_ok=True)
         output_dir = args.output_dir
 
-    print(f"Loaded {len(items)} utterances; {args.num_requests} req/level; concurrency {args.concurrency}; url {args.url}")
+    print(
+        f"Loaded {len(items)} utterances; {args.num_requests} req/level; concurrency {args.concurrency}; url {args.url}"
+    )
 
     summaries = []
     for concurrency in args.concurrency:
         if not args.no_warmup:
-            warmup = _make_tasks(items, concurrency, args.url, args.speaker_id, args.max_new_tokens, args.timeout, None)
+            warmup = _make_tasks(
+                items,
+                concurrency,
+                args.url,
+                args.speaker_id,
+                args.max_new_tokens,
+                args.sample_rate,
+                args.timeout,
+                None,
+            )
             _run_level(warmup, concurrency, None)
 
         tasks = _make_tasks(
-            items, args.num_requests, args.url, args.speaker_id, args.max_new_tokens, args.timeout, output_dir
+            items,
+            args.num_requests,
+            args.url,
+            args.speaker_id,
+            args.max_new_tokens,
+            args.sample_rate,
+            args.timeout,
+            output_dir,
         )
         results, wall = _run_level(tasks, concurrency, output_dir)
         summary = _summarize(results, wall, concurrency)
