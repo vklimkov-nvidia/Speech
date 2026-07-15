@@ -1,15 +1,15 @@
 # EasyMagpieTTS two-stage deploy: talker (text -> stacked acoustic codes) ->
 # code2wav (codes -> audio), fully in-engine (no external codec service).
 #
-# Mirrors vllm_omni/deploy/qwen3_tts.yaml. Pass this file to `vllm-omni serve`
+# Mirrors vllm_omni/deploy/qwen3_tts.yaml. Pass this file to `vllm serve`
 # (see scripts/run_server.sh) or to AsyncOmni(model=..., deploy_config=<this>)
-# (see scripts/synthesize_two_stage.py). The `pipeline: easymagpie` key forces
+# (see scripts/offline_demo.ipynb). The `pipeline: easymagpie` key forces
 # routing to EASYMAGPIE_PIPELINE (the talker's HF config reports the generic
 # model_type "nemotron_h", so it cannot be auto-detected by model_type alone).
 #
 # Stage 0 (talker) runs the Nemotron-H hybrid-Mamba backbone + local
-# transformer; Stage 1 (code2wav) decodes the bundled NeMo codec (see
-# scripts/easy_magpietts_convert_to_vllm.py --bundle_codec, on by default).
+# transformer; Stage 1 (code2wav) decodes the bundled NeMo codec under
+# <model_dir>/codec/ (shipped with the converted checkpoint).
 pipeline: easymagpie
 
 # MUST be true for this pipeline. In the installed vllm_omni (0.21.0rc1) the
@@ -23,7 +23,7 @@ pipeline: easymagpie
 # and is what actually delivers the codes. codec_chunk_frames below sets the
 # fixed 15-frame streaming window. The engine's output_processor accumulates the
 # per-chunk audio into mm["audio"] and concatenates it on the finished output,
-# which synthesize_two_stage.py reads.
+# which offline_demo.ipynb reads.
 async_chunk: true
 
 # Pipeline-wide engine settings applied to every stage.

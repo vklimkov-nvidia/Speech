@@ -1,27 +1,30 @@
 #!/bin/bash
-# Launch a vLLM-Omni server for the EasyMagpieTTS two-stage pipeline
-# (talker -> code2wav), fully in-engine (no external codec service).
+# Launch EasyMagpieTTS two-stage pipeline (talker -> code2wav) via `vllm serve`.
+# Serves OpenAI-compatible POST /v1/audio/speech with in-engine codec decode.
+#
+# Requires vLLM / vLLM-Omni 0.24+.
 #
 # Usage:
-#   ./run_server.sh <converted_model_dir> [port]
+#   ./run_server.sh <model_dir> [port]
 #
-# <converted_model_dir> is produced by scripts/easy_magpietts_convert_to_vllm.py
-# (with --bundle_codec, the default, so the codec ships under <dir>/codec/).
+# Example:
+#   ./run_server.sh ../converted_model_multiturn 8091
 set -e
 
-MODEL="${1:?Usage: run_server.sh <converted_model_dir> [port]}"
+MODEL="${1:?Usage: run_server.sh <model_dir> [port]}"
 PORT="${2:-8091}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DEPLOY_CONFIG="${SCRIPT_DIR}/../deploy/easymagpie.yaml"
 
-echo "Starting EasyMagpieTTS server: model=${MODEL} deploy=${DEPLOY_CONFIG} port=${PORT}"
+echo "Starting EasyMagpieTTS: model=${MODEL} deploy=${DEPLOY_CONFIG} port=${PORT}"
 
-# The vllm_plugin_easymagpie_omni entry point registers the model archs and the
-# EASYMAGPIE_PIPELINE. --trust-remote-code is required for the Nemotron-H config.
-vllm-omni serve "$MODEL" \
+VLLM_PLUGINS=easymagpie_omni vllm serve "$MODEL" \
     --deploy-config "$DEPLOY_CONFIG" \
     --host 0.0.0.0 \
     --port "$PORT" \
     --trust-remote-code \
+    --disable-log-stats \
+    --disable-uvicorn-access-log \
+    --uvicorn-log-level warning \
     --omni

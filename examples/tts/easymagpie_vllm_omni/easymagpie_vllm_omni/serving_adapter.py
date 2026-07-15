@@ -24,8 +24,7 @@ falls through to a raw-text prompt that the talker rejects.
 This module closes both gaps at serving time, without forking vllm-omni:
 
 * registers an :class:`EasyMagpieTTSAdapter` under the model-type ``"easymagpie"``
-  which builds the exact same prompt as ``scripts/synthesize_two_stage.py`` /
-  ``scripts/tts_server.py``;
+  which builds the exact same prompt as ``scripts/offline_demo.ipynb``;
 * teaches the TTS-stage lookup + ``_detect_tts_model_type`` to recognise the
   ``easymagpie`` talker stage so that adapter is resolved.
 
@@ -49,7 +48,7 @@ _TALKER_ARCH = "EasyMagpieTTSForConditionalGeneration"
 #: The front-end serving module; its presence marks the API-server process.
 _SERVING_MODULE = "vllm_omni.entrypoints.openai.serving_speech"
 
-# Request defaults mirror scripts/synthesize_two_stage.py / scripts/tts_server.py.
+# Request defaults mirror scripts/offline_demo.ipynb.
 _DEFAULT_SPEAKER = "eng"
 _DEFAULT_CONTEXT_TEXT = "[EN]"
 _DEFAULT_TEMPERATURE = 0.7

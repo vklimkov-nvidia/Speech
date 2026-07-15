@@ -12,19 +12,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Benchmark EasyMagpieTTS served by ``scripts/run_thin_server.sh``.
+"""Benchmark EasyMagpieTTS served by ``scripts/run_server.sh``.
 
-Sends requests from ``-c`` parallel *processes* against the server's streaming
-OpenAI-compatible ``POST /v1/audio/speech`` endpoint and reports throughput
-(requests/second) and time-to-first-audio (TTFA). The response is raw mono
-16-bit PCM, matching ``run_thin_service_request.ipynb``. Each line of the text
-file is ``<uttid>\\t<text>``; a text is sampled at random per request. Multiple
-concurrency levels can be run in sequence.
+Sends requests from ``-c`` parallel processes against POST /v1/audio/speech and
+reports throughput, time-to-first-audio (TTFA), and streaming playback metrics.
 
 Usage:
-    python benchmark_thin_service.py --text-file vctk_subset.txt -n 100 -c 8
-    python benchmark_thin_service.py --text-file lines.txt -n 50 -c 1 4 8 \\
-        --url http://localhost:8091 --output-dir ./wavs
+    python benchmark_server.py --text-file vctk_subset.txt -n 100 -c 8
+    python benchmark_server.py --text-file lines.txt -n 50 -c 1 4 8 --url http://localhost:8091
 """
 from __future__ import annotations
 
@@ -48,7 +43,6 @@ class RequestResult:
     elapsed_s: float = 0.0
     ttfa_s: float = 0.0
     error: str | None = None
-    # Arrival time (relative to request start) and playback duration of each audio chunk.
     chunk_arrivals: list[float] = field(default_factory=list)
     chunk_durations: list[float] = field(default_factory=list)
 
@@ -181,15 +175,6 @@ def _mean(vals: list[float]) -> float:
 
 
 def _playback_metrics(arrivals: list[float], durations: list[float]) -> dict:
-    """Simulate gapless playback and detect buffer underruns.
-
-    Playback starts when the first chunk arrives. An underrun occurs whenever a
-    chunk has not arrived yet by the time we finish playing everything buffered
-    so far (i.e. the player would stall waiting for it). Also reports the
-    inter-chunk gaps and the per-chunk realtime factor (playback time of a chunk
-    divided by the time it took to fetch it; >1 means we receive faster than we
-    play, so the stream is sustainable). Mirrors benchmark_service.py.
-    """
     n = len(arrivals)
     if n == 0:
         return {"chunks": 0, "underruns": 0, "gaps": [], "chunk_rtfs": []}
@@ -278,7 +263,7 @@ def _print_summary(s: dict) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Benchmark the EasyMagpieTTS thin HTTP server")
+    parser = argparse.ArgumentParser(description="Benchmark the EasyMagpieTTS HTTP server")
     parser.add_argument("--text-file", required=True, help="Path to file with '<uttid>\\t<text>' per line")
     parser.add_argument("-n", "--num-requests", type=int, required=True, help="Requests per concurrency level")
     parser.add_argument("-c", "--concurrency", type=int, nargs="+", default=[4], help="Concurrency (process) levels")
