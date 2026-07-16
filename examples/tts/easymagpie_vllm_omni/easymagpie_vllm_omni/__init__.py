@@ -19,10 +19,14 @@ __all__ = ["EASYMAGPIE_SMALLMAMBA", "EasyMagpieOmniArch"]
 
 
 def __getattr__(name: str):
-    # Lazily expose the two-stage pipeline config without importing vllm_omni
-    # (a heavy dependency) at package import time.
+    # Lazily expose pipeline configs without importing vllm_omni (a heavy
+    # dependency) at package import time.
     if name == "EASYMAGPIE_PIPELINE":
         from easymagpie_vllm_omni.pipeline import EASYMAGPIE_PIPELINE
 
         return EASYMAGPIE_PIPELINE
+    if name == "EASYMAGPIE_TALKER_ONLY_PIPELINE":
+        from easymagpie_vllm_omni.pipeline import EASYMAGPIE_TALKER_ONLY_PIPELINE
+
+        return EASYMAGPIE_TALKER_ONLY_PIPELINE
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

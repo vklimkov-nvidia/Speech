@@ -64,8 +64,9 @@ def _register_serving_adapter() -> None:
 
 
 def _register_pipeline() -> None:
-    """Register the two-stage pipeline."""
-    from easymagpie_vllm_omni.pipeline import EASYMAGPIE_PIPELINE
+    """Register the two-stage and talker-only pipelines."""
+    from easymagpie_vllm_omni.pipeline import EASYMAGPIE_PIPELINE, EASYMAGPIE_TALKER_ONLY_PIPELINE
     from vllm_omni.config.pipeline_registry import register_pipeline
 
     register_pipeline(EASYMAGPIE_PIPELINE)
+    register_pipeline(EASYMAGPIE_TALKER_ONLY_PIPELINE)

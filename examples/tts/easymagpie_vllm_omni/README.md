@@ -1,6 +1,6 @@
 ## EasyMagpieTTS — vLLM-Omni two-stage inference
 
-Streaming TTS for **EasyMagpieTTS** (Nemotron-H backbone + per-codebook local
+Streaming TTS for **NemotronTTS** (Nemotron-H backbone + per-codebook local
 transformer over a 25 fps spectral codec) via [vLLM-Omni](https://github.com/vllm-project/vllm-omni).
 
 The in-engine **two-stage pipeline** chains:
@@ -15,25 +15,49 @@ Model definition and pipeline registration live in
 [`vllm_plugin_easymagpie_omni/`](vllm_plugin_easymagpie_omni/).
 Deployment knobs are in [`deploy/easymagpie.yaml`](deploy/easymagpie.yaml).
 
-### Setup
+### Convert a NeMo checkpoint
 
-Requires **vLLM / vLLM-Omni 0.24+**, a GPU, and this package installed into that env:
+This step turns the training-time `.nemo` checkpoints into a self-contained
+vLLM-Omni model directory: a) converts the talker weights to Safetensors,
+b) precomputes the text-embedding lookup, c) saves the tokenizer and optional speaker embedding, d) exports the codec graph and weights as a NeMo-free `torch.export` artifact. Run the converter in the **NeMo environment** from the repository root:
 
 ```bash
-pip install -e examples/tts/easymagpie_vllm_omni
+python examples/tts/easymagpie_vllm_omni/scripts/convert_to_vllm.py \
+  --nemo_file /path/to/emptts.nemo \
+  --codec_model_path /path/to/25fps_spectral_codec.nemo \
+  --phoneme_tokenizer_path /path/to/bpe_ipa_tokenizer.json \
+  --outdir examples/tts/easymagpie_vllm_omni/converted_model \
+  --context_audio /path/to/reference_voice.wav \
+  --speaker_name eng
+```
+
+### Setup the serving environment
+
+Create a separate, clean environment for inference. It needs a GPU,
+matching **vLLM 0.24 / vLLM-Omni 0.24** versions, and this package. It does not
+need NeMo when using the default exported codec bundle:
+
+```bash
+cd examples/tts/easymagpie_vllm_omni
+conda create -n easymagpie-vllm python=3.12 -y
+conda activate easymagpie-vllm
+pip install -r requirements.txt
+pip install -e .
+# optionally for notebook
+pip install ipykernel
+python -m ipykernel install --user \
+  --name easymagpie-vllm \
+  --display-name "Python (easymagpie-vllm)"
 ```
 
 ### Quick start — offline synthesis
 
-Open [`scripts/offline_demo.ipynb`](scripts/offline_demo.ipynb).
-Set `MODEL_PATH` to a converted checkpoint. The notebook runs both stages in
-one `AsyncOmni` engine, writes `out.wav`, and plays it.
+Run [`scripts/offline_demo.ipynb`](scripts/offline_demo.ipynb) to check how `AsyncOmni` is initialized and used.
 
 ### Serve over HTTP
 
 ```bash
-cd examples/tts/easymagpie_vllm_omni/scripts
-./run_server.sh /path/to/converted-model 8091
+bash ./scripts/run_server.sh ./converted_model 8091
 ```
 
 This starts `vllm serve` with the EasyMagpie plugin on port 8091.
@@ -42,37 +66,20 @@ Query it from any OpenAI-compatible client:
 ```bash
 curl -X POST http://localhost:8091/v1/audio/speech \
   -H 'Content-Type: application/json' \
-  -d '{"input":"Hello world.","voice":"eng","response_format":"pcm","stream":true,"stream_format":"audio"}' \
-  --output out.pcm
+  -d '{"input":"This is a TTS service test.","voice":"eng","response_format":"wav","stream":true,"stream_format":"audio"}' \
+  --output out.wav
 ```
 
-### Benchmark
+### Benchmarks
+
+Benchmark running service:
 
 ```bash
-python scripts/benchmark_server.py --text-file vctk_subset.txt -n 100 -c 8
+python scripts/benchmark_server.py --text-file vctk_subset.txt -n 128 -c 1 32
 ```
 
-Text file format: `<uttid>\t<text>` per line. Reports req/s, TTFA, inter-chunk
-latency, and playback underrun rate.
-
-### Tests
+Benchmark acoustic tokens prediction only (no codec)
 
 ```bash
-pytest examples/tts/easymagpie_vllm_omni/tests -v
-```
-
-Unit tests cover config math, local-transformer parity, audio-output parsing,
-and the HTTP benchmark client. No GPU or model directory required for most tests.
-
-### Layout
-
-```
-easymagpie_vllm_omni/          # model + pipeline + codec stage
-vllm_plugin_easymagpie_omni/   # vLLM plugin entry point
-deploy/easymagpie.yaml         # two-stage deploy config
-scripts/
-  offline_demo.ipynb           # offline synthesis demo
-  run_server.sh                # HTTP server
-  benchmark_server.py          # throughput / latency benchmark
-tests/                         # unit tests
+python scripts/benchmark_model.py --model ./converted_model -n 128 -c 1 32
 ```

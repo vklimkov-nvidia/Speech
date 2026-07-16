@@ -11,10 +11,15 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Two-stage EasyMagpieTTS pipeline from text to acoustic codes to audio.
+"""EasyMagpieTTS pipeline topologies for vLLM-Omni.
 
 The talker reports the generic ``model_type="nemotron_h"``, so routing uses its
-HF architecture or an explicit ``pipeline: easymagpie`` deployment setting.
+HF architecture or an explicit ``pipeline: …`` deployment setting.
+
+* :data:`EASYMAGPIE_PIPELINE` — two-stage text → acoustic codes → waveform.
+* :data:`EASYMAGPIE_TALKER_ONLY_PIPELINE` — single-stage acoustic-token
+  prediction only (no in-engine Code2Wav). Use this to benchmark and develop
+  the talker in isolation; select it with ``pipeline: easymagpie_talker``.
 """
 from vllm_omni.config.stage_config import PipelineConfig, StageExecutionType, StagePipelineConfig
 
@@ -59,6 +64,32 @@ EASYMAGPIE_PIPELINE = PipelineConfig(
             # Sync mode uses a length-only prompt; the connector carries codec data.
             sync_process_input_func=f"{_PROC}.talker2code2wav_token_only",
             sampling_constraints={"detokenize": True},
+        ),
+    ),
+)
+
+EASYMAGPIE_TALKER_ONLY_PIPELINE = PipelineConfig(
+    model_type="easymagpie_talker",
+    model_arch="EasyMagpieTTSForConditionalGeneration",
+    hf_architectures=(
+        "EasyMagpieTTSForConditionalGeneration",
+        "EasyMagpieTTS",
+    ),
+    stages=(
+        StagePipelineConfig(
+            stage_id=0,
+            model_stage="easymagpie",
+            execution_type=StageExecutionType.LLM_AR,
+            input_sources=(),
+            owns_tokenizer=True,
+            final_output=True,
+            final_output_type="latent",
+            engine_output_type="latent",
+            scheduler_cls="easymagpie_vllm_omni.scheduler.EasyMagpieARAsyncScheduler",
+            sampling_constraints={
+                "detokenize": False,
+                "stop_token_ids": [_AUDIO_EOS_STOP_TOKEN_ID],
+            },
         ),
     ),
 )

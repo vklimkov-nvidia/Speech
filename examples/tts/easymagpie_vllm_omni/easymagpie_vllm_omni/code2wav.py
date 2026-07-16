@@ -490,7 +490,7 @@ class EasyMagpieCode2Wav(nn.Module):
         if legacy_cfg is not None:
             raise RuntimeError(
                 "This model contains the removed hand-implemented codec bundle. Re-run "
-                "easy_magpietts_convert_to_vllm.py to generate codec/codec_decoder.pt2, "
+                "convert_to_vllm.py to generate codec/codec_decoder.pt2, "
                 "or convert with --codec_bundle_mode nemo."
             )
         logger.info("EasyMagpie Code2Wav: no exported codec found; falling back to bundled codec.nemo.")
@@ -592,7 +592,7 @@ class EasyMagpieCode2Wav(nn.Module):
         if resolved is None:
             raise FileNotFoundError(
                 "EasyMagpieCode2Wav could not locate the codec .nemo. Re-run "
-                "scripts/easy_magpietts_convert_to_vllm.py (which bundles the codec under "
+                "scripts/convert_to_vllm.py (which bundles the codec under "
                 "<model>/codec/), or set `codec_model_path` in the model's config.json."
             )
         return resolved

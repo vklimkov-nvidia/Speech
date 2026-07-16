@@ -34,7 +34,7 @@ stages:
     async_scheduling: true
     enable_prefix_caching: false
     enable_chunked_prefill: true
-    max_num_batched_tokens: 512
+    max_num_batched_tokens: 4096
     max_model_len: 4096
     devices: "0"
     output_connectors:
