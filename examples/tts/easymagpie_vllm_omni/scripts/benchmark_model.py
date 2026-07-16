@@ -67,6 +67,10 @@ CONTEXT_TEXT = "[EN]"
 LT_TEMPERATURE = 0.7  # audio (local-transformer) sampling temperature
 LT_TOPK = 80  # audio sampling top-k
 CODEC_FRAME_RATE = 25.0  # Hz, used to convert decoded frames -> audio seconds (RTF)
+# Max time to wait for a streaming segment's output frames before sending the
+# next input chunk. Async scheduling can drop a frame at a segment boundary, so
+# this bounds the pacing wait to avoid deadlocking a request.
+PACE_TIMEOUT_S = 2.0
 GPU_MEMORY_UTILIZATION = 0.5
 DISTRIBUTED_EXECUTOR_BACKEND = "uni"
 ENFORCE_EAGER = False
@@ -175,10 +179,9 @@ def _load_model_meta(
     use_spkr_emb: bool = False,
 ) -> ModelMeta:
     import torch
-    from transformers import AutoTokenizer
-
     from easymagpie_vllm_omni.config import EasyMagpieOmniArch
     from easymagpie_vllm_omni.easymagpie import EasyMagpieTTSForConditionalGeneration
+    from transformers import AutoTokenizer
 
     model_path = Path(model_dir)
     config = json.loads((model_path / "config.json").read_text())
@@ -443,9 +446,7 @@ def _clone_sampling_params(sampling_params, max_tokens: int):
     return sp
 
 
-def build_streaming_request(
-    text: str, meta: ModelMeta, stream_params, max_new_tokens: int, tokens_per_chunk: int = 1
-):
+def build_streaming_request(text: str, meta: ModelMeta, stream_params, max_new_tokens: int, tokens_per_chunk: int = 1):
     try:
         from vllm.engine.protocol import StreamingInput
     except ImportError:
@@ -464,6 +465,18 @@ def build_streaming_request(
     tail_params = _clone_sampling_params(stream_params, max_new_tokens - len(text_ids))
     go_queue: asyncio.Queue = asyncio.Queue()
 
+    async def _drain(k):
+        # Pace the next chunk on the previous segment's output frames. Under
+        # async scheduling vLLM-Omni may emit fewer frames than a segment's
+        # ``max_tokens`` (in-flight tokens are discarded at a segment boundary),
+        # so bound the wait: if the frames do not arrive we proceed rather than
+        # deadlock the request.
+        for _ in range(k):
+            try:
+                await asyncio.wait_for(go_queue.get(), timeout=PACE_TIMEOUT_S)
+            except asyncio.TimeoutError:
+                break
+
     async def inputs():
         yield StreamingInput(
             prompt={"prompt_token_ids": [0] * meta.prompt_len, "additional_information": prefill_info},
@@ -471,8 +484,7 @@ def build_streaming_request(
         )
         prev_frames = 1
         for chunk in chunks:
-            for _ in range(prev_frames):
-                await go_queue.get()
+            await _drain(prev_frames)
             params = chunk_params if len(chunk) == n else _clone_sampling_params(stream_params, len(chunk))
             yield StreamingInput(
                 prompt={
@@ -482,8 +494,7 @@ def build_streaming_request(
                 sampling_params=params,
             )
             prev_frames = len(chunk)
-        for _ in range(prev_frames):
-            await go_queue.get()
+        await _drain(prev_frames)
         yield StreamingInput(
             prompt={"prompt_token_ids": [0], "additional_information": {"text_token": []}},
             sampling_params=tail_params,
@@ -528,9 +539,7 @@ async def worker(
         request_id = f"bench-easymp-w{worker_id}-{uuid.uuid4().hex[:8]}"
 
         if streaming:
-            inputs, pace = build_streaming_request(
-                text, meta, stream_params, max_new_tokens, tokens_per_chunk
-            )
+            inputs, pace = build_streaming_request(text, meta, stream_params, max_new_tokens, tokens_per_chunk)
             result = await run_one_request(
                 omni,
                 inputs,
@@ -566,7 +575,9 @@ async def worker(
 # ---------------------------------------------------------------------------
 
 
-def compute_and_print_metrics(results: list, duration: float, concurrency: int, print_request_stats: bool = False) -> dict:
+def compute_and_print_metrics(
+    results: list, duration: float, concurrency: int, print_request_stats: bool = False
+) -> dict:
     ok = [r for r in results if r.success]
     failed = [r for r in results if not r.success]
 
@@ -574,8 +585,7 @@ def compute_and_print_metrics(results: list, duration: float, concurrency: int, 
     itls = [t * 1000 for r in ok for t in r.inter_token_latencies]
     total_audio_s = sum(r.audio_s for r in ok)
     eos_hits = sum(1 for r in ok if r.eos_reached)
-    generated_tokens = [r.generated_tokens for r in ok]
-    audio_durations = [r.audio_s for r in ok]
+    produced_frames = [r.audio_frames for r in ok]
 
     summary = {
         "concurrency": concurrency,
@@ -589,10 +599,7 @@ def compute_and_print_metrics(results: list, duration: float, concurrency: int, 
         "itl_mean_ms": float(np.mean(itls)) if itls else 0.0,
         "itl_p95_ms": float(np.percentile(itls, 95)) if itls else 0.0,
         "rtf": total_audio_s / duration if duration > 0 else 0.0,
-        "generated_tokens_mean": float(np.mean(generated_tokens)) if generated_tokens else 0.0,
-        "generated_tokens_p95": float(np.percentile(generated_tokens, 95)) if generated_tokens else 0.0,
-        "audio_s_mean": float(np.mean(audio_durations)) if audio_durations else 0.0,
-        "audio_s_p95": float(np.percentile(audio_durations, 95)) if audio_durations else 0.0,
+        "frames_per_utterance": float(np.mean(produced_frames)) if produced_frames else 0.0,
     }
 
     W = 48
@@ -610,11 +617,7 @@ def compute_and_print_metrics(results: list, duration: float, concurrency: int, 
     print(f"{'Throughput (req/s):':<28}{summary['req_per_s']:.2f}")
     print(f"{'TTFT mean / p95 (ms):':<28}{summary['ttft_mean_ms']:.2f} / {summary['ttft_p95_ms']:.2f}")
     print(f"{'ITL  mean / p95 (ms):':<28}{summary['itl_mean_ms']:.2f} / {summary['itl_p95_ms']:.2f}")
-    print(
-        f"{'Generated tokens mean/p95:':<28}"
-        f"{summary['generated_tokens_mean']:.1f} / {summary['generated_tokens_p95']:.1f}"
-    )
-    print(f"{'Est. audio mean / p95 (s):':<28}{summary['audio_s_mean']:.2f} / {summary['audio_s_p95']:.2f}")
+    print(f"{'Produced frames / utterance:':<28}{summary['frames_per_utterance']:.1f}")
     print(f"{'RTF (audio_s / wall):':<28}{summary['rtf']:.2f}x")
     print(f"{'=' * W}\n")
     if print_request_stats:
@@ -682,9 +685,20 @@ async def _run_workers(
     tasks = [
         asyncio.create_task(
             worker(
-                i, omni, texts, text_token_counts, meta, sampling_params, stream_params,
-                args.streaming, bool(args.audio_codes_dir), args.max_new_tokens, args.tokens_per_chunk,
-                results, counter, lock,
+                i,
+                omni,
+                texts,
+                text_token_counts,
+                meta,
+                sampling_params,
+                stream_params,
+                args.streaming,
+                bool(args.audio_codes_dir),
+                args.max_new_tokens,
+                args.tokens_per_chunk,
+                results,
+                counter,
+                lock,
             )
         )
         for i in range(concurrency)
@@ -729,7 +743,10 @@ async def main(args):
     )
     logger.info(
         "prompt_len=%d  audio_eos_id=%d  speech_delay=%d  frame_stacking=%d",
-        meta.prompt_len, meta.audio_eos_id, meta.speech_delay, meta.frame_stacking_factor,
+        meta.prompt_len,
+        meta.audio_eos_id,
+        meta.speech_delay,
+        meta.frame_stacking_factor,
     )
     if meta.prompt_len + args.max_new_tokens > args.max_model_len:
         logger.warning("prompt_len + max_new_tokens exceeds max_model_len (%d)", args.max_model_len)
@@ -852,7 +869,9 @@ def parse_args():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
-    parser.add_argument("--model", type=str, default="./converted_model_multiturn", help="Converted EasyMagpie model dir")
+    parser.add_argument(
+        "--model", type=str, default="./converted_model_multiturn", help="Converted EasyMagpie model dir"
+    )
     parser.add_argument(
         "--deploy-config",
         type=str,
