@@ -88,6 +88,12 @@ class EasyMagpieTTSForConditionalGeneration(
     has_postprocess: bool = True
     have_multimodal_outputs: bool = True
 
+    # Stage 1 (Code2Wav) consumes only the sampled codes (multimodal outputs),
+    # never the backbone hidden states. Opt out of attaching ``hidden`` to the
+    # inter-stage pooler payload so the runner skips the per-step D2H copy +
+    # transport of hidden states (the default is True and would pass them).
+    omni_pooler_payload_include_hidden: bool = False
+
     # Keep small per-step tensors GPU-resident across steps (no D2H/H2D).
     gpu_resident_buffer_keys: set[str] = {
         "last_audio_codes",
