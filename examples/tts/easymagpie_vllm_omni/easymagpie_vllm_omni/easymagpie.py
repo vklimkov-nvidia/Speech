@@ -108,6 +108,21 @@ class EasyMagpieTTSForConditionalGeneration(
         self.embedding_dim = arch.embedding_dim
         self.num_codebooks = arch.num_stacked_codebooks
 
+        # How to surface sampled acoustic codes from ``make_omni_output``, driven
+        # by the stage's pipeline-config ``engine_output_type``:
+        #
+        # * "audio" (single-stage talker that is also the *final*, client-facing
+        #   stage): emit under the ``model_outputs`` key. vLLM-Omni's output
+        #   processor remaps ``model_outputs`` -> the drainable ``audio`` modality
+        #   key, so DELTA streaming DRAINS the codes every step (the client gets
+        #   per-step deltas) instead of re-accumulating and re-sending the whole
+        #   cumulative code tensor on every step.
+        # * otherwise (two-stage talker; ``engine_output_type="latent"``): emit
+        #   the inter-stage keys (``audio_codes`` + nested ``codes.audio``) that
+        #   the Code2Wav connector / async-chunk streamer consume.
+        engine_output_type = getattr(vllm_config.model_config, "engine_output_type", None)
+        self._single_stage_audio = str(engine_output_type or "").lower() == "audio"
+
         # ── Backbone (reused vLLM Nemotron-H LM; fed via inputs_embeds) ──
         self.backbone = NemotronHModel(
             vllm_config=vllm_config,
@@ -523,6 +538,15 @@ class EasyMagpieTTSForConditionalGeneration(
         hidden = model_outputs
         num_tokens = int(hidden.shape[0])
         audio_codes = self._out_codes[:num_tokens].clone()
+        if self._single_stage_audio:
+            # Drainable client key (see ``self._single_stage_audio`` in __init__):
+            # ``model_outputs`` is remapped to the ``audio`` modality and drained
+            # per step, so the client streams true deltas rather than a growing
+            # cumulative payload. ``postprocess`` also reads this key.
+            return OmniOutput(
+                text_hidden_states=hidden,
+                multimodal_outputs={"model_outputs": audio_codes},
+            )
         return OmniOutput(
             text_hidden_states=hidden,
             multimodal_outputs={"audio_codes": audio_codes, "codes": {"audio": audio_codes}},
@@ -984,7 +1008,19 @@ class EasyMagpieTTSForConditionalGeneration(
         last = req_start + hidden_states.shape[0] - 1
 
         out: dict[str, Any] = {}
-        audio_codes = (multimodal_outputs or {}).get("audio_codes")
+        mm = multimodal_outputs or {}
+        # The codes key depends on the emission mode (see make_omni_output):
+        # single-stage uses "model_outputs", two-stage uses "audio_codes" /
+        # nested "codes.audio". Read whichever is present.
+        audio_codes = mm.get("audio_codes")
+        if audio_codes is None:
+            audio_codes = mm.get("model_outputs")
+        if audio_codes is None:
+            codes = mm.get("codes")
+            if isinstance(codes, dict):
+                audio_codes = codes.get("audio")
+            elif "codes.audio" in mm:
+                audio_codes = mm.get("codes.audio")
         if isinstance(audio_codes, torch.Tensor) and audio_codes.numel() > 0:
             out["last_audio_codes"] = audio_codes[last : last + 1].detach()
         if self.has_phoneme:

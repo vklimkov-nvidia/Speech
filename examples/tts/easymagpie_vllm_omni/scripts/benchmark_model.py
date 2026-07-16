@@ -272,8 +272,19 @@ def _extract_request_output(stage_output):
     return getattr(stage_output, "request_output", stage_output)
 
 
-def _extract_cumulative_audio_codes(stage_output):
-    """Find and reduce an audio-code payload to one cumulative ``[T, Q]`` tensor."""
+def _extract_step_audio_codes(stage_output):
+    """Find this step's audio-code payload as one ``[T, Q]`` delta tensor.
+
+    The single-stage talker emits its codes under the ``model_outputs`` key,
+    which vLLM-Omni remaps to the drainable ``audio`` modality; in DELTA mode
+    that key is drained every step, so each per-step snapshot carries only the
+    codes produced this step (a delta), NOT the cumulative sequence. Callers
+    accumulate these deltas in a list and concatenate once to reconstruct the
+    full ``[prompt_len + generated, Q]`` tensor — no per-step growth on the wire.
+
+    The ``codes.audio`` / ``audio_codes`` keys are read only as a fallback for
+    non-drainable configs.
+    """
     import torch
 
     def reduce_payload(payload):
@@ -294,17 +305,17 @@ def _extract_cumulative_audio_codes(stage_output):
 
         multimodal_output = getattr(output, "multimodal_output", None)
         if isinstance(multimodal_output, Mapping):
-            payload = multimodal_output.get("audio_codes")
+            # Drainable single-stage key (remapped from "model_outputs"), then
+            # the non-drainable inter-stage keys as a fallback.
+            payload = multimodal_output.get("audio")
+            if payload is None:
+                payload = multimodal_output.get("model_outputs")
+            if payload is None:
+                payload = multimodal_output.get("audio_codes")
             if payload is None:
                 nested_codes = multimodal_output.get("codes")
                 if isinstance(nested_codes, Mapping):
                     payload = nested_codes.get("audio")
-            if payload is None:
-                payload = multimodal_output.get("model_outputs")
-            if payload is None:
-                payload = multimodal_output.get("latent")
-            if payload is None:
-                payload = multimodal_output.get("latents")
             codes = reduce_payload(payload)
             if codes is not None:
                 return codes
@@ -338,6 +349,9 @@ class StepMeter:
         self._t_last = None
         self._prev_tokens = 0
         self._finish_reason = None
+        # Per-step code deltas, concatenated once in finalize() (never per step,
+        # so measurement is not polluted by O(n^2) accumulation/serialization).
+        self._code_chunks: list = []
 
     def observe(self, stage_output) -> None:
         now = time.perf_counter()
@@ -351,11 +365,9 @@ class StepMeter:
         if fr is not None:
             self._finish_reason = fr
         if self.capture_audio_codes:
-            audio_codes = _extract_cumulative_audio_codes(stage_output)
-            if audio_codes is not None and (
-                self.result.audio_codes is None or audio_codes.shape[0] > self.result.audio_codes.shape[0]
-            ):
-                self.result.audio_codes = audio_codes
+            audio_codes = _extract_step_audio_codes(stage_output)
+            if audio_codes is not None and audio_codes.numel() > 0:
+                self._code_chunks.append(audio_codes.detach().cpu())
         cum = getattr(out0, "cumulative_token_ids", None)
         cur = len(cum) if cum is not None else self._prev_tokens + len(getattr(out0, "token_ids", []) or [])
         if cur <= self._prev_tokens:
@@ -379,6 +391,10 @@ class StepMeter:
         audio_frames = max(0, self._prev_tokens - self.meta.speech_delay)
         self.result.audio_frames = audio_frames
         self.result.audio_s = audio_frames * self.meta.frame_stacking_factor / CODEC_FRAME_RATE
+        if self.capture_audio_codes and self._code_chunks:
+            import torch
+
+            self.result.audio_codes = torch.cat(self._code_chunks, dim=0)
         return self.result
 
     def mark_error(self, exc) -> RequestResult:
@@ -678,11 +694,6 @@ async def _run_workers(
 
 
 async def main(args):
-    if args.audio_codes_dir:
-        # Worker processes inherit this and expose terminal talker codes through
-        # vLLM-Omni's client-facing ``model_outputs`` multimodal key.
-        os.environ["EASYMAGPIE_RETURN_AUDIO_CODES"] = "1"
-
     import vllm_plugin_easymagpie_omni
 
     vllm_plugin_easymagpie_omni.register()
@@ -812,6 +823,9 @@ async def main(args):
             duration = time.perf_counter() - start
 
             summaries.append(compute_and_print_metrics(results, duration, concurrency, args.print_request_stats))
+
+            if args.audio_codes_dir:
+                save_audio_codes(results, args.audio_codes_dir, meta, concurrency)
 
         print(f"\n{'=' * 56}")
         print(f"{'Summary':^56}")

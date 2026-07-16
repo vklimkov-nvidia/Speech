@@ -83,8 +83,20 @@ EASYMAGPIE_TALKER_ONLY_PIPELINE = PipelineConfig(
             input_sources=(),
             owns_tokenizer=True,
             final_output=True,
-            final_output_type="latent",
-            engine_output_type="latent",
+            # A single stage that is *also* the final stage needs
+            # ``engine_output_type="audio"`` for two reasons:
+            #  1. vLLM-Omni's AR runner force-includes single-stage requests in
+            #     the client pooler payload only for ``engine_output_type ==
+            #     "audio"`` (see GPUARModelRunner._resolve_pooler_payload_req_ids).
+            #     With "latent" there is no downstream stage to consume the codes
+            #     and no client payload is built, so the codes get filtered out.
+            #  2. It drives the output modality to "audio", so the model's
+            #     ``model_outputs`` codes key (see EasyMagpieTTS.make_omni_output,
+            #     which keys off engine_output_type) is remapped to the DRAINABLE
+            #     ``audio`` modality — the client then streams per-step code
+            #     deltas instead of a growing cumulative payload every step.
+            final_output_type="audio",
+            engine_output_type="audio",
             scheduler_cls="easymagpie_vllm_omni.scheduler.EasyMagpieARAsyncScheduler",
             sampling_constraints={
                 "detokenize": False,
