@@ -21,6 +21,62 @@ from easymagpie_vllm_omni.scheduler import EasyMagpieARAsyncScheduler
 from vllm_omni.core.sched.omni_ar_scheduler import OmniARAsyncScheduler
 
 
+def test_no_stop_is_inert_for_non_resumable_requests(monkeypatch):
+    """A plain HTTP request never hits a segment stop, so the override must pass
+    ``super()`` through unchanged and leave request accounting untouched."""
+    scheduler = object.__new__(EasyMagpieARAsyncScheduler)
+    request = SimpleNamespace(
+        async_tokens_to_discard=0,
+        num_computed_tokens=20,
+        num_output_placeholders=0,
+    )
+
+    def fake_update_request_with_output(self, req, new_token_ids):
+        return new_token_ids, False  # no stop this step
+
+    def fake_update_from_output(self, scheduler_output, model_runner_output):
+        self._update_request_with_output(request, [7])
+        return "outputs"
+
+    monkeypatch.setattr(OmniARAsyncScheduler, "_update_request_with_output", fake_update_request_with_output)
+    monkeypatch.setattr(OmniARAsyncScheduler, "update_from_output", fake_update_from_output)
+
+    outputs = scheduler.update_from_output(None, None)
+
+    assert outputs == "outputs"
+    assert request.async_tokens_to_discard == 0
+    assert request.num_computed_tokens == 20
+    assert request.num_output_placeholders == 0
+
+
+def test_terminal_stop_without_discard_is_inert(monkeypatch):
+    """HTTP requests end on a normal audio-EOS stop (not a resumable segment
+    stop), so omni arms no discard and the override must not roll anything back."""
+    scheduler = object.__new__(EasyMagpieARAsyncScheduler)
+    request = SimpleNamespace(
+        async_tokens_to_discard=0,
+        num_computed_tokens=20,
+        num_output_placeholders=0,
+    )
+
+    def fake_update_request_with_output(self, req, new_token_ids):
+        req.num_output_placeholders = 0  # terminal stop, nothing else in flight
+        return new_token_ids, True
+
+    def fake_update_from_output(self, scheduler_output, model_runner_output):
+        self._update_request_with_output(request, [7])
+        return "outputs"  # omni does not arm a discard for a terminal stop
+
+    monkeypatch.setattr(OmniARAsyncScheduler, "_update_request_with_output", fake_update_request_with_output)
+    monkeypatch.setattr(OmniARAsyncScheduler, "update_from_output", fake_update_from_output)
+
+    outputs = scheduler.update_from_output(None, None)
+
+    assert outputs == "outputs"
+    assert request.async_tokens_to_discard == 0
+    assert request.num_computed_tokens == 20
+
+
 @pytest.mark.parametrize("remaining_placeholders", [0, 1, 2])
 def test_segment_stop_discards_and_rolls_back_exact_inflight_count(monkeypatch, remaining_placeholders):
     scheduler = object.__new__(EasyMagpieARAsyncScheduler)

@@ -44,7 +44,20 @@ EASYMAGPIE_PIPELINE = PipelineConfig(
             execution_type=StageExecutionType.LLM_AR,
             input_sources=(),
             owns_tokenizer=True,
+            # Surface stage 0 as a (latent) final output so incremental WebSocket
+            # requests can pace their next text chunk against the acoustic frames
+            # already produced. This is safe for the plain /v1/audio/speech path:
+            # in two-stage (latent) mode stage-0 codes are emitted under the
+            # ``audio_codes``/``codes`` keys (see EasyMagpieTTS.make_omni_output),
+            # which the HTTP handler's ``_extract_audio_output`` does not treat as
+            # audio (it only keys on ``audio``/``model_outputs``), so those deltas
+            # are skipped and only the stage-1 waveform is returned.
+            final_output=True,
+            final_output_type="latent",
             engine_output_type="latent",
+            # Resumable/segment-stop scheduling for paced streaming; a no-op for
+            # non-resumable single-shot HTTP requests.
+            scheduler_cls="easymagpie_vllm_omni.scheduler.EasyMagpieARAsyncScheduler",
             async_chunk_process_next_stage_input_func=f"{_PROC}.talker2code2wav_async_chunk",
             custom_process_next_stage_input_func=f"{_PROC}.talker2code2wav_full_payload",
             sampling_constraints={

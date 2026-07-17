@@ -14,7 +14,10 @@
 """``/v1/audio/speech`` support for EasyMagpieTTS on vLLM-Omni 0.24+."""
 from __future__ import annotations
 
+import json
 import logging
+from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable
 
 logger = logging.getLogger(__name__)
@@ -29,8 +32,22 @@ _DEFAULT_CONTEXT_TEXT = "[EN]"
 _DEFAULT_TEMPERATURE = 0.7
 _DEFAULT_TOP_K = 80
 
+# Text-stream EOS is the last-but-one row of the text vocab, mirroring
+# EasyMagpieTTS.text_eos_id / the reference model's ``eos_id = num_tokens - 2``.
+_TEXT_EOS_OFFSET_FROM_VOCAB = 2
+
 if TYPE_CHECKING:
     from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
+
+
+@dataclass(frozen=True)
+class EasyMagpieStreamingSpec:
+    """Model metadata needed by the incremental WebSocket input stream."""
+
+    prefill_prompt: dict[str, Any]
+    tokenizer: Any
+    text_eos_id: int
+    sample_rate: int
 
 
 def _build_adapter_cls() -> type:
@@ -72,6 +89,10 @@ def _build_adapter_cls() -> type:
 
                 self._tokenizer = AutoTokenizer.from_pretrained(self._model_path(), trust_remote_code=True)
             return lambda text: self._tokenizer.encode(text)
+
+        def _model_tokenizer(self):
+            self._tokenize()
+            return self._tokenizer
 
         def _prompt_len(self, speaker_id: str) -> int:
             cached = self._prompt_len_cache.get(speaker_id)
@@ -116,6 +137,36 @@ def _build_adapter_cls() -> type:
             }
             return PreparedRequest(prompt=prompt, tts_params={}, model_type=MODEL_TYPE)
 
+        def build_streaming_spec(self, request: "OpenAICreateSpeechRequest") -> EasyMagpieStreamingSpec:
+            """Build the speaker prefill and tokenizer metadata without complete text."""
+            speaker_id = (request.voice or _DEFAULT_SPEAKER).strip()
+            model_path = Path(self._model_path())
+            config = json.loads((model_path / "config.json").read_text())
+            text_vocab_size = int(config.get("text_vocab_size", config.get("vocab_size", 0)))
+            if text_vocab_size <= _TEXT_EOS_OFFSET_FROM_VOCAB:
+                raise ValueError("EasyMagpie config must define text_vocab_size")
+
+            sample_rate = 22050
+            codec_export = model_path / "codec" / "codec_export.json"
+            if codec_export.exists():
+                codec_config = json.loads(codec_export.read_text())
+                sample_rate = int(codec_config.get("output_sample_rate", sample_rate))
+
+            return EasyMagpieStreamingSpec(
+                prefill_prompt={
+                    "prompt_token_ids": [0] * self._prompt_len(speaker_id),
+                    "additional_information": {
+                        "context_text": _DEFAULT_CONTEXT_TEXT,
+                        "temperature": _DEFAULT_TEMPERATURE,
+                        "top_k": _DEFAULT_TOP_K,
+                        "speaker_id": speaker_id,
+                    },
+                },
+                tokenizer=self._model_tokenizer(),
+                text_eos_id=text_vocab_size - _TEXT_EOS_OFFSET_FROM_VOCAB,
+                sample_rate=sample_rate,
+            )
+
     return EasyMagpieTTSAdapter
 
 
@@ -151,6 +202,14 @@ def _patch_detection() -> None:
     ss.OmniOpenAIServingSpeech._detect_tts_model_type = _detect_tts_model_type
 
 
+def _patch_streaming_handler() -> None:
+    """Select the EasyMagpie-aware handler when API state is initialized."""
+    from easymagpie_vllm_omni.serving_stream import EasyMagpieStreamingSpeechHandler
+    from vllm_omni.entrypoints.openai import api_server
+
+    api_server.OmniStreamingSpeechHandler = EasyMagpieStreamingSpeechHandler
+
+
 def apply_serving_patches(force: bool = False) -> None:
     """Install speech support in the API-server process."""
     import sys
@@ -160,6 +219,10 @@ def apply_serving_patches(force: bool = False) -> None:
     try:
         _patch_detection()
         _register_adapter()
-        logger.info("EasyMagpie: /v1/audio/speech serving adapter registered (model_type=%r).", MODEL_TYPE)
+        _patch_streaming_handler()
+        logger.info(
+            "EasyMagpie: /v1/audio/speech and /v1/audio/speech/stream serving registered (model_type=%r).",
+            MODEL_TYPE,
+        )
     except Exception:  # never let a serving-layer change break model/pipeline loading
         logger.exception("EasyMagpie: failed to install /v1/audio/speech serving support.")

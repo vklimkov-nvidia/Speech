@@ -54,14 +54,20 @@ python -m ipykernel install --user \
 
 Run [`scripts/offline_demo.ipynb`](scripts/offline_demo.ipynb) to check how `AsyncOmni` is initialized and used.
 
-### Serve over HTTP
+### Serve over HTTP and WebSocket
 
 ```bash
 bash ./scripts/run_server.sh ./converted_model 8091
 ```
 
-This starts `vllm serve` with the EasyMagpie plugin on port 8091.
-Query it from any OpenAI-compatible client:
+This starts `vllm serve` with the EasyMagpie plugin on port 8091. Two serving
+APIs are available:
+
+- `POST /v1/audio/speech` with a complete text input.
+- `WS /v1/audio/speech/stream` with incremental text/token updates and
+  asynchronous PCM audio output.
+
+Query the HTTP endpoint from any OpenAI-compatible client:
 
 ```bash
 curl -X POST http://localhost:8091/v1/audio/speech \
@@ -69,6 +75,9 @@ curl -X POST http://localhost:8091/v1/audio/speech \
   -d '{"input":"This is a TTS service test.","voice":"eng","response_format":"wav","stream":true,"stream_format":"audio"}' \
   --output out.wav
 ```
+
+Run [`scripts/server_request.ipynb`](scripts/server_request.ipynb) for examples
+of both serving APIs.
 
 ### Benchmarks
 

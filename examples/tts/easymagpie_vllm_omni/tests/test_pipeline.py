@@ -31,8 +31,8 @@ def test_talker_only_pipeline_is_single_stage():
     assert stage.stage_id == 0
     assert stage.model_stage == "easymagpie"
     assert stage.final_output is True
-    assert stage.final_output_type == "latent"
-    assert stage.engine_output_type == "latent"
+    assert stage.final_output_type == "audio"
+    assert stage.engine_output_type == "audio"
     assert stage.custom_process_next_stage_input_func is None
     assert stage.async_chunk_process_next_stage_input_func is None
 
