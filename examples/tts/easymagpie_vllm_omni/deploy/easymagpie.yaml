@@ -16,13 +16,15 @@ connectors:
       connector_get_sleep_s: 0.01
       connector_get_max_wait_first_chunk: 3000
       connector_get_max_wait: 300
-      # Windows contain 3 new frames plus 12 frames of left context. Stage 1
-      # trims the context and right-padding after decoding.
-      codec_chunk_frames: 3
-      codec_left_context_frames: 12
-      initial_codec_chunk_frames: 1
-      codec_fixed_chunk_frames: 15
-      decode_cudagraph_capture_frames: [15]
+      # The causal decoder's measured receptive field is 0.854 s: 11 stacked
+      # (80 ms) past frames. The 19-frame export therefore permits 8 new frames
+      # per steady chunk. Start with 17 frames (1.36 s audio) to absorb scheduling
+      # jitter; all decodes retain one fixed shape and trim context/right-padding.
+      codec_chunk_frames: 8
+      codec_left_context_frames: 11
+      codec_startup_chunk_frames: [17]
+      codec_fixed_chunk_frames: 19
+      decode_cudagraph_capture_frames: [19]
       decode_cudagraph_batch_sizes: [1, 2, 4, 8, 16, 32]
 
 stages:
@@ -55,8 +57,8 @@ stages:
     # Codec graph replays share static buffers and must not overlap.
     async_scheduling: false
     enable_prefix_caching: false
-    # 32 sequences × 16 codebooks × 15 frames require at least 7680 tokens.
-    max_num_batched_tokens: 8192
+    # 32 sequences × 16 codebooks × 19 frames require at least 9728 tokens.
+    max_num_batched_tokens: 10240
     max_model_len: 512
     devices: "0"
     input_connectors:

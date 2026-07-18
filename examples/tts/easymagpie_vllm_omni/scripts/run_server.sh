@@ -6,7 +6,7 @@ MODEL="${1:?Usage: run_server.sh <model_dir> [port]}"
 PORT="${2:-8091}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-DEPLOY_CONFIG="${SCRIPT_DIR}/../deploy/easymagpie.yaml"
+DEPLOY_CONFIG="${EASYMAGPIE_DEPLOY_CONFIG:-${SCRIPT_DIR}/../deploy/easymagpie.yaml}"
 
 echo "Starting EasyMagpieTTS: model=${MODEL} deploy=${DEPLOY_CONFIG} port=${PORT}"
 

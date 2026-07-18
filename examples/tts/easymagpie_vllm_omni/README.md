@@ -87,6 +87,20 @@ Benchmark running service:
 python scripts/benchmark_server.py --text-file vctk_subset.txt -n 128 -c 1 32
 ```
 
+#### RTX A6000 reference (2026-07-18)
+
+The current deployment uses an 11-frame (0.88 s) codec left context, a
+17-frame initial body, an 8-frame steady body, and a fixed 19-frame exported
+codec graph. With 128 requests per level and streaming PCM output:
+
+| Concurrency | req/s | RTF | TTFA mean | ITL mean | Playback underruns |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 1.16 | 7.15x | 246.2 ms | 77.3 ms | 0 / 1,148 chunks |
+| 2 | 2.04 | 11.94x | 301.9 ms | 89.9 ms | 0 / 1,083 chunks |
+
+These numbers include client and HTTP transport overhead and are intended as a
+regression reference, not a hardware-independent model claim.
+
 Benchmark incremental WebSocket input with five tokenizer IDs per message:
 
 ```bash

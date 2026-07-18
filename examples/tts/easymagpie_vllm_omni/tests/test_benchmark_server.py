@@ -98,3 +98,19 @@ def test_make_tasks_still_supports_more_requests_than_corpus_entries():
     tasks = benchmark._make_tasks([("utt-1", "one")], 2, "url", None, 128, 22050, 10, None)
 
     assert len(tasks) == 2
+
+
+def test_playback_metrics_compare_gap_to_preceding_chunk_duration():
+    metrics = benchmark._playback_metrics(
+        arrivals=[0.0, 0.10, 0.25],
+        durations=[0.08, 0.20, 0.20],
+    )
+
+    assert metrics["deadline_misses"] == 1
+    assert metrics["underruns"] == 1
+    assert metrics["chunk_rtfs"] == pytest.approx([0.8, 4.0 / 3.0])
+    assert metrics["headrooms"] == pytest.approx([-0.02, 0.05])
+    assert metrics["transitions"] == [
+        pytest.approx((0.08, 0.10, True, True)),
+        pytest.approx((0.20, 0.15, False, False)),
+    ]

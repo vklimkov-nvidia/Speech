@@ -177,22 +177,51 @@ def _mean(vals: list[float]) -> float:
 def _playback_metrics(arrivals: list[float], durations: list[float]) -> dict:
     n = len(arrivals)
     if n == 0:
-        return {"chunks": 0, "underruns": 0, "gaps": [], "chunk_rtfs": []}
+        return {
+            "chunks": 0,
+            "underruns": 0,
+            "deadline_misses": 0,
+            "gaps": [],
+            "chunk_rtfs": [],
+            "headrooms": [],
+            "transitions": [],
+        }
 
     underruns = 0
+    deadline_misses = 0
     gaps: list[float] = []
     chunk_rtfs: list[float] = []
+    headrooms: list[float] = []
+    transitions: list[tuple[float, float, bool, bool]] = []
     playback_end = arrivals[0] + durations[0]
     for i in range(1, n):
         gap = arrivals[i] - arrivals[i - 1]
         gaps.append(gap)
+        previous_audio = durations[i - 1]
+        headrooms.append(previous_audio - gap)
         if gap > 0:
-            chunk_rtfs.append(durations[i] / gap)
-        if arrivals[i] > playback_end:
+            # The next chunk must arrive while the *previous* chunk is playing.
+            # Using durations[i] hid startup underruns when the first logical
+            # codec chunk was one frame and the second was a larger steady hop.
+            chunk_rtfs.append(previous_audio / gap)
+        missed_deadline = gap > previous_audio
+        if missed_deadline:
+            deadline_misses += 1
+        cumulative_underrun = arrivals[i] > playback_end
+        if cumulative_underrun:
             underruns += 1
             playback_end = arrivals[i]
+        transitions.append((previous_audio, gap, missed_deadline, cumulative_underrun))
         playback_end += durations[i]
-    return {"chunks": n, "underruns": underruns, "gaps": gaps, "chunk_rtfs": chunk_rtfs}
+    return {
+        "chunks": n,
+        "underruns": underruns,
+        "deadline_misses": deadline_misses,
+        "gaps": gaps,
+        "chunk_rtfs": chunk_rtfs,
+        "headrooms": headrooms,
+        "transitions": transitions,
+    }
 
 
 def _summarize(results: list[RequestResult], wall_s: float, concurrency: int) -> dict:
@@ -205,18 +234,44 @@ def _summarize(results: list[RequestResult], wall_s: float, concurrency: int) ->
 
     itl_ms: list[float] = []
     chunk_rtfs: list[float] = []
+    headrooms_ms: list[float] = []
     total_chunks = 0
     total_underruns = 0
+    total_deadline_misses = 0
     reqs_with_underrun = 0
+    transition_buckets: dict[int, dict] = {}
     for r in ok:
         pm = _playback_metrics(r.chunk_arrivals, r.chunk_durations)
         total_chunks += pm["chunks"]
         total_underruns += pm["underruns"]
+        total_deadline_misses += pm["deadline_misses"]
         if pm["underruns"] > 0:
             reqs_with_underrun += 1
         itl_ms.extend(g * 1000.0 for g in pm["gaps"])
         chunk_rtfs.extend(pm["chunk_rtfs"])
+        headrooms_ms.extend(value * 1000.0 for value in pm["headrooms"])
+        for previous_audio, gap, missed_deadline, cumulative_underrun in pm["transitions"]:
+            duration_ms = int(round(previous_audio * 1000.0))
+            bucket = transition_buckets.setdefault(
+                duration_ms, {"count": 0, "deadline_misses": 0, "underruns": 0, "gaps_ms": []}
+            )
+            bucket["count"] += 1
+            bucket["deadline_misses"] += int(missed_deadline)
+            bucket["underruns"] += int(cumulative_underrun)
+            bucket["gaps_ms"].append(gap * 1000.0)
     itl_ms.sort()
+    headrooms_ms.sort()
+    transition_summary = []
+    for duration_ms, bucket in sorted(transition_buckets.items()):
+        gaps_ms = sorted(bucket.pop("gaps_ms"))
+        transition_summary.append(
+            {
+                "duration_ms": duration_ms,
+                **bucket,
+                "gap_p95_ms": _percentile(gaps_ms, 0.95),
+                "gap_max_ms": gaps_ms[-1],
+            }
+        )
 
     return {
         "concurrency": concurrency,
@@ -234,9 +289,13 @@ def _summarize(results: list[RequestResult], wall_s: float, concurrency: int) ->
         "itl_p95_ms": _percentile(itl_ms, 0.95),
         "total_chunks": total_chunks,
         "total_underruns": total_underruns,
+        "total_deadline_misses": total_deadline_misses,
         "reqs_with_underrun": reqs_with_underrun,
         "underrun_pct": (100.0 * total_underruns / total_chunks) if total_chunks else 0.0,
         "playback_rtf_mean": _mean(chunk_rtfs),
+        "playback_headroom_mean_ms": _mean(headrooms_ms),
+        "playback_headroom_p05_ms": _percentile(headrooms_ms, 0.05),
+        "playback_transitions": transition_summary,
     }
 
 
@@ -249,8 +308,16 @@ def _print_detailed(s: dict) -> None:
     print(
         f"    playback  underruns {s['total_underruns']}/{s['total_chunks']} chunks "
         f"({s['underrun_pct']:.2f}%) in {s['reqs_with_underrun']}/{s['ok']} reqs  |  "
-        f"realtime factor mean {s['playback_rtf_mean']:.2f}x (chunk play / fetch)"
+        f"deadlines missed {s['total_deadline_misses']}  |  "
+        f"realtime factor mean {s['playback_rtf_mean']:.2f}x (previous chunk play / fetch)  |  "
+        f"headroom mean {s['playback_headroom_mean_ms']:.1f}ms p05 {s['playback_headroom_p05_ms']:.1f}ms"
     )
+    for row in s["playback_transitions"]:
+        print(
+            f"        after {row['duration_ms']:4d}ms audio: {row['count']:4d} gaps, "
+            f"{row['deadline_misses']:3d} deadlines / {row['underruns']:3d} underruns, "
+            f"gap p95 {row['gap_p95_ms']:.1f}ms max {row['gap_max_ms']:.1f}ms"
+        )
 
 
 def _print_summary(s: dict) -> None:

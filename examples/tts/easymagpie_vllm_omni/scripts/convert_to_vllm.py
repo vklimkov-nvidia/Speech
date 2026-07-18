@@ -187,7 +187,7 @@ def parse_args():
     parser.add_argument(
         "--codec_export_frames",
         type=int,
-        default=15,
+        default=19,
         help="Fixed model-frame input length for the exported codec (must match codec_fixed_chunk_frames).",
     )
     parser.add_argument(

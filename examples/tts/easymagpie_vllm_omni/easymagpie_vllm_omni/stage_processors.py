@@ -307,7 +307,10 @@ def talker2code2wav_async_chunk(
         # continuous acoustic stream regardless of how the text was chunked.
         frame_buffer = _persistent_list_state(transfer_manager, "_emp_frame_buffer")
         if frame is not None and not is_warmup:
-            frame_row = frame.cpu().tolist()
+            # ``multimodal_output`` is already a CPU snapshot. Keep it as a
+            # tensor so codec windows can be assembled with stack/transpose
+            # instead of a Python list round-trip and nested comprehension.
+            frame_row = frame.detach().to(device="cpu", dtype=torch.long).reshape(-1).contiguous()
             frame_buffer[request_id].append(frame_row)
             # Keep the framework buffer populated too (some connector bookkeeping
             # counts active requests by its non-empty per-request lists).
@@ -321,16 +324,47 @@ def talker2code2wav_async_chunk(
     chunk_size = int(cfg.get("codec_chunk_frames", 25))
     left_context_size_config = int(cfg.get("codec_left_context_frames", 0))
     initial_chunk_size = int(cfg.get("initial_codec_chunk_frames") or 0)
+    if initial_chunk_size > chunk_size > 0:
+        # Preserve the legacy single-initial-chunk behavior, which capped the
+        # value to the steady hop. Larger first chunks use the explicit ramp.
+        initial_chunk_size = chunk_size
 
-    if chunk_size <= 0 or left_context_size_config < 0 or initial_chunk_size < 0:
+    fixed_window_size = int(cfg.get("codec_fixed_chunk_frames") or (left_context_size_config + chunk_size))
+
+    raw_startup_chunks = cfg.get("codec_startup_chunk_frames")
+    if raw_startup_chunks is None:
+        startup_chunk_sizes = [initial_chunk_size] if initial_chunk_size else []
+    elif isinstance(raw_startup_chunks, (list, tuple)):
+        startup_chunk_sizes = [int(value) for value in raw_startup_chunks]
+    else:
+        raise ValueError(
+            "Invalid EasyMagpie codec chunk config: codec_startup_chunk_frames "
+            f"must be a list, got {type(raw_startup_chunks).__name__}"
+        )
+
+    startup_cursor = 0
+    startup_windows_fit = True
+    for value in startup_chunk_sizes:
+        startup_left_context = min(left_context_size_config, startup_cursor)
+        startup_windows_fit &= startup_left_context + value <= fixed_window_size
+        startup_cursor += value
+
+    if (
+        chunk_size <= 0
+        or left_context_size_config < 0
+        or initial_chunk_size < 0
+        or fixed_window_size <= 0
+        or left_context_size_config + chunk_size > fixed_window_size
+        or any(value <= 0 for value in startup_chunk_sizes)
+        or not startup_windows_fit
+    ):
         raise ValueError(
             f"Invalid EasyMagpie codec chunk config: codec_chunk_frames={chunk_size}, "
             f"codec_left_context_frames={left_context_size_config}, "
-            f"initial_codec_chunk_frames={initial_chunk_size}"
+            f"initial_codec_chunk_frames={initial_chunk_size}, "
+            f"codec_startup_chunk_frames={startup_chunk_sizes}, "
+            f"codec_fixed_chunk_frames={fixed_window_size}"
         )
-    if initial_chunk_size > chunk_size:
-        initial_chunk_size = chunk_size
-
     # Window over our request-persistent frame buffer (never reset per segment),
     # tracking an absolute high-water mark of already-emitted frames
     # (``emitted``). This is essential for two reasons:
@@ -345,16 +379,22 @@ def talker2code2wav_async_chunk(
     #    progress) or lose cross-segment left-context (choppy audio).
     frame_buffer = _persistent_list_state(transfer_manager, "_emp_frame_buffer")
     buffer = frame_buffer[request_id]
-    length = len(buffer)
+    base_state = _persistent_state(transfer_manager, "_emp_frame_buffer_base")
+    base_index = base_state[request_id]
+    length = base_index + len(buffer)
 
     emitted_state = _persistent_state(transfer_manager, "_emp_emitted_frames")
     emitted = emitted_state[request_id]
+    emitted_chunks_state = _persistent_state(transfer_manager, "_emp_emitted_chunks")
+    emitted_chunks = emitted_chunks_state[request_id]
 
     true_finished = _is_true_request_finish(request)
 
     def _cleanup() -> None:
         emitted_state.pop(request_id, None)
+        emitted_chunks_state.pop(request_id, None)
         _persistent_state(transfer_manager, "_emp_seen_frames").pop(request_id, None)
+        base_state.pop(request_id, None)
         frame_buffer.pop(request_id, None)
 
     if length <= 0:
@@ -375,13 +415,18 @@ def talker2code2wav_async_chunk(
             _cleanup()
         return None
 
-    # Chosen number of NEW frames to emit this call: a full (initial) chunk once
-    # enough have accumulated, or — on any finish/flush — whatever remains.
-    use_first_chunk = 0 < initial_chunk_size < chunk_size
-    target = initial_chunk_size if (emitted == 0 and use_first_chunk) else chunk_size
-    if not finished and pending < target:
+    # Chosen number of NEW frames to emit this call. Startup targets may ramp up
+    # (for example 1, 2, then the steady 4-frame chunk) so the first short audio
+    # chunk is replenished quickly instead of waiting for a full steady chunk.
+    # Every codec invocation is still padded to ``codec_fixed_chunk_frames`` in
+    # Stage 1, so the ramp does not introduce new decoder/CUDA-graph shapes.
+    target = startup_chunk_sizes[emitted_chunks] if emitted_chunks < len(startup_chunk_sizes) else chunk_size
+    # A resumable segment stop is not an audio flush: retain a partial body
+    # across text-input segments so steady codec chunks keep one logical size.
+    # Only the terminal request finish may emit a short final tail.
+    if not true_finished and pending < target:
         return None
-    context_length = pending if finished else min(pending, target)
+    context_length = pending if true_finished else min(pending, target)
 
     new_start = emitted
     new_end = emitted + context_length
@@ -389,20 +434,24 @@ def talker2code2wav_async_chunk(
     # span (stage 1 decodes them for receptive field but discards their audio).
     # Cap the total window to the codec's fixed frame budget.
     left_context_size = min(left_context_size_config, new_start)
-    max_window = left_context_size_config + chunk_size
+    max_window = fixed_window_size
     if left_context_size + context_length > max_window:
         left_context_size = max(0, max_window - context_length)
     window_start = new_start - left_context_size
-    window_frames = buffer[window_start:new_end]
-
-    num_quantizers = len(window_frames[0])
-    num_frames = len(window_frames)
-    code_predictor_codes = torch.tensor(
-        [window_frames[f][q] for q in range(num_quantizers) for f in range(num_frames)],
-        dtype=torch.long,
-    )
+    relative_start = window_start - base_index
+    relative_end = new_end - base_index
+    window_frames = torch.stack(buffer[relative_start:relative_end], dim=0)
+    code_predictor_codes = window_frames.transpose(0, 1).reshape(-1).contiguous()
 
     emitted_state[request_id] = new_end
+    emitted_chunks_state[request_id] += 1
+    # Retain only context that can participate in the next fixed-shape window.
+    # This bounds state to left-context plus pending frames, not the utterance.
+    keep_from = max(0, new_end - left_context_size_config)
+    drop = keep_from - base_index
+    if drop > 0:
+        del buffer[:drop]
+        base_state[request_id] = keep_from
     if true_finished:
         _cleanup()
 
