@@ -87,6 +87,13 @@ Benchmark running service:
 python scripts/benchmark_server.py --text-file vctk_subset.txt -n 128 -c 1 32
 ```
 
+Benchmark incremental WebSocket input with five tokenizer IDs per message:
+
+```bash
+python scripts/benchmark_incremental_server.py --model ./converted_model \
+    --text-file vctk_subset.txt --tokens-per-chunk 5 -n 128 -c 1 32
+```
+
 Benchmark acoustic tokens prediction only (no codec)
 
 ```bash

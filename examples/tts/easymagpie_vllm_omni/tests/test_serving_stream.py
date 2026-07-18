@@ -22,6 +22,19 @@ from easymagpie_vllm_omni.serving_stream import EasyMagpieInputStream, EasyMagpi
 from vllm.sampling_params import RequestOutputKind, SamplingParams
 
 
+def test_input_stream_default_pacing_tolerates_loaded_service_queueing():
+    stream = EasyMagpieInputStream(
+        prefill_prompt={"prompt_token_ids": [0]},
+        sampling_params=SamplingParams(max_tokens=32),
+        text_eos_id=99,
+        max_new_tokens=32,
+    )
+
+    # Segment completions took 2-3 seconds with 32 concurrent service requests.
+    # The watchdog must distinguish that normal queueing from a stalled engine.
+    assert stream.pace_timeout_s >= 30.0
+
+
 @pytest.mark.asyncio
 async def test_input_stream_builds_one_resumable_request_from_token_chunks():
     params = SamplingParams(
@@ -49,16 +62,45 @@ async def test_input_stream_builds_one_resumable_request_from_token_chunks():
     assert chunks[0].prompt["additional_information"] == {
         "speaker_id": "eng",
         "text_token": [10, 11, 12],
+        "text_token_start": 0,
     }
     assert chunks[0].sampling_params.max_tokens == 3
-    assert chunks[1].prompt["additional_information"] == {"text_token": [13, 14, 99]}
+    assert chunks[1].prompt["additional_information"] == {"text_token": [13, 14, 99], "text_token_start": 3}
     assert chunks[1].sampling_params.max_tokens == 3
     assert chunks[2].prompt["additional_information"] == {"text_token": []}
     assert chunks[2].sampling_params.max_tokens == 20
 
 
 @pytest.mark.asyncio
-async def test_input_stream_paces_updates_from_stage_zero_delta_tokens():
+async def test_input_stream_preserves_one_token_chunks_with_absolute_offsets():
+    params = SamplingParams(max_tokens=32, output_kind=RequestOutputKind.DELTA)
+    stream = EasyMagpieInputStream(
+        prefill_prompt={"prompt_token_ids": [0]},
+        sampling_params=params,
+        text_eos_id=99,
+        max_new_tokens=32,
+        pace_timeout_s=0.0,
+        queue_depth=4,
+        coalesce_queued_tokens=False,
+    )
+    await stream.put_tokens([10])
+    await stream.put_tokens([11])
+    await stream.put_tokens([12])
+    await stream.finish()
+
+    chunks = [chunk async for chunk in stream.inputs()]
+
+    assert [chunk.prompt["additional_information"] for chunk in chunks] == [
+        {"text_token": [10], "text_token_start": 0},
+        {"text_token": [11], "text_token_start": 1},
+        {"text_token": [12], "text_token_start": 2},
+        {"text_token": [99], "text_token_start": 3},
+        {"text_token": []},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_input_stream_counts_stage_zero_delta_tokens():
     params = SamplingParams(max_tokens=32, output_kind=RequestOutputKind.DELTA)
     stream = EasyMagpieInputStream(
         prefill_prompt={"prompt_token_ids": [0]},
@@ -70,7 +112,7 @@ async def test_input_stream_paces_updates_from_stage_zero_delta_tokens():
 
     stream.observe_output(SimpleNamespace(stage_id=0, outputs=[SimpleNamespace(token_ids=[1, 1, 1])]))
 
-    assert stream.available_output_credits == 3
+    assert stream.observed_output_frames == 3
 
 
 @pytest.mark.asyncio
@@ -91,7 +133,7 @@ async def test_input_stream_times_out_before_replacing_segment_conditioning():
     assert first.sampling_params.max_tokens == 2
 
     stream.observe_output(SimpleNamespace(stage_id=0, outputs=[SimpleNamespace(token_ids=[1])]))
-    with pytest.raises(TimeoutError, match="waiting for 2 stage-0 frames"):
+    with pytest.raises(TimeoutError, match="waiting for stage-0 segment completion"):
         await anext(inputs)
 
 
@@ -110,17 +152,38 @@ async def test_input_stream_waits_for_segment_completion_after_all_frames():
     inputs = stream.inputs()
     await anext(inputs)
 
-    stream.observe_output(
-        SimpleNamespace(stage_id=0, outputs=[SimpleNamespace(token_ids=[1, 1], finish_reason=None)])
-    )
+    stream.observe_output(SimpleNamespace(stage_id=0, outputs=[SimpleNamespace(token_ids=[1, 1], finish_reason=None)]))
     next_input = asyncio.create_task(anext(inputs))
     await asyncio.sleep(0)
     assert not next_input.done()
 
-    stream.observe_output(
-        SimpleNamespace(stage_id=0, outputs=[SimpleNamespace(token_ids=[], finish_reason="length")])
+    stream.observe_output(SimpleNamespace(stage_id=0, outputs=[SimpleNamespace(token_ids=[], finish_reason="length")]))
+    assert (await next_input).prompt["additional_information"] == {"text_token": [12], "text_token_start": 2}
+
+
+@pytest.mark.asyncio
+async def test_input_stream_accepts_segment_completion_with_a_dropped_output_frame():
+    params = SamplingParams(max_tokens=32, output_kind=RequestOutputKind.DELTA)
+    stream = EasyMagpieInputStream(
+        prefill_prompt={"prompt_token_ids": [0]},
+        sampling_params=params,
+        text_eos_id=99,
+        max_new_tokens=32,
+        pace_timeout_s=1.0,
     )
-    assert (await next_input).prompt["additional_information"] == {"text_token": [12]}
+    await stream.put_tokens([10, 11])
+    await stream.put_tokens([12])
+    inputs = stream.inputs()
+    await anext(inputs)
+
+    # Async segment lookahead may discard one in-flight frame. The segment's
+    # finish event is authoritative and must allow the next text chunk through.
+    stream.observe_output(
+        SimpleNamespace(stage_id=0, outputs=[SimpleNamespace(token_ids=[1], finish_reason="length")])
+    )
+
+    next_input = await anext(inputs)
+    assert next_input.prompt["additional_information"] == {"text_token": [12], "text_token_start": 2}
 
 
 def test_two_stage_pipeline_exposes_talker_progress_for_stream_pacing():

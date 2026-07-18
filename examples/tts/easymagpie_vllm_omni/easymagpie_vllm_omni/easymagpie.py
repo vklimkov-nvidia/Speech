@@ -55,6 +55,37 @@ logger = init_logger(__name__)
 # argmax-at-0 dummy logits, so this only needs to be a valid id.
 _DUMMY_TOKEN_ID = 0
 
+
+def _merge_streaming_text_chunk(
+    text_tokens: list[int], incoming: list[int], text_token_start: Any
+) -> tuple[list[int], bool]:
+    """Merge one absolute-position text chunk into a request's token buffer.
+
+    vLLM async scheduling can expose the next segment's metadata one decode
+    step early. Absolute positions make that lookahead harmless: an already
+    merged chunk is a no-op, while the next contiguous chunk is appended once.
+    Gaps and conflicting overlaps indicate a malformed streaming request and
+    are rejected instead of silently dropping text conditioning.
+    """
+    if not incoming:
+        return text_tokens, False
+    if text_token_start is None:
+        raise ValueError("Streaming text_token updates require text_token_start")
+
+    start = int(text_token_start)
+    if start < 0 or start > len(text_tokens):
+        raise ValueError(f"Invalid text_token_start={start} for accumulated text length {len(text_tokens)}")
+
+    chunk = [int(token) for token in incoming]
+    overlap = min(len(chunk), len(text_tokens) - start)
+    if text_tokens[start : start + overlap] != chunk[:overlap]:
+        raise ValueError(f"Conflicting streaming text chunk at absolute position {start}")
+    if overlap == len(chunk):
+        return text_tokens, False
+
+    return text_tokens + chunk[overlap:], True
+
+
 # Context text used when the request omits ``context_text``
 _DEFAULT_CONTEXT_TEXT = "[EN]"
 
@@ -659,6 +690,19 @@ class EasyMagpieTTSForConditionalGeneration(
             text = info_dict.get("text")
             if text:
                 info_update["text_tokens"] = self._encode_text_stream(text)
+            else:
+                # Absolute-position streaming: seed the buffer with the prefill
+                # segment's own ``text_token`` chunk here instead of relying on it
+                # being absorbed at the first decode step. When that chunk carries a
+                # single id (max_tokens==1) vLLM's one-step segment lookahead swaps
+                # the visible ``text_token`` for the *next* segment's payload before
+                # ``decode_offset==0`` runs, so the prefill id would otherwise be
+                # dropped and every later chunk misaligned (start=1 vs len=0).
+                incoming = info_dict.get("text_token") or []
+                if incoming:
+                    info_update["text_tokens"], _ = _merge_streaming_text_chunk(
+                        [], incoming, info_dict.get("text_token_start")
+                    )
         input_ids_out = torch.full_like(input_ids, _DUMMY_TOKEN_ID)
         return input_ids_out, take, info_update
 
@@ -939,18 +983,17 @@ class EasyMagpieTTSForConditionalGeneration(
         # pumping decode steps (passing an empty ``text_token`` list) while the audio
         # tail finishes.
         #
-        # Append-once: a streamed chunk's ``text_token`` payload stays identical on
-        # every decode step of that chunk, so we extend the buffer only when it has
-        # been fully consumed (``decode_offset`` caught up to its length). This is
-        # safe because the chunk's segment stops at ``max_tokens`` and ``preprocess``
-        # is not called again until a fresh chunk has replaced ``text_token`` — hence
-        # the caller must size each chunk's ``max_tokens`` to the number of ids it
-        # carries.
+        # A streamed chunk's ``text_token`` payload stays identical across every
+        # decode step of its segment. ``text_token_start`` is its absolute position
+        # in the accumulated buffer, which makes repeated metadata and async
+        # one-segment lookahead safe.
         text_tokens = info_dict.get("text_tokens") or []
         incoming = info_dict.get("text_token") or []
-        if incoming and decode_offset >= len(text_tokens):
-            text_tokens = text_tokens + [int(t) for t in incoming]
-            info_update["text_tokens"] = text_tokens
+        text_token_start = info_dict.get("text_token_start")
+        if incoming:
+            text_tokens, appended = _merge_streaming_text_chunk(text_tokens, incoming, text_token_start)
+            if appended:
+                info_update["text_tokens"] = text_tokens
         if decode_offset < len(text_tokens):
             self._dec_text_tokens[start] = int(text_tokens[decode_offset])
             self._dec_text_mask[start] = 1

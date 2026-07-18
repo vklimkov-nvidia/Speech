@@ -67,10 +67,6 @@ CONTEXT_TEXT = "[EN]"
 LT_TEMPERATURE = 0.7  # audio (local-transformer) sampling temperature
 LT_TOPK = 80  # audio sampling top-k
 CODEC_FRAME_RATE = 25.0  # Hz, used to convert decoded frames -> audio seconds (RTF)
-# Max time to wait for a streaming segment's output frames before sending the
-# next input chunk. Async scheduling can drop a frame at a segment boundary, so
-# this bounds the pacing wait to avoid deadlocking a request.
-PACE_TIMEOUT_S = 2.0
 GPU_MEMORY_UTILIZATION = 0.5
 DISTRIBUTED_EXECUTOR_BACKEND = "uni"
 ENFORCE_EAGER = False
@@ -412,7 +408,7 @@ async def run_one_request(
     request_id: str,
     meta: ModelMeta,
     capture_audio_codes: bool = False,
-    pace=None,
+    output_observer=None,
     max_steps: Optional[int] = None,
 ) -> RequestResult:
     meter = StepMeter(meta, capture_audio_codes=capture_audio_codes)
@@ -421,10 +417,10 @@ async def run_one_request(
         gen = omni.generate(inputs, sampling_params_list=[sampling_params], request_id=request_id)
         async for stage_output in gen:
             meter.observe(stage_output)
+            if output_observer is not None:
+                output_observer(stage_output)
             if max_steps is not None and meter.steps >= max_steps:
                 break
-            if pace is not None:
-                await pace()
         meter.finalize()
     except Exception as exc:
         meter.mark_error(exc)
@@ -438,19 +434,8 @@ async def run_one_request(
     return meter.result
 
 
-def _clone_sampling_params(sampling_params, max_tokens: int):
-    import copy
-
-    sp = copy.deepcopy(sampling_params)
-    sp.max_tokens = max(1, int(max_tokens))
-    return sp
-
-
 def build_streaming_request(text: str, meta: ModelMeta, stream_params, max_new_tokens: int, tokens_per_chunk: int = 1):
-    try:
-        from vllm.engine.protocol import StreamingInput
-    except ImportError:
-        from vllm.v1.engine.async_llm import StreamingInput
+    from easymagpie_vllm_omni.serving_stream import EasyMagpieInputStream
 
     prefill_info = {
         "context_text": CONTEXT_TEXT,
@@ -458,52 +443,26 @@ def build_streaming_request(text: str, meta: ModelMeta, stream_params, max_new_t
         "top_k": LT_TOPK,
     }
     prefill_info.update(_speaker_info(meta))
-    text_ids = list(meta.tokenizer.encode(text, add_special_tokens=False)) + [meta.text_eos_id]
+    text_ids = list(meta.tokenizer.encode(text, add_special_tokens=False))
     n = max(1, int(tokens_per_chunk))
     chunks = [text_ids[i : i + n] for i in range(0, len(text_ids), n)]
-    chunk_params = _clone_sampling_params(stream_params, n)
-    tail_params = _clone_sampling_params(stream_params, max_new_tokens - len(text_ids))
-    go_queue: asyncio.Queue = asyncio.Queue()
-
-    async def _drain(k):
-        # Pace the next chunk on the previous segment's output frames. Under
-        # async scheduling vLLM-Omni may emit fewer frames than a segment's
-        # ``max_tokens`` (in-flight tokens are discarded at a segment boundary),
-        # so bound the wait: if the frames do not arrive we proceed rather than
-        # deadlock the request.
-        for _ in range(k):
-            try:
-                await asyncio.wait_for(go_queue.get(), timeout=PACE_TIMEOUT_S)
-            except asyncio.TimeoutError:
-                break
+    stream = EasyMagpieInputStream(
+        prefill_prompt={"prompt_token_ids": [0] * meta.prompt_len, "additional_information": prefill_info},
+        sampling_params=stream_params,
+        text_eos_id=meta.text_eos_id,
+        max_new_tokens=max_new_tokens,
+        queue_depth=len(chunks) + 1,
+        coalesce_queued_tokens=False,
+    )
 
     async def inputs():
-        yield StreamingInput(
-            prompt={"prompt_token_ids": [0] * meta.prompt_len, "additional_information": prefill_info},
-            sampling_params=stream_params,
-        )
-        prev_frames = 1
         for chunk in chunks:
-            await _drain(prev_frames)
-            params = chunk_params if len(chunk) == n else _clone_sampling_params(stream_params, len(chunk))
-            yield StreamingInput(
-                prompt={
-                    "prompt_token_ids": [0],
-                    "additional_information": {"text_token": [int(t) for t in chunk]},
-                },
-                sampling_params=params,
-            )
-            prev_frames = len(chunk)
-        await _drain(prev_frames)
-        yield StreamingInput(
-            prompt={"prompt_token_ids": [0], "additional_information": {"text_token": []}},
-            sampling_params=tail_params,
-        )
+            await stream.put_tokens(chunk)
+        await stream.finish()
+        async for engine_input in stream.inputs():
+            yield engine_input
 
-    async def pace():
-        await go_queue.put(True)
-
-    return inputs(), pace
+    return inputs(), stream.observe_output
 
 
 # ---------------------------------------------------------------------------
@@ -539,7 +498,9 @@ async def worker(
         request_id = f"bench-easymp-w{worker_id}-{uuid.uuid4().hex[:8]}"
 
         if streaming:
-            inputs, pace = build_streaming_request(text, meta, stream_params, max_new_tokens, tokens_per_chunk)
+            inputs, observe_output = build_streaming_request(
+                text, meta, stream_params, max_new_tokens, tokens_per_chunk
+            )
             result = await run_one_request(
                 omni,
                 inputs,
@@ -547,7 +508,7 @@ async def worker(
                 request_id,
                 meta,
                 capture_audio_codes=capture_audio_codes,
-                pace=pace,
+                output_observer=observe_output,
                 max_steps=4 * max_new_tokens + 16,
             )
         else:

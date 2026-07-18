@@ -17,21 +17,24 @@ from __future__ import annotations
 import asyncio
 import copy
 import json
-import logging
 from contextlib import aclosing
 from typing import Any, cast
 
 from fastapi import WebSocket, WebSocketDisconnect
 from vllm.engine.protocol import StreamingInput
+from vllm.logger import init_logger
 from vllm.utils import random_uuid
 from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
 from vllm_omni.entrypoints.openai.serving_speech_stream import OmniStreamingSpeechHandler
 from vllm_omni.entrypoints.utils import coerce_param_message_types
 
-logger = logging.getLogger(__name__)
+logger = init_logger(__name__)
 
 _MODEL_TYPE = "easymagpie"
-_DEFAULT_PACE_TIMEOUT_S = 2.0
+# Segment completion includes time spent queued behind other requests. Keep
+# this comfortably above the multi-second queueing observed at concurrency 32,
+# while still bounding a genuinely stalled engine request.
+_DEFAULT_PACE_TIMEOUT_S = 30.0
 _MAX_TOKEN_CHUNK_SIZE = 256
 _MAX_INPUT_MESSAGE_SIZE = 128 * 1024
 _QUEUE_DEPTH = 8
@@ -56,21 +59,18 @@ class EasyMagpieInputStream:
         max_new_tokens: int,
         pace_timeout_s: float = _DEFAULT_PACE_TIMEOUT_S,
         queue_depth: int = _QUEUE_DEPTH,
+        coalesce_queued_tokens: bool = True,
     ) -> None:
         self.prefill_prompt = prefill_prompt
         self.sampling_params = sampling_params
         self.text_eos_id = int(text_eos_id)
         self.max_new_tokens = max(1, int(max_new_tokens))
         self.pace_timeout_s = max(0.0, float(pace_timeout_s))
+        self.coalesce_queued_tokens = coalesce_queued_tokens
         self._input_queue: asyncio.Queue[list[int] | object] = asyncio.Queue(maxsize=max(1, queue_depth))
-        self._output_credits: asyncio.Queue[None] = asyncio.Queue()
         self._segment_completions: asyncio.Queue[None] = asyncio.Queue()
         self._finished = False
         self.observed_output_frames = 0
-
-    @property
-    def available_output_credits(self) -> int:
-        return self._output_credits.qsize()
 
     @property
     def finished(self) -> bool:
@@ -89,43 +89,30 @@ class EasyMagpieInputStream:
             await self._input_queue.put(_DONE)
 
     def observe_output(self, output: Any) -> None:
-        """Credit generated stage-0 frames so the next text update may resume."""
+        """Track generated frames and release the next text update at segment completion."""
         if getattr(output, "stage_id", None) != 0:
             return
         outputs = getattr(output, "outputs", None) or []
         if not outputs:
             return
         token_ids = getattr(outputs[0], "token_ids", None) or []
+        finish_reason = getattr(outputs[0], "finish_reason", None)
         self.observed_output_frames += len(token_ids)
-        for _ in token_ids:
-            self._output_credits.put_nowait(None)
-        if getattr(outputs[0], "finish_reason", None) is not None:
+        if finish_reason is not None:
             self._segment_completions.put_nowait(None)
 
-    async def _drain(self, count: int) -> None:
+    async def _wait_for_segment_completion(self) -> None:
         if self.pace_timeout_s <= 0:
             return
-        for _ in range(max(0, int(count))):
-            try:
-                await asyncio.wait_for(self._output_credits.get(), timeout=self.pace_timeout_s)
-            except asyncio.TimeoutError as error:
-                raise TimeoutError(
-                    f"Timed out waiting for {count} stage-0 frames; "
-                    f"received {self.observed_output_frames} frames in total."
-                ) from error
         try:
             await asyncio.wait_for(self._segment_completions.get(), timeout=self.pace_timeout_s)
         except asyncio.TimeoutError as error:
-            raise TimeoutError(
-                f"Timed out waiting for stage-0 segment completion after receiving {count} frames."
-            ) from error
-
-    def _clear_output_credits(self) -> None:
-        while not self._output_credits.empty():
-            self._output_credits.get_nowait()
+            raise TimeoutError("Timed out waiting for stage-0 segment completion") from error
 
     def _accumulate_queued_tokens(self, token_ids: list[int]) -> tuple[list[int], bool]:
         """Coalesce text received while stage 0 was producing prior frames."""
+        if not self.coalesce_queued_tokens:
+            return token_ids, False
         done = False
         while not self._input_queue.empty():
             item = self._input_queue.get_nowait()
@@ -140,52 +127,61 @@ class EasyMagpieInputStream:
         first_item = await self._input_queue.get()
         if first_item is _DONE:
             return
+        # Cumulative index of the next text id in the model's buffer. Each segment
+        # is tagged with the absolute ``text_token_start`` of its first id so the
+        # model absorbs it exactly once regardless of async segment lookahead (see
+        # EasyMagpieTTSForConditionalGeneration._preprocess_decode).
+        text_token_start = 0
+
         first_token_ids = cast(list[int], first_item)
         first_prompt = copy.deepcopy(self.prefill_prompt)
         first_info = first_prompt.setdefault("additional_information", {})
         first_info["text_token"] = first_token_ids
+        first_info["text_token_start"] = text_token_start
         first_required_frames = len(first_token_ids)
-        self._clear_output_credits()
         yield StreamingInput(
             prompt=first_prompt,
             sampling_params=_sampling_params_with_max_tokens(self.sampling_params, first_required_frames),
         )
+        text_token_start += len(first_token_ids)
 
-        previous_frames = first_required_frames
         input_done = False
         while True:
             item = await self._input_queue.get()
             if item is _DONE:
                 break
             token_ids = cast(list[int], item)
-            await self._drain(previous_frames)
+            await self._wait_for_segment_completion()
             token_ids, input_done = self._accumulate_queued_tokens(token_ids)
             if input_done:
                 token_ids.append(self.text_eos_id)
-            self._clear_output_credits()
             yield StreamingInput(
                 prompt={
                     "prompt_token_ids": [0],
-                    "additional_information": {"text_token": token_ids},
+                    "additional_information": {"text_token": token_ids, "text_token_start": text_token_start},
                 },
                 sampling_params=_sampling_params_with_max_tokens(self.sampling_params, len(token_ids)),
             )
-            previous_frames = len(token_ids)
+            text_token_start += len(token_ids)
             if input_done:
                 break
 
-        await self._drain(previous_frames)
+        await self._wait_for_segment_completion()
         if not input_done:
-            self._clear_output_credits()
             yield StreamingInput(
                 prompt={
                     "prompt_token_ids": [0],
-                    "additional_information": {"text_token": [self.text_eos_id]},
+                    "additional_information": {
+                        "text_token": [self.text_eos_id],
+                        "text_token_start": text_token_start,
+                    },
                 },
                 sampling_params=_sampling_params_with_max_tokens(self.sampling_params, 1),
             )
-            await self._drain(1)
+            text_token_start += 1
+            await self._wait_for_segment_completion()
 
+        tail_max_tokens = self.max_new_tokens - self.observed_output_frames
         yield StreamingInput(
             prompt={
                 "prompt_token_ids": [0],
@@ -193,7 +189,7 @@ class EasyMagpieInputStream:
             },
             sampling_params=_sampling_params_with_max_tokens(
                 self.sampling_params,
-                self.max_new_tokens - self.observed_output_frames,
+                tail_max_tokens,
             ),
         )
 

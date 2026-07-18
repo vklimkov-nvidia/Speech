@@ -14,6 +14,7 @@
 """Tests for the vLLM-Omni 0.24 async scheduler compatibility layer."""
 from __future__ import annotations
 
+from collections import deque
 from types import SimpleNamespace
 
 import pytest
@@ -104,6 +105,29 @@ def test_segment_stop_discards_and_rolls_back_exact_inflight_count(monkeypatch, 
     assert outputs == "outputs"
     assert request.async_tokens_to_discard == remaining_placeholders
     assert request.num_computed_tokens == 20 - remaining_placeholders
+
+
+def test_final_streaming_sentinel_marks_session_non_resumable(monkeypatch):
+    scheduler = object.__new__(EasyMagpieARAsyncScheduler)
+    request = SimpleNamespace(resumable=True, streaming_queue=deque([None]))
+
+    def fake_handle_stopped_request(self, req):
+        assert req.resumable is False
+        return True
+
+    monkeypatch.setattr(OmniARAsyncScheduler, "_handle_stopped_request", fake_handle_stopped_request)
+
+    assert scheduler._handle_stopped_request(request) is True
+    assert request.resumable is False
+
+
+def test_empty_streaming_queue_remains_resumable_while_waiting(monkeypatch):
+    scheduler = object.__new__(EasyMagpieARAsyncScheduler)
+    request = SimpleNamespace(resumable=True, streaming_queue=deque())
+    monkeypatch.setattr(OmniARAsyncScheduler, "_handle_stopped_request", lambda self, req: False)
+
+    assert scheduler._handle_stopped_request(request) is False
+    assert request.resumable is True
 
 
 def test_resume_uses_exact_discard_count_and_forwards_chunk_metadata(monkeypatch):

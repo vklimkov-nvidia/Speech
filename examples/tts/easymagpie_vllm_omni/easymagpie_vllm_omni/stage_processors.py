@@ -18,6 +18,7 @@ codebook-major flat stream.
 """
 from __future__ import annotations
 
+from collections import defaultdict
 from collections.abc import Mapping
 from typing import Any
 
@@ -26,6 +27,7 @@ from vllm.logger import init_logger
 from vllm_omni.data_entry_keys import CodesStruct, MetaStruct, OmniPayload, OmniPayloadStruct
 
 logger = init_logger(__name__)
+
 
 # Base codebook size, excluding control tokens.
 _CODEBOOK_SIZE = 1024
@@ -239,13 +241,38 @@ def _resolve_speech_delay(transfer_manager: Any) -> int:
     return delay
 
 
-def _is_warmup_frame(request: Any, transfer_manager: Any) -> bool:
-    """Check whether the newest frame precedes the configured speech start."""
-    speech_delay = _resolve_speech_delay(transfer_manager)
-    if speech_delay <= 0:
-        return False
-    n_emitted = len(getattr(request, "output_token_ids", None) or [])
-    return n_emitted <= speech_delay
+def _persistent_state(transfer_manager: Any, attr: str) -> dict:
+    """Lazily create a request-keyed ``int`` dict on the transfer manager.
+
+    These survive the scheduler's per-segment reset of ``output_token_ids`` /
+    the codec buffer, so warm-up and emission accounting stay continuous across
+    the segment stops that a streaming (chunk-by-chunk) request goes through.
+    """
+    state = getattr(transfer_manager, attr, None)
+    if state is None:
+        state = defaultdict(int)
+        setattr(transfer_manager, attr, state)
+    return state
+
+
+def _persistent_list_state(transfer_manager: Any, attr: str) -> dict:
+    """Lazily create a request-keyed ``list`` dict on the transfer manager."""
+    state = getattr(transfer_manager, attr, None)
+    if state is None:
+        state = defaultdict(list)
+        setattr(transfer_manager, attr, state)
+    return state
+
+
+def _is_true_request_finish(request: Any) -> bool:
+    """True only at the real end of the utterance, not at a segment stop.
+
+    Mirrors the transfer adapter's own ``request.is_finished() and not
+    request.resumable`` rule: a resumable streaming request reports
+    ``is_finished()`` at every segment boundary while still expecting more
+    input, so it must not be treated as the terminal finish.
+    """
+    return bool(getattr(request, "is_finished", lambda: False)()) and not bool(getattr(request, "resumable", False))
 
 
 def talker2code2wav_async_chunk(
@@ -264,8 +291,27 @@ def talker2code2wav_async_chunk(
 
     if isinstance(multimodal_output, Mapping):
         frame = _extract_last_frame(multimodal_output)
-        if frame is not None and not _is_warmup_frame(request, transfer_manager):
-            transfer_manager.code_prompt_token_ids[request_id].append(frame.cpu().tolist())
+        speech_delay = _resolve_speech_delay(transfer_manager)
+        # Persistent per-request frame index: one decode step == one frame,
+        # counted across segment stops (unlike ``output_token_ids``, which the
+        # scheduler zeroes at each stop). Warm-up drops the first ``speech_delay``
+        # frames of the *whole* utterance exactly once.
+        seen_state = _persistent_state(transfer_manager, "_emp_seen_frames")
+        seen_state[request_id] += 1
+        frame_index = seen_state[request_id]
+        is_warmup = speech_delay > 0 and frame_index <= speech_delay
+        # Accumulate real frames into a request-persistent buffer. The framework's
+        # ``code_prompt_token_ids`` is popped per segment (it hands back a fresh
+        # list at every segment stop), which strands left-context and desyncs the
+        # emission counter; our own buffer never resets, so windowing sees one
+        # continuous acoustic stream regardless of how the text was chunked.
+        frame_buffer = _persistent_list_state(transfer_manager, "_emp_frame_buffer")
+        if frame is not None and not is_warmup:
+            frame_row = frame.cpu().tolist()
+            frame_buffer[request_id].append(frame_row)
+            # Keep the framework buffer populated too (some connector bookkeeping
+            # counts active requests by its non-empty per-request lists).
+            transfer_manager.code_prompt_token_ids[request_id].append(frame_row)
     elif not finished:
         return None
 
@@ -285,31 +331,69 @@ def talker2code2wav_async_chunk(
     if initial_chunk_size > chunk_size:
         initial_chunk_size = chunk_size
 
-    length = len(transfer_manager.code_prompt_token_ids[request_id])
+    # Window over our request-persistent frame buffer (never reset per segment),
+    # tracking an absolute high-water mark of already-emitted frames
+    # (``emitted``). This is essential for two reasons:
+    #  * Stateless recompute from ``length`` + chunk alignment re-emits the tail
+    #    window whenever the processor is invoked again at the same length —
+    #    which happens at every segment stop (the adapter passes
+    #    ``is_finished=is_segment_finished`` as a flush signal, often several
+    #    times). That duplicates acoustic frames (the "phys phys" stutter).
+    #  * The framework's own ``code_prompt_token_ids`` is popped per segment, so
+    #    a per-that-buffer counter would restart mid-utterance and either drop
+    #    frames (one-token-per-segment: ``1 -> reset -> 1`` looks like no
+    #    progress) or lose cross-segment left-context (choppy audio).
+    frame_buffer = _persistent_list_state(transfer_manager, "_emp_frame_buffer")
+    buffer = frame_buffer[request_id]
+    length = len(buffer)
+
+    emitted_state = _persistent_state(transfer_manager, "_emp_emitted_frames")
+    emitted = emitted_state[request_id]
+
+    true_finished = _is_true_request_finish(request)
+
+    def _cleanup() -> None:
+        emitted_state.pop(request_id, None)
+        _persistent_state(transfer_manager, "_emp_seen_frames").pop(request_id, None)
+        frame_buffer.pop(request_id, None)
+
     if length <= 0:
         if finished:
+            if true_finished:
+                _cleanup()
             return OmniPayloadStruct(
                 codes=CodesStruct(audio=torch.empty(0, dtype=torch.long)),
                 meta=MetaStruct(finished=torch.tensor(True, dtype=torch.bool)),
             )
         return None
 
-    use_first_chunk = 0 < initial_chunk_size < chunk_size
-    if use_first_chunk and length <= initial_chunk_size:
-        if not finished and length < initial_chunk_size:
-            return None
-        context_length = length if finished and length < initial_chunk_size else initial_chunk_size
-    else:
-        initial_coverage = initial_chunk_size if use_first_chunk else 0
-        adjusted = length - initial_coverage
-        if not finished and adjusted % chunk_size != 0:
-            return None
-        chunk_length = adjusted % chunk_size
-        context_length = chunk_length if chunk_length != 0 else chunk_size
+    pending = length - emitted
+    if pending <= 0:
+        # Nothing new to emit. Never re-emit already-sent frames; the adapter
+        # still forwards segment/request finish markers when we return None.
+        if true_finished:
+            _cleanup()
+        return None
 
-    end_index = min(length, left_context_size_config + context_length)
-    left_context_size = max(0, end_index - context_length)
-    window_frames = transfer_manager.code_prompt_token_ids[request_id][-end_index:]
+    # Chosen number of NEW frames to emit this call: a full (initial) chunk once
+    # enough have accumulated, or — on any finish/flush — whatever remains.
+    use_first_chunk = 0 < initial_chunk_size < chunk_size
+    target = initial_chunk_size if (emitted == 0 and use_first_chunk) else chunk_size
+    if not finished and pending < target:
+        return None
+    context_length = pending if finished else min(pending, target)
+
+    new_start = emitted
+    new_end = emitted + context_length
+    # Overlap left-context = already-emitted frames immediately before the new
+    # span (stage 1 decodes them for receptive field but discards their audio).
+    # Cap the total window to the codec's fixed frame budget.
+    left_context_size = min(left_context_size_config, new_start)
+    max_window = left_context_size_config + chunk_size
+    if left_context_size + context_length > max_window:
+        left_context_size = max(0, max_window - context_length)
+    window_start = new_start - left_context_size
+    window_frames = buffer[window_start:new_end]
 
     num_quantizers = len(window_frames[0])
     num_frames = len(window_frames)
@@ -317,6 +401,10 @@ def talker2code2wav_async_chunk(
         [window_frames[f][q] for q in range(num_quantizers) for f in range(num_frames)],
         dtype=torch.long,
     )
+
+    emitted_state[request_id] = new_end
+    if true_finished:
+        _cleanup()
 
     return OmniPayloadStruct(
         codes=CodesStruct(audio=code_predictor_codes),

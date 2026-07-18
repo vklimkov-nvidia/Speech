@@ -136,9 +136,9 @@ def _load_items(text_file: str) -> list[tuple[str, str]]:
 
 
 def _make_tasks(items, n, url, speaker_id, max_new_tokens, sample_rate, timeout, output_dir) -> list[dict]:
+    selected_items = random.sample(items, n) if n <= len(items) else random.choices(items, k=n)
     tasks = []
-    for _ in range(n):
-        uttid, text = random.choice(items)
+    for uttid, text in selected_items:
         tasks.append(
             {
                 "url": url,

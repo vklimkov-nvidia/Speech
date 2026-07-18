@@ -77,3 +77,24 @@ def test_request_uses_openai_speech_endpoint_and_decodes_streaming_pcm(monkeypat
     assert result.error is None
     assert result.num_samples == 2
     assert result.sr == 22050
+
+
+def test_make_tasks_avoids_output_filename_collisions_when_corpus_is_large_enough():
+    tasks = benchmark._make_tasks(
+        [("utt-1", "one"), ("utt-2", "two"), ("utt-3", "three")],
+        3,
+        url="http://localhost:8091",
+        speaker_id="eng",
+        max_new_tokens=128,
+        sample_rate=22050,
+        timeout=10,
+        output_dir="wavs",
+    )
+
+    assert {task["uttid"] for task in tasks} == {"utt-1", "utt-2", "utt-3"}
+
+
+def test_make_tasks_still_supports_more_requests_than_corpus_entries():
+    tasks = benchmark._make_tasks([("utt-1", "one")], 2, "url", None, 128, 22050, 10, None)
+
+    assert len(tasks) == 2

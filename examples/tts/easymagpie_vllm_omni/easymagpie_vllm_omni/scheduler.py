@@ -88,6 +88,17 @@ class EasyMagpieARAsyncScheduler(OmniARAsyncScheduler):
             self._emp_stopped_this_step = None
         return outputs
 
+    def _handle_stopped_request(self, request: Request) -> bool:
+        # The input engine queues ``None`` after the final StreamingInput but
+        # leaves the existing session's ``resumable`` flag set. Clear it before
+        # the base handler consumes the sentinel so the chunk-transfer adapter
+        # emits a true terminal payload and releases request-persistent codec
+        # state. An empty queue still means "waiting for more websocket input".
+        streaming_queue = getattr(request, "streaming_queue", None)
+        if getattr(request, "resumable", False) and streaming_queue and streaming_queue[0] is None:
+            request.resumable = False
+        return super()._handle_stopped_request(request)
+
     def _update_request_as_session(self, session: Request, update: StreamingUpdate) -> None:
         outstanding_async_tokens = getattr(session, "num_output_placeholders", 0)
         super()._update_request_as_session(session, update)
