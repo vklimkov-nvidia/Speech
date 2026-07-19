@@ -67,14 +67,16 @@ EASYMAGPIE_PIPELINE = PipelineConfig(
         ),
         StagePipelineConfig(
             stage_id=1,
-            model_stage="easymagpie_code2wav",
+            model_stage="easymagpie_codec",
             execution_type=StageExecutionType.LLM_GENERATION,
             input_sources=(0,),
             final_output=True,
             final_output_type="audio",
             engine_output_type="audio",
-            model_arch="EasyMagpieCode2Wav",
-            # Sync mode uses a length-only prompt; the connector carries codec data.
+            model_arch="EasyMagpieCodecForConditionalGeneration",
+            model_subdir="codec_native",
+            scheduler_cls="easymagpie_vllm_omni.scheduler.EasyMagpieCodecScheduler",
+            # Sync mode uses one placeholder per frame; the connector carries codes.
             sync_process_input_func=f"{_PROC}.talker2code2wav_token_only",
             sampling_constraints={"detokenize": True},
         ),

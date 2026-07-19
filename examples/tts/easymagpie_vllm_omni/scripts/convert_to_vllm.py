@@ -30,17 +30,10 @@ It contains:
 * ``speaker_embeddings/<name>.pt`` (optional) — pre-computed speaker-encoder
   outputs for one or more reference audio files, used as the ``speaker_embedding``
   input at inference time.
-* ``codec/`` (optional, on by default) — the exported audio codec so the
-  in-engine two-stage pipeline's Code2Wav stage
-  (:class:`easymagpie_vllm_omni.code2wav.EasyMagpieCode2Wav`) can decode acoustic
-  codes to a waveform without an external Triton/TRT codec service. The default
-  ``--codec_bundle_mode exported`` uses ``torch.export`` to serialize the original
-  NeMo decode graph as ``codec/codec_decoder.pt2``. It serves with only PyTorch,
-  vLLM, and vLLM-Omni installed; no codec reimplementation or NeMo runtime is
-  required. ``--codec_bundle_mode nemo`` instead copies
-  ``codec/codec.nemo`` + ``codec/vector_quantizer.yaml`` (Code2Wav loads it via
-  NeMo at serve time); ``both`` writes both. Disable with ``--no_bundle_codec``
-  when serving the talker only (single-stage / external codec).
+* ``codec_native/`` (optional, on by default) — the causal audio codec converted
+  to a stateful vLLM model for the in-engine second stage. Legacy ``exported`` and
+  ``nemo`` bundle modes remain available for debugging. Disable codec conversion
+  with ``--no-bundle-codec`` when serving the talker only.
 
 Compared to running the reference model, the character-aware subword (CAS)
 encoder is collapsed into a single pre-computed lookup table mapping
@@ -63,6 +56,8 @@ import argparse
 import json
 import os
 import shutil
+import subprocess
+import sys
 
 import torch
 import tqdm
@@ -171,18 +166,18 @@ def parse_args():
         "--bundle_codec",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="Bundle the codec into the model dir (codec/) so the in-engine two-stage "
-        "pipeline's Code2Wav can decode without an external codec service. Use "
+        help="Bundle the codec into the model dir so the in-engine two-stage native codec "
+        "can decode without an external codec service. Use "
         "--no-bundle-codec to serve the talker only.",
     )
     parser.add_argument(
         "--codec_bundle_mode",
-        choices=["exported", "nemo", "both"],
-        default="exported",
-        help="How to bundle the codec (when --bundle_codec is set). 'exported' (default) "
-        "serializes the original NeMo decode graph with torch.export so serving needs only "
-        "PyTorch / vLLM / vLLM-Omni. 'nemo' copies the codec .nemo + vector_quantizer.yaml "
-        "(Code2Wav loads it via NeMo at serve time). 'both' writes both.",
+        choices=["native", "exported", "nemo", "both"],
+        default="native",
+        help="How to bundle the codec (when --bundle_codec is set). 'native' (default) "
+        "converts a stateful vLLM model under codec_native/. The legacy 'exported' mode "
+        "writes a stateless torch.export graph; 'nemo' copies the original checkpoint, "
+        "and 'both' writes both legacy formats.",
     )
     parser.add_argument(
         "--codec_export_frames",
@@ -487,6 +482,28 @@ def bundle_codec(model, codec_model_path: str, outdir: str) -> dict:
     return fragment
 
 
+def bundle_native_codec(codec_model_path: str, outdir: str) -> None:
+    """Convert the causal codec to the stateful vLLM model subdirectory."""
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    plugin_dir = os.path.abspath(os.path.join(script_dir, "..", "..", "easymagpie_codec_vllm"))
+    converter = os.path.join(plugin_dir, "scripts", "convert_codec.py")
+    output = os.path.join(outdir, "codec_native")
+    env = os.environ.copy()
+    existing_pythonpath = env.get("PYTHONPATH")
+    env["PYTHONPATH"] = plugin_dir + (os.pathsep + existing_pythonpath if existing_pythonpath else "")
+    logging.info("Converting native stateful codec %s -> %s", codec_model_path, output)
+    subprocess.run(
+        [
+            sys.executable,
+            converter,
+            codec_model_path,
+            output,
+        ],
+        check=True,
+        env=env,
+    )
+
+
 def save_text_tokenizer(model, outdir: str, override: str | None) -> None:
     """Export the checkpoint's text-conditioning tokenizer into ``outdir``."""
     from transformers import AutoTokenizer
@@ -529,11 +546,11 @@ def convert(args) -> None:
 
     # ── 2. config.json ───────────────────────────────────────────────────
     config = build_config(model, vocab_size, args.dtype)
-    # Bundle the codec so the in-engine two-stage Code2Wav can decode acoustic
-    # codes to a waveform (writes into codec/ and records relative paths in
-    # config.json). The default 'exported' mode produces a NeMo-free decode
-    # bundle; 'nemo' copies the codec .nemo; 'both' writes both.
+    # Bundle the codec used by the second pipeline stage. Native mode writes a
+    # standalone stateful vLLM model; legacy modes keep the old debug bundles.
     if args.bundle_codec:
+        if args.codec_bundle_mode == "native":
+            bundle_native_codec(args.codec_model_path, args.outdir)
         if args.codec_bundle_mode in ("exported", "both"):
             config.update(
                 export_codec(

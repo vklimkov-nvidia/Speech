@@ -93,8 +93,8 @@ At 128 requests and concurrency 32:
 
     Model, whole-text input: 11.32 req/s, 68.20x RTF, 106.2 ms mean TTFT
     Model, 5 tokens/input chunk: 10.41 req/s, 62.62x RTF, 103.0 ms mean TTFT
-    HTTP service, whole-text input: 8.30 req/s, 44.08x RTF, 630.2 ms mean TTFA, 0/1,180 underruns
-    WebSocket service, 5 tokens/input chunk: 7.03 req/s, 40.47x RTF, 723.8 ms mean TTFA, 0/1,215 underruns
+    HTTP service, whole-text input: 8.73 req/s, 51.79x RTF, 512.9 ms mean TTFA, 0/1,321 underruns
+    WebSocket service, 5 tokens/input chunk: 7.67 req/s, 46.98x RTF, 614.5 ms mean TTFA, 0/1,305 underruns
 
 Benchmark incremental WebSocket input with five tokenizer IDs per message:
 

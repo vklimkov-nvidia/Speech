@@ -16,17 +16,12 @@ connectors:
       connector_get_sleep_s: 0.01
       connector_get_max_wait_first_chunk: 3000
       connector_get_max_wait: 300
-      # The causal decoder's measured receptive field is 0.854 s: 11 stacked
-      # (80 ms) past frames. The 19-frame export therefore permits 8 new frames
-      # per steady chunk. Start with two 6-frame bodies (0.48 s audio each),
-      # then use 8 frames; this avoids playback underruns on the RTX A6000 while
-      # keeping TTFA relatively low.
+      # Native vLLM state pages retain the decoder's exact causal histories;
+      # codec_left_context_frames documents the equivalent 0.88 s replay window.
+      codec_stateful: true
       codec_chunk_frames: 8
       codec_left_context_frames: 11
-      codec_startup_chunk_frames: [6, 6]
-      codec_fixed_chunk_frames: 19
-      decode_cudagraph_capture_frames: [19]
-      decode_cudagraph_batch_sizes: [1, 2, 4, 8, 16, 32]
+      codec_startup_chunk_frames: [5, 6]
 
 stages:
   # Keep engine settings flat at the stage level; nested settings are not parsed.
@@ -55,11 +50,11 @@ stages:
     max_num_seqs: 32
     gpu_memory_utilization: 0.35
     enforce_eager: true
-    # Codec graph replays share static buffers and must not overlap.
     async_scheduling: false
     enable_prefix_caching: false
-    # 32 sequences × 16 codebooks × 19 frames require at least 9728 tokens.
-    max_num_batched_tokens: 10240
+    # Codec chunks are atomic: never split one request's state update across steps.
+    enable_chunked_prefill: false
+    max_num_batched_tokens: 512
     max_model_len: 512
     devices: "0"
     input_connectors:

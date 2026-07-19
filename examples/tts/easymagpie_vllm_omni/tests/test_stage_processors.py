@@ -200,3 +200,23 @@ def test_async_codec_rejects_invalid_startup_chunk_ramp():
 
     with pytest.raises(ValueError, match="codec_startup_chunk_frames"):
         talker2code2wav_async_chunk(manager, _output(1), _Request())
+
+
+def test_stateful_codec_emits_only_new_time_major_rows():
+    manager = _manager()
+    manager.config.hf_config.streaming_speech_delay = 0
+    manager.connector.config["extra"].update({"codec_chunk_frames": 2, "codec_stateful": True})
+    request = _Request()
+
+    assert talker2code2wav_async_chunk(manager, _output(1), request) is None
+    first = talker2code2wav_async_chunk(manager, _output(2), request)
+    assert first.codes.audio.shape == (2, 2)
+    torch.testing.assert_close(first.codes.audio, torch.tensor([[1, 101], [2, 102]]))
+    assert first.meta.left_context_size == 0
+    assert manager._emp_frame_buffer[request.external_req_id] == []
+
+    assert talker2code2wav_async_chunk(manager, _output(3), request) is None
+    second = talker2code2wav_async_chunk(manager, _output(4), request)
+    assert second.codes.audio.shape == (2, 2)
+    torch.testing.assert_close(second.codes.audio, torch.tensor([[3, 103], [4, 104]]))
+    assert manager._emp_frame_buffer_base[request.external_req_id] == 4

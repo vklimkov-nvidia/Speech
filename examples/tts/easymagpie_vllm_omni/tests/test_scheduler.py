@@ -14,12 +14,17 @@
 """Tests for the vLLM-Omni 0.24 async scheduler compatibility layer."""
 from __future__ import annotations
 
+import threading
 from collections import deque
 from types import SimpleNamespace
 
 import pytest
-from easymagpie_vllm_omni.scheduler import EasyMagpieARAsyncScheduler
+import torch
+from easymagpie_vllm_omni.scheduler import EasyMagpieARAsyncScheduler, _poll_native_codec_chunk
 from vllm_omni.core.sched.omni_ar_scheduler import OmniARAsyncScheduler
+from vllm_omni.distributed.omni_connectors.transfer_adapter.chunk_transfer_adapter import (
+    OmniChunkTransferAdapter,
+)
 
 
 def test_no_stop_is_inert_for_non_resumable_requests(monkeypatch):
@@ -156,3 +161,49 @@ def test_resume_uses_exact_discard_count_and_forwards_chunk_metadata(monkeypatch
     assert session.num_computed_tokens == 18
     assert session.max_tokens == 5
     assert session.additional_information == {"text_token": [2, 3]}
+
+
+def test_native_codec_chunk_appends_prompt_without_resetting_state(monkeypatch):
+    adapter = object.__new__(OmniChunkTransferAdapter)
+    adapter._easymagpie_num_quantizers = 2
+    adapter._easymagpie_chunk_lock = threading.Lock()
+    adapter.get_req_chunk = {"request": 1}
+    request = SimpleNamespace(
+        prompt_token_ids=[0, 0],
+        request_id="request",
+        _all_token_ids=[0, 0],
+        num_computed_tokens=2,
+        num_prompt_tokens=2,
+        additional_information=None,
+        update_block_hashes=lambda: None,
+    )
+
+    def fake_poll(self, req):
+        req.prompt_token_ids = [0]
+        req._all_token_ids[:] = []
+        req.num_computed_tokens = 0
+        req.additional_information = {"codes": {"audio": torch.ones((3, 2), dtype=torch.long)}}
+        return True
+
+    monkeypatch.setattr(OmniChunkTransferAdapter, "_poll_single_request", fake_poll)
+
+    assert _poll_native_codec_chunk(adapter, request) is True
+    assert request.prompt_token_ids == [0, 0, 0, 0, 0]
+    assert request._all_token_ids == [0, 0, 0, 0, 0]
+    assert request.num_prompt_tokens == 5
+    assert request.num_computed_tokens == 2
+    assert request.additional_information["codes"]["audio"].shape == (3, 2)
+
+    prewarm_request = SimpleNamespace(
+        prompt_token_ids=[0],
+        request_id="request",
+        _all_token_ids=[0],
+        num_computed_tokens=0,
+        num_prompt_tokens=1,
+        additional_information=None,
+        update_block_hashes=lambda: None,
+    )
+    assert _poll_native_codec_chunk(adapter, prewarm_request) is True
+    assert prewarm_request.prompt_token_ids == [0, 0, 0]
+    assert prewarm_request._all_token_ids == [0, 0, 0]
+    assert prewarm_request.num_computed_tokens == 0

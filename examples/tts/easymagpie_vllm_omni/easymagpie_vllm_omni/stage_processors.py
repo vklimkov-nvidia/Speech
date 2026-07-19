@@ -11,10 +11,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Transfer stacked acoustic codes from the talker to Code2Wav.
+"""Transfer stacked acoustic codes from the talker to the native codec.
 
-Stage 0 emits ``[frames, codebooks]`` codes. Stage 1 consumes the corresponding
-codebook-major flat stream.
+Stage 0 emits ``[frames, codebooks]`` codes. The stateful Stage 1 consumes one
+placeholder and one code row per newly generated acoustic frame.
 """
 from __future__ import annotations
 
@@ -31,7 +31,6 @@ logger = init_logger(__name__)
 
 # Base codebook size, excluding control tokens.
 _CODEBOOK_SIZE = 1024
-_NUM_QUANTIZERS_DEFAULT = 16
 
 
 def _empty_finished_payload() -> dict[str, Any]:
@@ -105,10 +104,10 @@ def talker2code2wav_token_only(
     prompt=None,
     _requires_multimodal_data: bool = False,
 ) -> list:
-    """Sync-side length-only placeholder for the non-async-chunk Stage-1 input.
+    """Sync-side one-placeholder-per-frame Stage-1 input.
 
-    Sized to ``Q * num_audio_frames``; the real codec ids ship via the worker
-    connector payload built by :func:`talker2code2wav_full_payload`.
+    The real codec rows ship via the worker connector payload built by
+    :func:`talker2code2wav_full_payload`.
     """
     from vllm_omni.inputs.data import OmniTokensPrompt
 
@@ -127,15 +126,12 @@ def talker2code2wav_token_only(
             if seq_len > 0 and audio.ndim == 2 and int(audio.shape[0]) > seq_len:
                 audio = audio[-seq_len:]
             num_frames = int(audio.shape[0]) if audio.ndim == 2 else 0
-            num_quantizers = int(audio.shape[1]) if audio.ndim == 2 and audio.shape[1] > 0 else _NUM_QUANTIZERS_DEFAULT
         else:
             num_frames = 0
-            num_quantizers = _NUM_QUANTIZERS_DEFAULT
 
-        prompt_len = num_quantizers * num_frames
         code2wav_inputs.append(
             OmniTokensPrompt(
-                prompt_token_ids=[0] * prompt_len,
+                prompt_token_ids=[0] * num_frames,
                 additional_information=None,
                 multi_modal_data=None,
                 mm_processor_kwargs=None,
@@ -191,9 +187,8 @@ def talker2code2wav_full_payload(transfer_manager, multimodal_output, request, i
     if seq_len > 0 and audio.ndim == 2 and int(audio.shape[0]) > seq_len:
         audio = audio[-seq_len:]
 
-    codec_codes = _flatten_codebook_major(audio)
     return {
-        "codes": {"audio": codec_codes},
+        "codes": {"audio": audio.to(device="cpu", dtype=torch.long).contiguous()},
         "meta": {"finished": torch.tensor(True, dtype=torch.bool)},
     }
 
@@ -281,7 +276,7 @@ def talker2code2wav_async_chunk(
     request: Any,
     is_finished: bool = False,
 ) -> OmniPayloadStruct | None:
-    """Emit a codec window with bounded left context.
+    """Emit new codec rows, with optional stateless left-context replay.
 
     ``multimodal_output`` must retain this name because the transfer adapter
     passes it by keyword.
@@ -322,6 +317,7 @@ def talker2code2wav_async_chunk(
     raw_cfg = getattr(connector, "config", {}) or {}
     cfg = raw_cfg.get("extra", raw_cfg) if isinstance(raw_cfg, dict) else {}
     chunk_size = int(cfg.get("codec_chunk_frames", 25))
+    stateful_codec = bool(cfg.get("codec_stateful", False))
     left_context_size_config = int(cfg.get("codec_left_context_frames", 0))
     initial_chunk_size = int(cfg.get("initial_codec_chunk_frames") or 0)
     if initial_chunk_size > chunk_size > 0:
@@ -346,7 +342,7 @@ def talker2code2wav_async_chunk(
     startup_windows_fit = True
     for value in startup_chunk_sizes:
         startup_left_context = min(left_context_size_config, startup_cursor)
-        startup_windows_fit &= startup_left_context + value <= fixed_window_size
+        startup_windows_fit &= stateful_codec or startup_left_context + value <= fixed_window_size
         startup_cursor += value
 
     if (
@@ -354,7 +350,7 @@ def talker2code2wav_async_chunk(
         or left_context_size_config < 0
         or initial_chunk_size < 0
         or fixed_window_size <= 0
-        or left_context_size_config + chunk_size > fixed_window_size
+        or (not stateful_codec and left_context_size_config + chunk_size > fixed_window_size)
         or any(value <= 0 for value in startup_chunk_sizes)
         or not startup_windows_fit
     ):
@@ -430,24 +426,25 @@ def talker2code2wav_async_chunk(
 
     new_start = emitted
     new_end = emitted + context_length
-    # Overlap left-context = already-emitted frames immediately before the new
-    # span (stage 1 decodes them for receptive field but discards their audio).
-    # Cap the total window to the codec's fixed frame budget.
-    left_context_size = min(left_context_size_config, new_start)
-    max_window = fixed_window_size
-    if left_context_size + context_length > max_window:
-        left_context_size = max(0, max_window - context_length)
+    # Native vLLM state retains the exact per-layer causal history, so only new
+    # rows are submitted. The legacy stateless path still replays left context.
+    left_context_size = 0 if stateful_codec else min(left_context_size_config, new_start)
+    if not stateful_codec and left_context_size + context_length > fixed_window_size:
+        left_context_size = max(0, fixed_window_size - context_length)
     window_start = new_start - left_context_size
     relative_start = window_start - base_index
     relative_end = new_end - base_index
     window_frames = torch.stack(buffer[relative_start:relative_end], dim=0)
-    code_predictor_codes = window_frames.transpose(0, 1).reshape(-1).contiguous()
+    if stateful_codec:
+        code_predictor_codes = window_frames.contiguous()
+    else:
+        code_predictor_codes = window_frames.transpose(0, 1).reshape(-1).contiguous()
 
     emitted_state[request_id] = new_end
     emitted_chunks_state[request_id] += 1
     # Retain only context that can participate in the next fixed-shape window.
     # This bounds state to left-context plus pending frames, not the utterance.
-    keep_from = max(0, new_end - left_context_size_config)
+    keep_from = new_end if stateful_codec else max(0, new_end - left_context_size_config)
     drop = keep_from - base_index
     if drop > 0:
         del buffer[:drop]

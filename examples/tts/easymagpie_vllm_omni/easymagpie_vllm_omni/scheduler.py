@@ -19,9 +19,14 @@ Configure it on a single-stage deployment with::
 """
 from __future__ import annotations
 
-from vllm.v1.request import Request, StreamingUpdate
+import threading
+from types import MethodType
 
+import torch
+from vllm.v1.request import Request, StreamingUpdate
 from vllm_omni.core.sched.omni_ar_scheduler import OmniARAsyncScheduler
+from vllm_omni.core.sched.omni_generation_scheduler import OmniGenerationScheduler
+from vllm_omni.distributed.omni_connectors.transfer_adapter.chunk_transfer_adapter import OmniChunkTransferAdapter
 
 
 class EasyMagpieARAsyncScheduler(OmniARAsyncScheduler):
@@ -126,3 +131,65 @@ class EasyMagpieARAsyncScheduler(OmniARAsyncScheduler):
         # prompt cache hit (see Scheduler._update_waiting_for_remote_kv).
         if session.num_computed_tokens >= session.num_tokens:
             session.num_computed_tokens = session.num_tokens - 1
+
+
+def _codec_payload_frames(info, num_quantizers: int) -> int:
+    """Return the number of time-major acoustic rows in a connector payload."""
+    codes = info.get("codes", {}) if isinstance(info, dict) else {}
+    audio = codes.get("audio") if isinstance(codes, dict) else None
+    if not isinstance(audio, torch.Tensor) or audio.numel() == 0:
+        return 0
+    if audio.ndim == 2:
+        return int(audio.shape[0])
+    if audio.ndim == 1 and audio.numel() % num_quantizers == 0:
+        return int(audio.numel() // num_quantizers)
+    raise ValueError(f"invalid native codec payload shape: {tuple(audio.shape)}")
+
+
+def _poll_native_codec_chunk_unlocked(adapter: OmniChunkTransferAdapter, request: Request) -> bool:
+    """Receive a chunk without resetting the vLLM state-cache position."""
+    old_num_computed_tokens = request.num_computed_tokens
+    # Async-chunk prewarm may install one unscheduled placeholder before the
+    # first real payload. Only tokens with materialized state are retained.
+    old_prompt = list(request.prompt_token_ids or [])[:old_num_computed_tokens]
+    old_all_token_ids = list(request._all_token_ids)[:old_num_computed_tokens]
+
+    received = OmniChunkTransferAdapter._poll_single_request(adapter, request)
+    if not received:
+        return False
+
+    frames = _codec_payload_frames(request.additional_information, adapter._easymagpie_num_quantizers)
+    placeholders = [0] * frames
+    request.prompt_token_ids = old_prompt + placeholders
+    request._all_token_ids[:] = old_all_token_ids + placeholders
+    request.num_prompt_tokens = len(request.prompt_token_ids)
+    request.num_computed_tokens = old_num_computed_tokens
+    request.update_block_hashes()
+    return True
+
+
+def _poll_native_codec_chunk(adapter: OmniChunkTransferAdapter, request: Request) -> bool:
+    """Publish connector readiness only after the request payload is coherent."""
+    with adapter._easymagpie_chunk_lock:
+        return _poll_native_codec_chunk_unlocked(adapter, request)
+
+
+class EasyMagpieCodecScheduler(OmniGenerationScheduler):
+    """Keep each Stage-1 stream on one append-only native vLLM request."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        adapter = self.chunk_transfer_adapter
+        if adapter is None:
+            raise ValueError("the native EasyMagpie codec requires async_chunk")
+        config = self.vllm_config.model_config.hf_config
+        num_quantizers = int(getattr(config, "num_stacked_codebooks", 0))
+        if num_quantizers <= 0:
+            raise ValueError("native EasyMagpie codec config has no stacked codebooks")
+        adapter._easymagpie_chunk_lock = threading.Lock()
+        adapter._easymagpie_num_quantizers = num_quantizers
+        adapter._poll_single_request = MethodType(_poll_native_codec_chunk, adapter)
+
+    def schedule(self, *args, **kwargs):
+        with self.chunk_transfer_adapter._easymagpie_chunk_lock:
+            return super().schedule(*args, **kwargs)

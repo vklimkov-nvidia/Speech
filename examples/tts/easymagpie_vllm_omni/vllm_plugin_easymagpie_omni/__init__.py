@@ -16,13 +16,13 @@
 _TARGET = "easymagpie_vllm_omni.easymagpie:EasyMagpieTTSForConditionalGeneration"
 _ARCHS = ("EasyMagpieTTS", "EasyMagpieTTSForConditionalGeneration")
 
-_CODE2WAV_TARGET = "easymagpie_vllm_omni.code2wav:EasyMagpieCode2Wav"
-_CODE2WAV_ARCH = "EasyMagpieCode2Wav"
-
 
 def register() -> None:
     """Register model architectures in both vLLM registries."""
     from vllm import ModelRegistry
+    from vllm_plugin_easymagpie_codec import register as register_codec
+
+    register_codec()
 
     registries = [ModelRegistry]
     omni_available = False
@@ -39,9 +39,6 @@ def register() -> None:
         for arch in _ARCHS:
             if arch not in registry.get_supported_archs():
                 registry.register_model(arch, _TARGET)
-        # Model validation and stage resolution consult different registries.
-        if _CODE2WAV_ARCH not in registry.get_supported_archs():
-            registry.register_model(_CODE2WAV_ARCH, _CODE2WAV_TARGET)
 
     if omni_available:
         _register_pipeline()
