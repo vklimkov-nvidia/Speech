@@ -16,7 +16,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from easymagpie_codec_vllm.model import EasyMagpieCodecForConditionalGeneration
+from easymagpie_vllm_omni.codec.model import EasyMagpieCodecForConditionalGeneration
 
 
 def _payload(frames: int, codebooks: int = 16) -> dict:

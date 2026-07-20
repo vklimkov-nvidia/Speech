@@ -16,8 +16,8 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from easymagpie_codec_vllm.kernels import packed_causal_conv1d, packed_causal_conv_transpose1d, packed_half_snake
-from easymagpie_codec_vllm.packed import CODEC_STATE_ELEMENTS
+from easymagpie_vllm_omni.codec.kernels import packed_causal_conv1d, packed_causal_conv_transpose1d, packed_half_snake
+from easymagpie_vllm_omni.codec.packed import CODEC_STATE_ELEMENTS
 
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for Triton kernel tests")

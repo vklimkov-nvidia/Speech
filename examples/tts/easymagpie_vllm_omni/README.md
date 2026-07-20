@@ -8,7 +8,7 @@ The in-engine **two-stage pipeline** chains:
 | Stage | Role |
 |-------|------|
 | **0 — talker** | Autoregressive Nemotron-H + local transformer → stacked acoustic codes |
-| **1 — code2wav** | Bundled NeMo codec decoder (`torch.export`, optional CUDA graph) → 22.05 kHz waveform |
+| **1 — codec** | Stateful native vLLM codec → 22.05 kHz waveform |
 
 Model definition and pipeline registration live in
 [`easymagpie_vllm_omni/`](easymagpie_vllm_omni/) and
@@ -18,8 +18,9 @@ Deployment knobs are in [`deploy/easymagpie.yaml`](deploy/easymagpie.yaml).
 ### Convert a NeMo checkpoint
 
 This step turns the training-time `.nemo` checkpoints into a self-contained
-vLLM-Omni model directory: a) converts the talker weights to Safetensors,
-b) precomputes the text-embedding lookup, c) saves the tokenizer and optional speaker embedding, d) exports the codec graph and weights as a NeMo-free `torch.export` artifact. Run the converter in the **NeMo environment** from the repository root:
+vLLM-Omni model directory: it converts the talker and causal codec to native
+vLLM models, precomputes the text-embedding lookup, and saves the tokenizer and
+optional speaker embedding. Run it in the **NeMo environment** from the repository root:
 
 ```bash
 python examples/tts/easymagpie_vllm_omni/scripts/convert_to_vllm.py \
@@ -35,7 +36,7 @@ python examples/tts/easymagpie_vllm_omni/scripts/convert_to_vllm.py \
 
 Create a separate, clean environment for inference. It needs a GPU,
 matching **vLLM 0.24 / vLLM-Omni 0.24** versions, and this package. It does not
-need NeMo when using the default exported codec bundle:
+need NeMo after conversion; serving uses the native codec bundle:
 
 ```bash
 cd examples/tts/easymagpie_vllm_omni
@@ -87,14 +88,14 @@ Benchmark running service:
 python scripts/benchmark_server.py --text-file vctk_subset.txt -n 128 -c 1 32
 ```
 
-#### RTX A6000 reference (2026-07-19)
+#### RTX A6000 reference (2026-07-20)
 
 At 128 requests and concurrency 32:
 
-    Model, whole-text input: 11.32 req/s, 68.20x RTF, 106.2 ms mean TTFT
-    Model, 5 tokens/input chunk: 10.41 req/s, 62.62x RTF, 103.0 ms mean TTFT
-    HTTP service, whole-text input: 8.73 req/s, 51.79x RTF, 512.9 ms mean TTFA, 0/1,321 underruns
-    WebSocket service, 5 tokens/input chunk: 7.67 req/s, 46.98x RTF, 614.5 ms mean TTFA, 0/1,305 underruns
+    Model, whole-text input: 11.20 req/s, 67.75x RTF, 107.3 ms mean TTFT
+    Model, 5 tokens/input chunk: 10.44 req/s, 63.01x RTF, 105.1 ms mean TTFT
+    HTTP service, whole-text input: 8.76 req/s, 52.79x RTF, 514.0 ms mean TTFA, 0/1,337 underruns
+    WebSocket service, 5 tokens/input chunk: 8.02 req/s, 45.90x RTF, 608.3 ms mean TTFA, 0/1,225 underruns
 
 Benchmark incremental WebSocket input with five tokenizer IDs per message:
 

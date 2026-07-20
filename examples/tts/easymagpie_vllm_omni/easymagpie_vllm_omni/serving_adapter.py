@@ -147,9 +147,9 @@ def _build_adapter_cls() -> type:
                 raise ValueError("EasyMagpie config must define text_vocab_size")
 
             sample_rate = 22050
-            codec_export = model_path / "codec" / "codec_export.json"
-            if codec_export.exists():
-                codec_config = json.loads(codec_export.read_text())
+            codec_config_path = model_path / "codec_native" / "config.json"
+            if codec_config_path.exists():
+                codec_config = json.loads(codec_config_path.read_text())
                 sample_rate = int(codec_config.get("output_sample_rate", sample_rate))
 
             return EasyMagpieStreamingSpec(

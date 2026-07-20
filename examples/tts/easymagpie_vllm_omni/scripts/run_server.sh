@@ -6,12 +6,11 @@ MODEL="${1:?Usage: run_server.sh <model_dir> [port]}"
 PORT="${2:-8091}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-CODEC_PLUGIN_DIR="$(realpath "${SCRIPT_DIR}/../../easymagpie_codec_vllm")"
 DEPLOY_CONFIG="${EASYMAGPIE_DEPLOY_CONFIG:-${SCRIPT_DIR}/../deploy/easymagpie.yaml}"
 
 echo "Starting EasyMagpieTTS: model=${MODEL} deploy=${DEPLOY_CONFIG} port=${PORT}"
 
-PYTHONPATH="${CODEC_PLUGIN_DIR}${PYTHONPATH:+:${PYTHONPATH}}" VLLM_PLUGINS=easymagpie_omni vllm serve "$MODEL" \
+VLLM_PLUGINS=easymagpie_omni vllm serve "$MODEL" \
     --deploy-config "$DEPLOY_CONFIG" \
     --host 0.0.0.0 \
     --port "$PORT" \

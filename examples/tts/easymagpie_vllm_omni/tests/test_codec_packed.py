@@ -14,9 +14,9 @@
 
 import pytest
 import torch
-from easymagpie_codec_vllm.codec import EasyMagpieCodec
-from easymagpie_codec_vllm.config import EasyMagpieCodecConfig
-from easymagpie_codec_vllm.packed import CODEC_STATE_ELEMENTS, CodecStateLayer, PackedEasyMagpieCodec
+from easymagpie_vllm_omni.codec.codec import EasyMagpieCodec
+from easymagpie_vllm_omni.codec.config import EasyMagpieCodecConfig
+from easymagpie_vllm_omni.codec.packed import CODEC_STATE_ELEMENTS, CodecStateLayer, PackedEasyMagpieCodec
 from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.forward_context import set_forward_context
 from vllm.v1.attention.backends.mamba1_attn import Mamba1AttentionMetadata

@@ -31,9 +31,8 @@ It contains:
   outputs for one or more reference audio files, used as the ``speaker_embedding``
   input at inference time.
 * ``codec_native/`` (optional, on by default) — the causal audio codec converted
-  to a stateful vLLM model for the in-engine second stage. Legacy ``exported`` and
-  ``nemo`` bundle modes remain available for debugging. Disable codec conversion
-  with ``--no-bundle-codec`` when serving the talker only.
+  to a stateful vLLM model for the in-engine second stage. Disable codec conversion
+  with ``--no-bundle-codec`` when serving the talker-only pipeline.
 
 Compared to running the reference model, the character-aware subword (CAS)
 encoder is collapsed into a single pre-computed lookup table mapping
@@ -54,20 +53,16 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
-import shutil
 import subprocess
 import sys
 
 import torch
 import tqdm
-from codec_export import export_codec_decoder
 from omegaconf import OmegaConf
 from safetensors.torch import save_file
 
-from nemo.collections.tts.modules.magpietts_inference.utils import ModelLoadConfig, load_easy_magpie_model
-from nemo.collections.tts.modules.magpietts_modules import add_special_tokens
-from nemo.utils import logging
 
 # Top-level checkpoint key prefixes the vLLM model's ``load_weights`` consumes
 # for the TTS submodules (everything else under these names maps 1:1 into the
@@ -170,33 +165,6 @@ def parse_args():
         "can decode without an external codec service. Use "
         "--no-bundle-codec to serve the talker only.",
     )
-    parser.add_argument(
-        "--codec_bundle_mode",
-        choices=["native", "exported", "nemo", "both"],
-        default="native",
-        help="How to bundle the codec (when --bundle_codec is set). 'native' (default) "
-        "converts a stateful vLLM model under codec_native/. The legacy 'exported' mode "
-        "writes a stateless torch.export graph; 'nemo' copies the original checkpoint, "
-        "and 'both' writes both legacy formats.",
-    )
-    parser.add_argument(
-        "--codec_export_frames",
-        type=int,
-        default=19,
-        help="Fixed model-frame input length for the exported codec (must match codec_fixed_chunk_frames).",
-    )
-    parser.add_argument(
-        "--codec_export_max_batch_size",
-        type=int,
-        default=32,
-        help="Maximum dynamic batch size accepted by the exported codec.",
-    )
-    parser.add_argument(
-        "--codec_export_atol",
-        type=float,
-        default=2e-3,
-        help="Absolute tolerance for the post-save exported-codec parity check.",
-    )
     parser.add_argument("--context_audio_duration", type=float, default=5.0)
     parser.add_argument(
         "--dtype",
@@ -255,6 +223,8 @@ def extract_speaker_embedding(model, context_audio_path: str, context_audio_dura
     per-codebook tokens, and (when enabled) run the speaker encoder. Returns the
     ``(T_audio, embedding_dim)`` tensor consumed as the model's ``speaker_embedding``.
     """
+    from nemo.collections.tts.modules.magpietts_modules import add_special_tokens
+
     device = next(model.parameters()).device
 
     context_audio = model._load_audio_for_inference(context_audio_path, model.sample_rate)
@@ -420,77 +390,15 @@ def select_weights(state_dict: dict, hidden_dim: int, dtype: torch.dtype) -> dic
     return weights
 
 
-def export_codec(model, outdir: str, *, frames: int, max_batch_size: int, device: str, atol: float) -> dict:
-    """Serialize the original NeMo codec decode path as a NeMo-free ExportedProgram."""
-    codec_dir = os.path.join(outdir, "codec")
-    os.makedirs(codec_dir, exist_ok=True)
-    program_path = os.path.join(codec_dir, "codec_decoder.pt2")
-    metadata_path = os.path.join(codec_dir, "codec_export.json")
-    metadata = export_codec_decoder(
-        model,
-        program_path,
-        metadata_path,
-        frames=frames,
-        max_batch_size=max_batch_size,
-        device=torch.device(device),
-        atol=atol,
-    )
-    logging.info(
-        "Saved codec ExportedProgram -> %s (frames=%d, max_batch=%d, samples_per_frame=%d, parity=%g)",
-        program_path,
-        metadata["frames"],
-        metadata["max_batch_size"],
-        metadata["samples_per_frame"],
-        metadata["parity_max_abs_diff"],
-    )
-    return {
-        "codec_exported_program": "codec/codec_decoder.pt2",
-        "codec_export_metadata": "codec/codec_export.json",
-    }
-
-
-def bundle_codec(model, codec_model_path: str, outdir: str) -> dict:
-    """Copy the codec .nemo + the model's FSQ ``vector_quantizer`` config into ``outdir``.
-
-    The Code2Wav stage rebuilds the exact decode path used by
-    ``scripts/export_codec_decoder_onnx.py`` (clamp specials -> unstack -> FSQ
-    index convert -> ``AudioCodecModel.decode``). It needs (a) the codec
-    checkpoint and (b) the model's regrouped ``vector_quantizer`` config to build
-    the ``VectorQuantizerIndexConverter``. Both are bundled under ``codec/`` and
-    referenced by relative paths in ``config.json``.
-
-    Returns the config.json fragment describing the bundled artifacts.
-    """
-    codec_dir = os.path.join(outdir, "codec")
-    os.makedirs(codec_dir, exist_ok=True)
-
-    codec_dst = os.path.join(codec_dir, "codec.nemo")
-    logging.info(f"Bundling codec checkpoint {codec_model_path} -> {codec_dst}")
-    shutil.copyfile(codec_model_path, codec_dst)
-
-    fragment: dict = {"codec_model_path": "codec/codec.nemo"}
-
-    vq_cfg = model.cfg.get("vector_quantizer")
-    if vq_cfg is not None:
-        vq_dst = os.path.join(codec_dir, "vector_quantizer.yaml")
-        OmegaConf.save(config=vq_cfg, f=vq_dst)
-        fragment["codec_vq_config"] = "codec/vector_quantizer.yaml"
-        logging.info(f"Saved FSQ vector_quantizer config -> {vq_dst}")
-    else:
-        logging.info("Checkpoint has no vector_quantizer override; Code2Wav will use codec native decode.")
-
-    return fragment
-
-
 def bundle_native_codec(codec_model_path: str, outdir: str) -> None:
     """Convert the causal codec to the stateful vLLM model subdirectory."""
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    plugin_dir = os.path.abspath(os.path.join(script_dir, "..", "..", "easymagpie_codec_vllm"))
-    converter = os.path.join(plugin_dir, "scripts", "convert_codec.py")
+    project_dir = os.path.abspath(os.path.join(script_dir, ".."))
+    converter = os.path.join(script_dir, "convert_codec.py")
     output = os.path.join(outdir, "codec_native")
     env = os.environ.copy()
     existing_pythonpath = env.get("PYTHONPATH")
-    env["PYTHONPATH"] = plugin_dir + (os.pathsep + existing_pythonpath if existing_pythonpath else "")
+    env["PYTHONPATH"] = project_dir + (os.pathsep + existing_pythonpath if existing_pythonpath else "")
     logging.info("Converting native stateful codec %s -> %s", codec_model_path, output)
     subprocess.run(
         [
@@ -524,6 +432,8 @@ def save_text_tokenizer(model, outdir: str, override: str | None) -> None:
 
 
 def convert(args) -> None:
+    from nemo.collections.tts.modules.magpietts_inference.utils import ModelLoadConfig, load_easy_magpie_model
+
     os.makedirs(args.outdir, exist_ok=True)
     dtype = {"bfloat16": torch.bfloat16, "float16": torch.float16, "float32": torch.float32}[args.dtype]
 
@@ -546,24 +456,8 @@ def convert(args) -> None:
 
     # ── 2. config.json ───────────────────────────────────────────────────
     config = build_config(model, vocab_size, args.dtype)
-    # Bundle the codec used by the second pipeline stage. Native mode writes a
-    # standalone stateful vLLM model; legacy modes keep the old debug bundles.
     if args.bundle_codec:
-        if args.codec_bundle_mode == "native":
-            bundle_native_codec(args.codec_model_path, args.outdir)
-        if args.codec_bundle_mode in ("exported", "both"):
-            config.update(
-                export_codec(
-                    model,
-                    args.outdir,
-                    frames=args.codec_export_frames,
-                    max_batch_size=args.codec_export_max_batch_size,
-                    device=args.device,
-                    atol=args.codec_export_atol,
-                )
-            )
-        if args.codec_bundle_mode in ("nemo", "both"):
-            config.update(bundle_codec(model, args.codec_model_path, args.outdir))
+        bundle_native_codec(args.codec_model_path, args.outdir)
     with open(os.path.join(args.outdir, "config.json"), "w") as f:
         json.dump(config, f, indent=2)
     logging.info("Saved config.json")

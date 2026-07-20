@@ -20,8 +20,8 @@ from typing import Any
 
 import torch
 import torch.nn as nn
-from easymagpie_codec_vllm.config import EasyMagpieCodecConfig
-from easymagpie_codec_vllm.packed import PackedEasyMagpieCodec
+from easymagpie_vllm_omni.codec.config import EasyMagpieCodecConfig
+from easymagpie_vllm_omni.codec.packed import PackedEasyMagpieCodec
 from vllm.config import VllmConfig
 from vllm.model_executor.layers.mamba.mamba_utils import MambaStateCopyFuncCalculator
 from vllm.model_executor.models.utils import AutoWeightsLoader
@@ -43,7 +43,7 @@ class EasyMagpieCodecForConditionalGeneration(nn.Module):
 
     @classmethod
     def get_mamba_state_shape_from_config(cls, vllm_config: VllmConfig) -> tuple[tuple[int]]:
-        from easymagpie_codec_vllm.packed import CODEC_STATE_ELEMENTS
+        from easymagpie_vllm_omni.codec.packed import CODEC_STATE_ELEMENTS
 
         return ((CODEC_STATE_ELEMENTS,),)
 

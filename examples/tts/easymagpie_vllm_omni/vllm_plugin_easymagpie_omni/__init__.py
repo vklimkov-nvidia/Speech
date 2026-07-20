@@ -15,14 +15,22 @@
 
 _TARGET = "easymagpie_vllm_omni.easymagpie:EasyMagpieTTSForConditionalGeneration"
 _ARCHS = ("EasyMagpieTTS", "EasyMagpieTTSForConditionalGeneration")
+_CODEC_ARCH = "EasyMagpieCodecForConditionalGeneration"
+_CODEC_TARGET = "easymagpie_vllm_omni.codec.model:EasyMagpieCodecForConditionalGeneration"
 
 
 def register() -> None:
     """Register model architectures in both vLLM registries."""
+    from easymagpie_vllm_omni.codec.config import EasyMagpieCodecConfig
+    from transformers import AutoConfig
     from vllm import ModelRegistry
-    from vllm_plugin_easymagpie_codec import register as register_codec
+    from vllm.model_executor.models.config import MODELS_CONFIG_MAP, MambaModelConfig
 
-    register_codec()
+    try:
+        AutoConfig.register(EasyMagpieCodecConfig.model_type, EasyMagpieCodecConfig)
+    except ValueError:
+        pass
+    MODELS_CONFIG_MAP.setdefault(_CODEC_ARCH, MambaModelConfig)
 
     registries = [ModelRegistry]
     omni_available = False
@@ -39,6 +47,8 @@ def register() -> None:
         for arch in _ARCHS:
             if arch not in registry.get_supported_archs():
                 registry.register_model(arch, _TARGET)
+        if _CODEC_ARCH not in registry.get_supported_archs():
+            registry.register_model(_CODEC_ARCH, _CODEC_TARGET)
 
     if omni_available:
         _register_pipeline()

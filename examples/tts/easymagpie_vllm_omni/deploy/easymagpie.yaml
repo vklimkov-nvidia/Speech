@@ -16,11 +16,8 @@ connectors:
       connector_get_sleep_s: 0.01
       connector_get_max_wait_first_chunk: 3000
       connector_get_max_wait: 300
-      # Native vLLM state pages retain the decoder's exact causal histories;
-      # codec_left_context_frames documents the equivalent 0.88 s replay window.
-      codec_stateful: true
+      # Native vLLM state pages retain the decoder's exact causal history.
       codec_chunk_frames: 8
-      codec_left_context_frames: 11
       codec_startup_chunk_frames: [5, 6]
 
 stages:

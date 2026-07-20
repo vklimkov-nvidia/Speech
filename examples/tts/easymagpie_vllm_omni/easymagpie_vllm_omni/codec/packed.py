@@ -13,12 +13,10 @@
 # limitations under the License.
 """Packed decoder layers backed by vLLM-managed fixed-size state pages.
 
-The implementation in this file is intentionally correctness-first: it loops
-over sequence boundaries in eager PyTorch. The layer/cache contract is the one
-the packed Triton kernels will keep, so replacing the loop does not change the
-model definition, weight names, or scheduler integration.
+The CPU fallback intentionally loops over sequence boundaries in eager PyTorch.
+CUDA execution uses packed batched Triton and cuDNN kernels without changing
+the model definition, weight names, or scheduler integration.
 """
-
 from __future__ import annotations
 
 from collections.abc import Iterable
@@ -28,8 +26,8 @@ from typing import Any
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from easymagpie_codec_vllm.config import EasyMagpieCodecConfig
-from easymagpie_codec_vllm.packing import unstack_acoustic_codes
+from easymagpie_vllm_omni.codec.config import EasyMagpieCodecConfig
+from easymagpie_vllm_omni.codec.packing import unstack_acoustic_codes
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
@@ -128,7 +126,7 @@ class PackedHalfSnake(nn.Module):
 
     def forward(self, inputs: torch.Tensor) -> torch.Tensor:
         if inputs.is_cuda:
-            from easymagpie_codec_vllm.kernels import packed_half_snake
+            from easymagpie_vllm_omni.codec.kernels import packed_half_snake
 
             return packed_half_snake(inputs, self.alpha)
         snake_in = inputs[:, : self.snake_channels]
@@ -287,7 +285,7 @@ class PackedCausalConv1d(CodecStateLayer):
         is_decode: bool,
     ) -> torch.Tensor:
         """Run a uniform packed batch through one batched cuDNN convolution."""
-        from easymagpie_codec_vllm.kernels import gather_packed_state_inputs, update_packed_state
+        from easymagpie_vllm_omni.codec.kernels import gather_packed_state_inputs, update_packed_state
 
         inputs = inputs.contiguous()
         if is_decode:
@@ -336,7 +334,7 @@ class PackedCausalConv1d(CodecStateLayer):
         if inputs.shape[0] != expected_rows:
             raise RuntimeError(f"codec metadata describes {expected_rows} rows, got {inputs.shape[0]}")
         if inputs.is_cuda:
-            from easymagpie_codec_vllm.kernels import packed_causal_conv1d
+            from easymagpie_vllm_omni.codec.kernels import packed_causal_conv1d
 
             if getattr(metadata, "codec_uniform", False):
                 if metadata.num_decodes and metadata.num_prefills:
@@ -434,7 +432,7 @@ class PackedCausalConvTranspose1d(CodecStateLayer):
         is_decode: bool,
     ) -> torch.Tensor:
         """Run a uniform packed batch through one batched cuDNN deconvolution."""
-        from easymagpie_codec_vllm.kernels import gather_packed_state_inputs, update_packed_state
+        from easymagpie_vllm_omni.codec.kernels import gather_packed_state_inputs, update_packed_state
 
         inputs = inputs.contiguous()
         if is_decode:
@@ -483,7 +481,7 @@ class PackedCausalConvTranspose1d(CodecStateLayer):
         if inputs.shape[0] != expected_rows:
             raise RuntimeError(f"codec metadata describes {expected_rows} rows, got {inputs.shape[0]}")
         if inputs.is_cuda:
-            from easymagpie_codec_vllm.kernels import packed_causal_conv_transpose1d
+            from easymagpie_vllm_omni.codec.kernels import packed_causal_conv_transpose1d
 
             if getattr(metadata, "codec_uniform", False):
                 if metadata.num_decodes and metadata.num_prefills:

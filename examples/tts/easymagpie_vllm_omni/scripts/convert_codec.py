@@ -24,9 +24,9 @@ from pathlib import Path
 
 import torch
 import yaml
-from easymagpie_codec_vllm.codec import EasyMagpieCodec
-from easymagpie_codec_vllm.config import EasyMagpieCodecConfig
-from easymagpie_codec_vllm.weight_conversion import convert_decoder_state_dict
+from easymagpie_vllm_omni.codec.codec import EasyMagpieCodec
+from easymagpie_vllm_omni.codec.config import EasyMagpieCodecConfig
+from easymagpie_vllm_omni.codec.weight_conversion import convert_decoder_state_dict
 from safetensors.torch import save_file
 
 

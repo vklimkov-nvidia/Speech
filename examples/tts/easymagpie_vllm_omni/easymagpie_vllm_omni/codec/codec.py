@@ -26,8 +26,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from easymagpie_codec_vllm.config import EasyMagpieCodecConfig
-from easymagpie_codec_vllm.packing import unstack_acoustic_codes
+from easymagpie_vllm_omni.codec.config import EasyMagpieCodecConfig
+from easymagpie_vllm_omni.codec.packing import unstack_acoustic_codes
 
 
 class FiniteScalarDequantizer(nn.Module):

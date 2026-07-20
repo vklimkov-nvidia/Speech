@@ -276,7 +276,7 @@ def talker2code2wav_async_chunk(
     request: Any,
     is_finished: bool = False,
 ) -> OmniPayloadStruct | None:
-    """Emit new codec rows, with optional stateless left-context replay.
+    """Emit newly generated time-major codec rows to the stateful native codec.
 
     ``multimodal_output`` must retain this name because the transfer adapter
     passes it by keyword.
@@ -297,14 +297,14 @@ def talker2code2wav_async_chunk(
         is_warmup = speech_delay > 0 and frame_index <= speech_delay
         # Accumulate real frames into a request-persistent buffer. The framework's
         # ``code_prompt_token_ids`` is popped per segment (it hands back a fresh
-        # list at every segment stop), which strands left-context and desyncs the
-        # emission counter; our own buffer never resets, so windowing sees one
+        # list at every segment stop), which desynchronizes the
+        # emission counter; our own buffer never resets, so the codec sees one
         # continuous acoustic stream regardless of how the text was chunked.
         frame_buffer = _persistent_list_state(transfer_manager, "_emp_frame_buffer")
         if frame is not None and not is_warmup:
             # ``multimodal_output`` is already a CPU snapshot. Keep it as a
-            # tensor so codec windows can be assembled with stack/transpose
-            # instead of a Python list round-trip and nested comprehension.
+            # tensor so codec chunks can be assembled with a single stack
+            # instead of a Python list round-trip.
             frame_row = frame.detach().to(device="cpu", dtype=torch.long).reshape(-1).contiguous()
             frame_buffer[request_id].append(frame_row)
             # Keep the framework buffer populated too (some connector bookkeeping
@@ -317,62 +317,20 @@ def talker2code2wav_async_chunk(
     raw_cfg = getattr(connector, "config", {}) or {}
     cfg = raw_cfg.get("extra", raw_cfg) if isinstance(raw_cfg, dict) else {}
     chunk_size = int(cfg.get("codec_chunk_frames", 25))
-    stateful_codec = bool(cfg.get("codec_stateful", False))
-    left_context_size_config = int(cfg.get("codec_left_context_frames", 0))
-    initial_chunk_size = int(cfg.get("initial_codec_chunk_frames") or 0)
-    if initial_chunk_size > chunk_size > 0:
-        # Preserve the legacy single-initial-chunk behavior, which capped the
-        # value to the steady hop. Larger first chunks use the explicit ramp.
-        initial_chunk_size = chunk_size
-
-    fixed_window_size = int(cfg.get("codec_fixed_chunk_frames") or (left_context_size_config + chunk_size))
-
-    raw_startup_chunks = cfg.get("codec_startup_chunk_frames")
-    if raw_startup_chunks is None:
-        startup_chunk_sizes = [initial_chunk_size] if initial_chunk_size else []
-    elif isinstance(raw_startup_chunks, (list, tuple)):
-        startup_chunk_sizes = [int(value) for value in raw_startup_chunks]
-    else:
+    raw_startup_chunks = cfg.get("codec_startup_chunk_frames", [])
+    if not isinstance(raw_startup_chunks, (list, tuple)):
         raise ValueError(
             "Invalid EasyMagpie codec chunk config: codec_startup_chunk_frames "
             f"must be a list, got {type(raw_startup_chunks).__name__}"
         )
-
-    startup_cursor = 0
-    startup_windows_fit = True
-    for value in startup_chunk_sizes:
-        startup_left_context = min(left_context_size_config, startup_cursor)
-        startup_windows_fit &= stateful_codec or startup_left_context + value <= fixed_window_size
-        startup_cursor += value
-
-    if (
-        chunk_size <= 0
-        or left_context_size_config < 0
-        or initial_chunk_size < 0
-        or fixed_window_size <= 0
-        or (not stateful_codec and left_context_size_config + chunk_size > fixed_window_size)
-        or any(value <= 0 for value in startup_chunk_sizes)
-        or not startup_windows_fit
-    ):
+    startup_chunk_sizes = [int(value) for value in raw_startup_chunks]
+    if chunk_size <= 0 or any(value <= 0 for value in startup_chunk_sizes):
         raise ValueError(
             f"Invalid EasyMagpie codec chunk config: codec_chunk_frames={chunk_size}, "
-            f"codec_left_context_frames={left_context_size_config}, "
-            f"initial_codec_chunk_frames={initial_chunk_size}, "
-            f"codec_startup_chunk_frames={startup_chunk_sizes}, "
-            f"codec_fixed_chunk_frames={fixed_window_size}"
+            f"codec_startup_chunk_frames={startup_chunk_sizes}"
         )
-    # Window over our request-persistent frame buffer (never reset per segment),
-    # tracking an absolute high-water mark of already-emitted frames
-    # (``emitted``). This is essential for two reasons:
-    #  * Stateless recompute from ``length`` + chunk alignment re-emits the tail
-    #    window whenever the processor is invoked again at the same length —
-    #    which happens at every segment stop (the adapter passes
-    #    ``is_finished=is_segment_finished`` as a flush signal, often several
-    #    times). That duplicates acoustic frames (the "phys phys" stutter).
-    #  * The framework's own ``code_prompt_token_ids`` is popped per segment, so
-    #    a per-that-buffer counter would restart mid-utterance and either drop
-    #    frames (one-token-per-segment: ``1 -> reset -> 1`` looks like no
-    #    progress) or lose cross-segment left-context (choppy audio).
+    # Track one absolute emission high-water mark across resumable text
+    # segments so repeated segment-finish notifications cannot duplicate frames.
     frame_buffer = _persistent_list_state(transfer_manager, "_emp_frame_buffer")
     buffer = frame_buffer[request_id]
     base_state = _persistent_state(transfer_manager, "_emp_frame_buffer_base")
@@ -411,11 +369,7 @@ def talker2code2wav_async_chunk(
             _cleanup()
         return None
 
-    # Chosen number of NEW frames to emit this call. Startup targets may ramp up
-    # (for example 1, 2, then the steady 4-frame chunk) so the first short audio
-    # chunk is replenished quickly instead of waiting for a full steady chunk.
-    # Every codec invocation is still padded to ``codec_fixed_chunk_frames`` in
-    # Stage 1, so the ramp does not introduce new decoder/CUDA-graph shapes.
+    # Startup targets ramp independently from the steady codec chunk size.
     target = startup_chunk_sizes[emitted_chunks] if emitted_chunks < len(startup_chunk_sizes) else chunk_size
     # A resumable segment stop is not an audio flush: retain a partial body
     # across text-input segments so steady codec chunks keep one logical size.
@@ -424,38 +378,24 @@ def talker2code2wav_async_chunk(
         return None
     context_length = pending if true_finished else min(pending, target)
 
-    new_start = emitted
     new_end = emitted + context_length
-    # Native vLLM state retains the exact per-layer causal history, so only new
-    # rows are submitted. The legacy stateless path still replays left context.
-    left_context_size = 0 if stateful_codec else min(left_context_size_config, new_start)
-    if not stateful_codec and left_context_size + context_length > fixed_window_size:
-        left_context_size = max(0, fixed_window_size - context_length)
-    window_start = new_start - left_context_size
-    relative_start = window_start - base_index
+    relative_start = emitted - base_index
     relative_end = new_end - base_index
-    window_frames = torch.stack(buffer[relative_start:relative_end], dim=0)
-    if stateful_codec:
-        code_predictor_codes = window_frames.contiguous()
-    else:
-        code_predictor_codes = window_frames.transpose(0, 1).reshape(-1).contiguous()
+    code_predictor_codes = torch.stack(buffer[relative_start:relative_end], dim=0).contiguous()
 
     emitted_state[request_id] = new_end
     emitted_chunks_state[request_id] += 1
-    # Retain only context that can participate in the next fixed-shape window.
-    # This bounds state to left-context plus pending frames, not the utterance.
-    keep_from = new_end if stateful_codec else max(0, new_end - left_context_size_config)
-    drop = keep_from - base_index
+    drop = new_end - base_index
     if drop > 0:
         del buffer[:drop]
-        base_state[request_id] = keep_from
+        base_state[request_id] = new_end
     if true_finished:
         _cleanup()
 
     return OmniPayloadStruct(
         codes=CodesStruct(audio=code_predictor_codes),
         meta=MetaStruct(
-            left_context_size=left_context_size,
+            left_context_size=0,
             finished=torch.tensor(finished, dtype=torch.bool),
         ),
     )

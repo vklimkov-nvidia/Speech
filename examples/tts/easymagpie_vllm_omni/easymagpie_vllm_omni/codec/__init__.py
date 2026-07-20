@@ -13,6 +13,6 @@
 # limitations under the License.
 """Native vLLM implementation of the EasyMagpie spectral codec decoder."""
 
-from easymagpie_codec_vllm.config import EasyMagpieCodecConfig
+from easymagpie_vllm_omni.codec.config import EasyMagpieCodecConfig
 
 __all__ = ["EasyMagpieCodecConfig"]

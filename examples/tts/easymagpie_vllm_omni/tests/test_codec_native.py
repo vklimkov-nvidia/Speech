@@ -14,10 +14,10 @@
 
 import torch
 
-from easymagpie_codec_vllm.codec import EasyMagpieCodec, FiniteScalarDequantizer
-from easymagpie_codec_vllm.config import EasyMagpieCodecConfig
-from easymagpie_codec_vllm.packing import unstack_acoustic_codes
-from easymagpie_codec_vllm.weight_conversion import fold_weight_norm
+from easymagpie_vllm_omni.codec.codec import EasyMagpieCodec, FiniteScalarDequantizer
+from easymagpie_vllm_omni.codec.config import EasyMagpieCodecConfig
+from easymagpie_vllm_omni.codec.packing import unstack_acoustic_codes
+from easymagpie_vllm_omni.codec.weight_conversion import fold_weight_norm
 
 
 def tiny_config() -> EasyMagpieCodecConfig:

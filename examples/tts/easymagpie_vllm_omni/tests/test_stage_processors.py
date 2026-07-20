@@ -40,8 +40,6 @@ def _manager():
             config={
                 "extra": {
                     "codec_chunk_frames": 2,
-                    "codec_left_context_frames": 1,
-                    "initial_codec_chunk_frames": 0,
                 }
             }
         ),
@@ -74,7 +72,7 @@ def test_async_codec_state_stays_continuous_across_resumable_segments():
     request.output_token_ids = [0, 0]
     request.finished = True
     first = talker2code2wav_async_chunk(manager, _output(4), request, is_finished=True)
-    torch.testing.assert_close(first.codes.audio, torch.tensor([3, 4, 103, 104]))
+    torch.testing.assert_close(first.codes.audio, torch.tensor([[3, 103], [4, 104]]))
     assert first.meta.left_context_size == 0
     manager.code_prompt_token_ids.pop(request.external_req_id, None)
 
@@ -83,8 +81,8 @@ def test_async_codec_state_stays_continuous_across_resumable_segments():
     assert talker2code2wav_async_chunk(manager, _output(5), request) is None
     request.output_token_ids = [0, 0]
     second = talker2code2wav_async_chunk(manager, _output(6), request)
-    torch.testing.assert_close(second.codes.audio, torch.tensor([4, 5, 6, 104, 105, 106]))
-    assert second.meta.left_context_size == 1
+    torch.testing.assert_close(second.codes.audio, torch.tensor([[5, 105], [6, 106]]))
+    assert second.meta.left_context_size == 0
 
     # Repeated segment flushes at the same length must not duplicate audio.
     request.finished = True
@@ -103,9 +101,7 @@ def test_async_codec_state_stays_continuous_across_resumable_segments():
 def test_resumable_segment_stop_does_not_flush_partial_codec_chunk():
     manager = _manager()
     manager.config.hf_config.streaming_speech_delay = 0
-    manager.connector.config["extra"].update(
-        {"codec_chunk_frames": 4, "codec_left_context_frames": 1, "initial_codec_chunk_frames": 0}
-    )
+    manager.connector.config["extra"].update({"codec_chunk_frames": 4})
     request = _Request()
 
     assert talker2code2wav_async_chunk(manager, _output(1), request) is None
@@ -116,10 +112,10 @@ def test_resumable_segment_stop_does_not_flush_partial_codec_chunk():
     assert talker2code2wav_async_chunk(manager, _output(3), request) is None
     full = talker2code2wav_async_chunk(manager, _output(4), request)
     assert full is not None
-    torch.testing.assert_close(full.codes.audio, torch.tensor([1, 2, 3, 4, 101, 102, 103, 104]))
+    torch.testing.assert_close(full.codes.audio, torch.tensor([[1, 101], [2, 102], [3, 103], [4, 104]]))
 
 
-def test_async_codec_buffer_is_tensorized_and_bounded_to_left_context():
+def test_async_codec_buffer_drops_emitted_rows():
     manager = _manager()
     manager.config.hf_config.streaming_speech_delay = 0
     request = _Request()
@@ -129,37 +125,29 @@ def test_async_codec_buffer_is_tensorized_and_bounded_to_left_context():
         last = talker2code2wav_async_chunk(manager, _output(value), request)
 
     assert last is not None
-    torch.testing.assert_close(last.codes.audio, torch.tensor([8, 9, 10, 108, 109, 110]))
-    assert last.meta.left_context_size == 1
+    torch.testing.assert_close(last.codes.audio, torch.tensor([[9, 109], [10, 110]]))
+    assert last.meta.left_context_size == 0
     buffer = manager._emp_frame_buffer[request.external_req_id]
-    assert len(buffer) == 1
-    assert isinstance(buffer[0], torch.Tensor)
-    torch.testing.assert_close(buffer[0], torch.tensor([10, 110]))
-    assert manager._emp_frame_buffer_base[request.external_req_id] == 9
+    assert buffer == []
+    assert manager._emp_frame_buffer_base[request.external_req_id] == 10
     assert manager._emp_emitted_frames[request.external_req_id] == 10
 
 
 def test_async_codec_uses_configured_startup_chunk_ramp():
     manager = _manager()
     manager.config.hf_config.streaming_speech_delay = 0
-    manager.connector.config["extra"].update(
-        {
-            "codec_chunk_frames": 4,
-            "codec_left_context_frames": 3,
-            "codec_startup_chunk_frames": [1, 2],
-        }
-    )
+    manager.connector.config["extra"].update({"codec_chunk_frames": 4, "codec_startup_chunk_frames": [1, 2]})
     request = _Request()
 
     first = talker2code2wav_async_chunk(manager, _output(1), request)
     assert first is not None
-    torch.testing.assert_close(first.codes.audio, torch.tensor([1, 101]))
+    torch.testing.assert_close(first.codes.audio, torch.tensor([[1, 101]]))
 
     assert talker2code2wav_async_chunk(manager, _output(2), request) is None
     second = talker2code2wav_async_chunk(manager, _output(3), request)
     assert second is not None
-    torch.testing.assert_close(second.codes.audio, torch.tensor([1, 2, 3, 101, 102, 103]))
-    assert second.meta.left_context_size == 1
+    torch.testing.assert_close(second.codes.audio, torch.tensor([[2, 102], [3, 103]]))
+    assert second.meta.left_context_size == 0
 
     for value in range(4, 7):
         assert talker2code2wav_async_chunk(manager, _output(value), request) is None
@@ -167,37 +155,29 @@ def test_async_codec_uses_configured_startup_chunk_ramp():
     assert steady is not None
     torch.testing.assert_close(
         steady.codes.audio,
-        torch.tensor([1, 2, 3, 4, 5, 6, 7, 101, 102, 103, 104, 105, 106, 107]),
+        torch.tensor([[4, 104], [5, 105], [6, 106], [7, 107]]),
     )
-    assert steady.meta.left_context_size == 3
+    assert steady.meta.left_context_size == 0
     assert manager._emp_emitted_chunks[request.external_req_id] == 3
 
 
-def test_async_codec_allows_larger_first_chunk_when_it_fits_fixed_window():
+def test_async_codec_allows_larger_first_chunk_than_steady_state():
     manager = _manager()
     manager.config.hf_config.streaming_speech_delay = 0
-    manager.connector.config["extra"].update(
-        {
-            "codec_chunk_frames": 4,
-            "codec_left_context_frames": 1,
-            "codec_fixed_chunk_frames": 5,
-            "codec_startup_chunk_frames": [5],
-        }
-    )
+    manager.connector.config["extra"].update({"codec_chunk_frames": 4, "codec_startup_chunk_frames": [5]})
     request = _Request()
 
     for value in range(1, 5):
         assert talker2code2wav_async_chunk(manager, _output(value), request) is None
     first = talker2code2wav_async_chunk(manager, _output(5), request)
     assert first is not None
-    torch.testing.assert_close(first.codes.audio, torch.tensor([1, 2, 3, 4, 5, 101, 102, 103, 104, 105]))
+    torch.testing.assert_close(first.codes.audio, torch.tensor([[1, 101], [2, 102], [3, 103], [4, 104], [5, 105]]))
 
 
 def test_async_codec_rejects_invalid_startup_chunk_ramp():
     manager = _manager()
     manager.config.hf_config.streaming_speech_delay = 0
-    manager.connector.config["extra"].update({"codec_chunk_frames": 4, "codec_startup_chunk_frames": [1, 5]})
-
+    manager.connector.config["extra"].update({"codec_chunk_frames": 4, "codec_startup_chunk_frames": [1, 0]})
     with pytest.raises(ValueError, match="codec_startup_chunk_frames"):
         talker2code2wav_async_chunk(manager, _output(1), _Request())
 
@@ -205,7 +185,7 @@ def test_async_codec_rejects_invalid_startup_chunk_ramp():
 def test_stateful_codec_emits_only_new_time_major_rows():
     manager = _manager()
     manager.config.hf_config.streaming_speech_delay = 0
-    manager.connector.config["extra"].update({"codec_chunk_frames": 2, "codec_stateful": True})
+    manager.connector.config["extra"].update({"codec_chunk_frames": 2})
     request = _Request()
 
     assert talker2code2wav_async_chunk(manager, _output(1), request) is None
