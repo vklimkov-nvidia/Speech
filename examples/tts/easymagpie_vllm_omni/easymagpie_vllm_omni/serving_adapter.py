@@ -32,8 +32,8 @@ _DEFAULT_CONTEXT_TEXT = "[EN]"
 _DEFAULT_TEMPERATURE = 0.7
 _DEFAULT_TOP_K = 80
 
-# Text-stream EOS is the last-but-one row of the text vocab, mirroring
-# EasyMagpieTTS.text_eos_id / the reference model's ``eos_id = num_tokens - 2``.
+# Legacy checkpoints use the last-but-one text-vocab row for EOS. Converted
+# multiturn checkpoints pin the actual ID explicitly in ``config.json``.
 _TEXT_EOS_OFFSET_FROM_VOCAB = 2
 
 if TYPE_CHECKING:
@@ -163,7 +163,7 @@ def _build_adapter_cls() -> type:
                     },
                 },
                 tokenizer=self._model_tokenizer(),
-                text_eos_id=text_vocab_size - _TEXT_EOS_OFFSET_FROM_VOCAB,
+                text_eos_id=int(config.get("text_eos_id", text_vocab_size - _TEXT_EOS_OFFSET_FROM_VOCAB)),
                 sample_rate=sample_rate,
             )
 
