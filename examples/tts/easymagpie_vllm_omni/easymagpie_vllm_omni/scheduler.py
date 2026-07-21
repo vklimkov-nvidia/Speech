@@ -23,7 +23,7 @@ import threading
 from types import MethodType
 
 import torch
-from vllm.v1.request import Request, StreamingUpdate
+from vllm.v1.request import Request, RequestStatus, StreamingUpdate
 from vllm_omni.core.sched.omni_ar_scheduler import OmniARAsyncScheduler
 from vllm_omni.core.sched.omni_generation_scheduler import OmniGenerationScheduler
 from vllm_omni.distributed.omni_connectors.transfer_adapter.chunk_transfer_adapter import OmniChunkTransferAdapter
@@ -156,6 +156,11 @@ def _poll_native_codec_chunk_unlocked(adapter: OmniChunkTransferAdapter, request
 
     received = OmniChunkTransferAdapter._poll_single_request(adapter, request)
     if not received:
+        request.prompt_token_ids = old_prompt
+        request._all_token_ids[:] = old_all_token_ids
+        request.num_prompt_tokens = len(old_prompt)
+        request.num_computed_tokens = old_num_computed_tokens
+        request.update_block_hashes()
         return False
 
     frames = _codec_payload_frames(request.additional_information, adapter._easymagpie_num_quantizers)
@@ -189,6 +194,70 @@ class EasyMagpieCodecScheduler(OmniGenerationScheduler):
         adapter._easymagpie_chunk_lock = threading.Lock()
         adapter._easymagpie_num_quantizers = num_quantizers
         adapter._poll_single_request = MethodType(_poll_native_codec_chunk, adapter)
+
+    def _update_request_as_session(self, session: Request, update: StreamingUpdate) -> None:
+        """Resume connector polling without resetting the stateful codec.
+
+        Every incremental text update prewarms downstream stages again. vLLM
+        turns the duplicate Stage-1 request into a streaming update, but the
+        generation scheduler's default handler replaces its prompt and resets
+        ``num_computed_tokens``. For the native codec the update carries no new
+        codec input; it only signals that another upstream segment is coming.
+        Keep the append-only prompt position and vLLM-managed codec state intact.
+        """
+        prompt_token_ids = session.prompt_token_ids
+        all_token_ids = list(session._all_token_ids)
+        num_prompt_tokens = session.num_prompt_tokens
+        num_computed_tokens = session.num_computed_tokens
+        additional_information = session.additional_information
+
+        super()._update_request_as_session(session, update)
+
+        session.prompt_token_ids = prompt_token_ids
+        session._all_token_ids[:] = all_token_ids
+        session.num_prompt_tokens = num_prompt_tokens
+        session.num_computed_tokens = num_computed_tokens
+        session.additional_information = additional_information
+        session.update_block_hashes()
+
+    def _handle_stopped_request(self, request: Request) -> bool:
+        finished = super()._handle_stopped_request(request)
+        stopped_sessions = getattr(self, "_easymagpie_stopped_sessions", None)
+        if not finished and stopped_sessions is not None:
+            stopped_sessions.append(request)
+        return finished
+
+    def _resume_codec_after_segment(self, session: Request) -> None:
+        """Keep a resumable codec request on the worker's cached-request path."""
+        waiting_for_input = session.status == RequestStatus.WAITING_FOR_STREAMING_REQ
+        if session in self.waiting:
+            self.waiting.remove_requests((session,))
+        if session in self.skipped_waiting:
+            self.skipped_waiting.remove_requests((session,))
+        if waiting_for_input:
+            self.num_waiting_for_streaming_input -= 1
+
+        session.status = RequestStatus.RUNNING
+        if session not in self.running:
+            self.running.append(session)
+        self.chunk_transfer_adapter.segment_finished_requests.discard(session.request_id)
+
+    def update_from_output(self, scheduler_output, model_runner_output):
+        # A segment finish must reach the output processor, but Stage 1 must not
+        # be re-admitted through the generation scheduler's ``scheduled_new``
+        # path afterward. That path recreates the worker batch row, losing the
+        # codec's recurrent cache even when ``num_computed_tokens`` is retained.
+        # Move resumable segment stops back to ``running`` after the base method
+        # has emitted the finish and removed them. Their next codec frames are
+        # then scheduled as cached tokens against the same state pages.
+        self._easymagpie_stopped_sessions = []
+        try:
+            outputs = super().update_from_output(scheduler_output, model_runner_output)
+            for session in self._easymagpie_stopped_sessions:
+                self._resume_codec_after_segment(session)
+        finally:
+            self._easymagpie_stopped_sessions = None
+        return outputs
 
     def schedule(self, *args, **kwargs):
         with self.chunk_transfer_adapter._easymagpie_chunk_lock:
