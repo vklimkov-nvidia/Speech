@@ -50,6 +50,10 @@ python -m ipykernel install --user \
   --display-name "Python (easymagpie-vllm)"
 ```
 
+Mamba's selective-state-update kernel requires shape- and GPU-specific tuning, so an untuned cache can give
+suboptimal performance. Reuse the same Triton/vLLM cache directories across launches so repeated runs accumulate
+better kernels; for an explicit sweep, run `python scripts/tune_mamba_ssu.py --model converted_model` and restart.
+
 ### Quick start — offline synthesis
 
 See [`scripts/offline_demo.ipynb`](scripts/offline_demo.ipynb) to check how `AsyncOmni` is initialized and used.
@@ -94,19 +98,19 @@ python scripts/benchmark_incremental_server.py --model ./converted_model \
     --text-file vctk_subset.txt --tokens-per-chunk 5 -n 128 -c 1 32
 ```
 
-#### RTX A6000 reference (2026-07-20)
+#### RTX A6000 reference (2026-07-21)
 
-Results for 128 requests using VCTK texts:
+Results for 128 requests using VCTK texts. Service rows use the default FP32 codec with 6/6/8-frame cadence:
 
 | Concurrency | Benchmark | Input | Requests/s | RTF | Mean latency | Underruns |
 | ---: | --- | --- | ---: | ---: | ---: | ---: |
 | 1 | Model | Whole text | 1.32 | 7.85x | 28.7 ms TTFT | — |
 | 1 | Model | 5 tokens/chunk | 1.28 | 7.64x | 29.3 ms TTFT | — |
-| 1 | HTTP service | Whole text | 1.20 | 7.33x | 127.8 ms TTFA | 0 / 1,350 |
-| 1 | WebSocket service | 5 tokens/chunk | 1.14 | 6.85x | 134.0 ms TTFA | 0 / 1,286 |
+| 1 | HTTP service | Whole text | 1.27 | 7.73x | 130.8 ms TTFA | 0 / 1,335 |
+| 1 | WebSocket service | 5 tokens/chunk | 1.25 | 7.24x | 137.2 ms TTFA | 0 / 1,226 |
 | 32 | Model | Whole text | 11.20 | 67.75x | 107.3 ms TTFT | — |
 | 32 | Model | 5 tokens/chunk | 10.44 | 63.01x | 105.1 ms TTFT | — |
-| 32 | HTTP service | Whole text | 8.76 | 52.79x | 514.0 ms TTFA | 0 / 1,337 |
-| 32 | WebSocket service | 5 tokens/chunk | 8.02 | 45.90x | 608.3 ms TTFA | 0 / 1,225 |
+| 32 | HTTP service | Whole text | 7.47 | 48.43x | 606.0 ms TTFA | 0 / 1,426 |
+| 32 | WebSocket service | 5 tokens/chunk | 7.45 | 44.12x | 690.9 ms TTFA | 0 / 1,249 |
 
 

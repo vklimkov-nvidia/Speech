@@ -17,8 +17,9 @@ connectors:
       connector_get_max_wait_first_chunk: 3000
       connector_get_max_wait: 300
       # Native vLLM state pages retain the decoder's exact causal history.
+      # Two 6-frame startup chunks prevent FP32 playback underruns on the RTX A6000.
       codec_chunk_frames: 8
-      codec_startup_chunk_frames: [5, 6]
+      codec_startup_chunk_frames: [6, 6]
 
 stages:
   # Keep engine settings flat at the stage level; nested settings are not parsed.
@@ -46,6 +47,8 @@ stages:
   - stage_id: 1
     max_num_seqs: 32
     gpu_memory_utilization: 0.35
+    # FP16 is faster, but introduces audible codec artifacts.
+    dtype: float32
     enforce_eager: true
     async_scheduling: false
     enable_prefix_caching: false
