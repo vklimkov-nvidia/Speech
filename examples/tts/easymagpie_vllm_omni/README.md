@@ -34,9 +34,8 @@ python examples/tts/easymagpie_vllm_omni/scripts/convert_to_vllm.py \
 
 ### Setup the serving environment
 
-Create a separate, clean environment for inference. It needs a GPU,
-matching **vLLM 0.24 / vLLM-Omni 0.24** versions, and this package. It does not
-need NeMo after conversion; serving uses the native codec bundle:
+Serving needs a GPU, matching **vLLM 0.24 / vLLM-Omni 0.24** versions, and this package.
+It does not need NeMo after conversion:
 
 ```bash
 cd examples/tts/easymagpie_vllm_omni
@@ -53,7 +52,7 @@ python -m ipykernel install --user \
 
 ### Quick start — offline synthesis
 
-Run [`scripts/offline_demo.ipynb`](scripts/offline_demo.ipynb) to check how `AsyncOmni` is initialized and used.
+See [`scripts/offline_demo.ipynb`](scripts/offline_demo.ipynb) to check how `AsyncOmni` is initialized and used.
 
 ### Serve over HTTP and WebSocket
 
@@ -77,35 +76,37 @@ curl -X POST http://localhost:8091/v1/audio/speech \
   --output out.wav
 ```
 
-Run [`scripts/server_request.ipynb`](scripts/server_request.ipynb) for examples
+See [`scripts/server_request.ipynb`](scripts/server_request.ipynb) for examples
 of both serving APIs.
 
 ### Benchmarks
 
-Benchmark running service:
-
 ```bash
+# Benchmark acoustic token prediction only (no codec).
+python scripts/benchmark_model.py --model ./converted_model -n 128 -c 1 32 \
+    [--incremental --tokens-per-chunk 5]
+
+# Benchmark the service's HTTP API.
 python scripts/benchmark_server.py --text-file vctk_subset.txt -n 128 -c 1 32
-```
 
-#### RTX A6000 reference (2026-07-20)
-
-At 128 requests and concurrency 32:
-
-    Model, whole-text input: 11.20 req/s, 67.75x RTF, 107.3 ms mean TTFT
-    Model, 5 tokens/input chunk: 10.44 req/s, 63.01x RTF, 105.1 ms mean TTFT
-    HTTP service, whole-text input: 8.76 req/s, 52.79x RTF, 514.0 ms mean TTFA, 0/1,337 underruns
-    WebSocket service, 5 tokens/input chunk: 8.02 req/s, 45.90x RTF, 608.3 ms mean TTFA, 0/1,225 underruns
-
-Benchmark incremental WebSocket input with five tokenizer IDs per message:
-
-```bash
+# Benchmark the service's incremental synthesis via its WebSocket API.
 python scripts/benchmark_incremental_server.py --model ./converted_model \
     --text-file vctk_subset.txt --tokens-per-chunk 5 -n 128 -c 1 32
 ```
 
-Benchmark acoustic tokens prediction only (no codec)
+#### RTX A6000 reference (2026-07-20)
 
-```bash
-python scripts/benchmark_model.py --model ./converted_model -n 128 -c 1 32
-```
+Results for 128 requests using VCTK texts:
+
+| Concurrency | Benchmark | Input | Requests/s | RTF | Mean latency | Underruns |
+| ---: | --- | --- | ---: | ---: | ---: | ---: |
+| 1 | Model | Whole text | 1.32 | 7.85x | 28.7 ms TTFT | — |
+| 1 | Model | 5 tokens/chunk | 1.28 | 7.64x | 29.3 ms TTFT | — |
+| 1 | HTTP service | Whole text | 1.20 | 7.33x | 127.8 ms TTFA | 0 / 1,350 |
+| 1 | WebSocket service | 5 tokens/chunk | 1.14 | 6.85x | 134.0 ms TTFA | 0 / 1,286 |
+| 32 | Model | Whole text | 11.20 | 67.75x | 107.3 ms TTFT | — |
+| 32 | Model | 5 tokens/chunk | 10.44 | 63.01x | 105.1 ms TTFT | — |
+| 32 | HTTP service | Whole text | 8.76 | 52.79x | 514.0 ms TTFA | 0 / 1,337 |
+| 32 | WebSocket service | 5 tokens/chunk | 8.02 | 45.90x | 608.3 ms TTFA | 0 / 1,225 |
+
+
