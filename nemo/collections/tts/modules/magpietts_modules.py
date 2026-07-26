@@ -793,10 +793,10 @@ class AcousticDecoder(torch.nn.Module):
         d_model,
         decoder,
         semantic_layer,
-        acoustic_infill_min = 0.1,
+        acoustic_infill_min = 0.25,
         acoustic_infill_max = 1.0,
-        semantic_mask_min = 0.0,
-        semantic_mask_max = 0.5,
+        semantic_mask_min = 0.25,
+        semantic_mask_max = 1.0,
     ):
         super(AcousticDecoder, self).__init__()
 
@@ -904,3 +904,61 @@ class AcousticDecoder(torch.nn.Module):
         audio_tokens = torch.concat([semantic_tokens, acoustic_tokens], dim=1)
 
         return audio_tokens
+
+
+class AcousticDecoderLinear(torch.nn.Module):
+    """
+    """
+
+    def __init__(
+        self,
+        input_dim,
+        d_model,
+        semantic_layer,
+        num_codebooks,
+        codebook_size,
+    ):
+        super(AcousticDecoderLinear, self).__init__()
+
+        self.num_codebooks = num_codebooks
+        self.codebook_size = codebook_size
+        self.num_logits = self.num_codebooks * self.codebook_size
+
+        self.semantic_layer = semantic_layer
+        self.input_proj = torch.nn.Linear(input_dim, d_model)
+        self.layer_norm = torch.nn.LayerNorm(d_model)
+        self.acoustic_token_layer = torch.nn.Linear(d_model, self.num_logits)
+
+    def forward(self, inputs, audio_lens, semantic_tokens, vector_quantizer):
+        audio_mask = get_mask_from_lengths(audio_lens)
+        audio_mask_3d = rearrange(audio_mask, 'B T -> B T 1')
+
+        semantic_tokens_rearrange = rearrange(semantic_tokens, 'B C T -> C B T')
+        # [batch_size, code_dim, audio_token_len]
+        semantic_codes = vector_quantizer.decode(indices=semantic_tokens_rearrange, input_len=audio_lens)
+        semantic_codes = rearrange(semantic_codes, 'B D T -> B T D')
+
+        res = self.semantic_layer(audio_codes=semantic_codes, audio_lens=audio_lens)
+        dec_inp = self.input_proj(inputs) + res
+        dec_inp = dec_inp * audio_mask_3d
+
+        # [batch_size, audio_len, hidden_dim]
+        dec_inp = self.layer_norm(dec_inp)
+
+        # [batch_size, audio_len, num_codebook * codebook_size]
+        audio_logits = self.acoustic_token_layer(dec_inp)
+        audio_logits = audio_logits * audio_mask_3d
+
+        # [batch_size, audio_len, num_codebook, codebook_size]
+        logit_shape = (audio_logits.shape[0], audio_logits.shape[1], self.num_codebooks, self.codebook_size)
+
+        audio_logits = torch.reshape(audio_logits, logit_shape)
+        # [batch_size, audio_len, num_codebook]
+        audio_tokens = audio_logits.max(dim=3).indices
+
+        audio_tokens = audio_tokens * audio_mask_3d
+
+        audio_logits = rearrange(audio_logits, 'B T C W -> B T (C W)')
+        audio_tokens = rearrange(audio_tokens, 'B T C -> B C T')
+
+        return audio_tokens, audio_logits

@@ -124,7 +124,74 @@ class SemanticInputLayer(NeuralModule):
 
         if semantic_mask is not None:
             semantic_mask_3d = rearrange(semantic_mask, 'B T -> B T 1')
-            out = torch.where(semantic_mask_3d, self.mask_emb, out)
+            #out = torch.where(semantic_mask_3d, self.mask_emb, out)
+            out = torch.where(semantic_mask_3d, out, self.mask_emb)
+
+        out = out * rearrange(audio_mask, 'B T -> B T 1')
+        return out
+
+
+class AudioInputLayer(NeuralModule):
+
+    def __init__(self, input_dim, output_dim, audio_mask_min=0.25, audio_mask_max=1.0):
+        super(AudioInputLayer, self).__init__()
+        self.hidden_layer = torch.nn.Linear(input_dim, output_dim)
+        self.output_layer = torch.nn.Linear(output_dim, output_dim)
+        self.mask_emb = torch.nn.Parameter(torch.zeros([1, 1, output_dim]))
+
+        self.audio_mask_min = audio_mask_min
+        self.audio_mask_max = audio_mask_max
+
+        self.infill_dist = torch.distributions.beta.Beta(concentration1=1.0, concentration0=2.0)
+
+    def create_infill_mask(self, input_lens, infill_min, infill_max):
+        batch_size = input_lens.shape[0]
+        len_mask = get_mask_from_lengths(input_lens)
+        max_len = len_mask.shape[1]
+
+        infill_percent = self.infill_dist.sample(sample_shape=torch.Size([batch_size])).to(input_lens.device)
+        infill_percent = infill_min + (infill_max - infill_min) * infill_percent
+        infill_len = infill_percent * input_lens.float()
+        infill_rank = torch.clamp_min(infill_len - 1, 0).long()
+        infill_rank = infill_rank.unsqueeze(1)
+
+        # [batch_size, time]
+        infill_vals = torch.rand(size=len_mask.shape, device=input_lens.device)
+        infill_vals = infill_vals * len_mask
+        infill_topk = torch.topk(infill_vals, k=max_len, dim=1, sorted=True).values
+        infill_min_val = torch.gather(infill_topk, index=infill_rank, dim=1)
+        infill_mask = infill_vals >= infill_min_val
+
+        infill_mask = infill_mask * len_mask
+
+        return infill_mask
+
+    @property
+    def input_types(self):
+        return {
+            "audio_codes": NeuralType(('B', 'T', 'C'), EncodedRepresentation()),
+            "audio_lens": NeuralType(tuple('B'), LengthsType()),
+        }
+
+    @property
+    def output_types(self):
+        return {
+            "out": NeuralType(('B', 'T', 'C'), EncodedRepresentation()),
+        }
+
+    @typecheck()
+    def forward(self, audio_codes, audio_lens):
+        audio_mask = get_mask_from_lengths(audio_lens)
+
+        out = self.hidden_layer(audio_codes)
+        out = self.output_layer(out)
+
+        if self.training:
+            infill_mask = self.create_infill_mask(
+                input_lens=audio_lens, infill_min=self.audio_mask_min, infill_max=self.audio_mask_max
+            )
+            infill_mask = rearrange(infill_mask, 'B T -> B T 1')
+            out = torch.where(infill_mask, out, self.mask_emb)
 
         out = out * rearrange(audio_mask, 'B T -> B T 1')
         return out

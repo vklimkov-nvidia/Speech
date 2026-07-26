@@ -822,7 +822,7 @@ class MagpieTTSDataset(TextToSpeechDataset):
                             f"Use only predicted phonemes for inference."
                         )
                 phoneme_text = data.manifest_entry.get('ipa', '')
-                if data.language in self.ignore_phoneme_languages:
+                if language in self.ignore_phoneme_languages:
                     # Ignore phoneme tokenization for this language.
                     phoneme_text = ""
             else:
@@ -972,7 +972,7 @@ class MagpieTTSDataset(TextToSpeechDataset):
                 example['has_text_context'] = True
             else:
                 if self.add_language_to_context_text:
-                    context_text = f"[{data.language.upper()}]"
+                    context_text = f"[{language.upper()}]"
                 else:
                     context_text = "[NO TEXT CONTEXT]"
                 context_tokens = self.text_tokenizer.encode(context_text, self.text_conditioning_tokenizer_name)
@@ -1007,7 +1007,7 @@ class MagpieTTSDataset(TextToSpeechDataset):
         else:
             example['raw_text'] = data.text
 
-        example['language'] = data.language
+        example['language'] = language
 
         if "reward" in data.manifest_entry:
             example["reward"] = data.manifest_entry["reward"]
