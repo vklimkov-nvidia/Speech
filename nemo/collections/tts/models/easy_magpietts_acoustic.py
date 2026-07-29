@@ -119,7 +119,8 @@ class EasyMagpieTTSAcousticModel(EasyMagpieTTSInferenceModel):
         self.codebook_loss_scale = cfg.get('codebook_loss_scale', 1.0)
         self.phoneme_as_text_prob = cfg.get('phoneme_as_text_prob', 0.0)
 
-        self.cross_entropy_loss = nn.CrossEntropyLoss(reduction='none')
+        self.ignore_index = -1
+        self.cross_entropy_loss = nn.CrossEntropyLoss(reduction='mean', ignore_index=self.ignore_index)
 
         # Validation inference with metrics (optional)
         self.run_val_inference = cfg.get('run_val_inference', False)
@@ -187,11 +188,12 @@ class EasyMagpieTTSAcousticModel(EasyMagpieTTSInferenceModel):
             ei = si + codebook_size
             codebook_logits = logits[:, :, si:ei]  # (B, T', num_tokens_per_codebook)
             codebook_targets = audio_codes[:, codebook]  # (B, T')
+            codebook_targets = torch.where(loss_mask[:, codebook, :], codebook_targets, self.ignore_index)
             codebook_loss = self.cross_entropy_loss(
                 codebook_logits.permute(0, 2, 1), codebook_targets.long()  # (B, num_tokens_per_codebook, T')
             )  # (B, T')
-            codebook_loss = codebook_loss * loss_mask[:, codebook, :]
-            codebook_loss = codebook_loss.sum() / loss_mask[:, codebook, :].sum()
+            #codebook_loss = codebook_loss * loss_mask[:, codebook, :]
+            #codebook_loss = codebook_loss.sum() / loss_mask[:, codebook, :].sum()
             if total_codebook_loss is None:
                 total_codebook_loss = codebook_loss
             else:
@@ -208,9 +210,10 @@ class EasyMagpieTTSAcousticModel(EasyMagpieTTSInferenceModel):
             ei = si + self.phoneme_vocab_size
             phoneme_logits = logits[:, :, si:ei]
             phoneme_targets = phoneme_tokens[:, codebook]
+            phoneme_targets = torch.where(loss_mask, phoneme_targets, self.ignore_index)
             phoneme_loss = self.cross_entropy_loss(phoneme_logits.permute(0, 2, 1), phoneme_targets)
-            phoneme_loss = phoneme_loss * loss_mask
-            phoneme_loss = phoneme_loss.sum() / loss_mask.sum()
+            #phoneme_loss = phoneme_loss * loss_mask
+            #phoneme_loss = phoneme_loss.sum() / loss_mask.sum()
             if total_phoneme_loss is None:
                 total_phoneme_loss = phoneme_loss
             else:
