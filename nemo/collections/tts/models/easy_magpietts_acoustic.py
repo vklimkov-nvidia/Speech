@@ -17,6 +17,7 @@ import random
 from dataclasses import dataclass
 from typing import Optional, Tuple
 
+from einops import rearrange
 import numpy as np
 import soundfile as sf
 import torch
@@ -119,8 +120,14 @@ class EasyMagpieTTSAcousticModel(EasyMagpieTTSInferenceModel):
         self.codebook_loss_scale = cfg.get('codebook_loss_scale', 1.0)
         self.phoneme_as_text_prob = cfg.get('phoneme_as_text_prob', 0.0)
 
-        self.ignore_index = -1
-        self.cross_entropy_loss = nn.CrossEntropyLoss(reduction='mean', ignore_index=self.ignore_index)
+        #self.ignore_index = -1
+        #self.cross_entropy_loss = nn.CrossEntropyLoss(reduction='mean', ignore_index=self.ignore_index)
+        self.cross_entropy_loss = nn.CrossEntropyLoss(reduction='none')
+
+        self.infill_min = cfg.get("infill_min", 0.25)
+        self.infill_max = cfg.get("infill_min", 1.0)
+        self.infill_dist = torch.distributions.beta.Beta(concentration1=1.0, concentration0=2.0)
+        self.mask_emb = torch.nn.Parameter(torch.zeros([1, 1, cfg.hidden_dim]))
 
         # Validation inference with metrics (optional)
         self.run_val_inference = cfg.get('run_val_inference', False)
@@ -188,12 +195,12 @@ class EasyMagpieTTSAcousticModel(EasyMagpieTTSInferenceModel):
             ei = si + codebook_size
             codebook_logits = logits[:, :, si:ei]  # (B, T', num_tokens_per_codebook)
             codebook_targets = audio_codes[:, codebook]  # (B, T')
-            codebook_targets = torch.where(loss_mask[:, codebook, :], codebook_targets, self.ignore_index)
+            #codebook_targets = torch.where(loss_mask[:, codebook, :], codebook_targets, self.ignore_index)
             codebook_loss = self.cross_entropy_loss(
                 codebook_logits.permute(0, 2, 1), codebook_targets.long()  # (B, num_tokens_per_codebook, T')
             )  # (B, T')
-            #codebook_loss = codebook_loss * loss_mask[:, codebook, :]
-            #codebook_loss = codebook_loss.sum() / loss_mask[:, codebook, :].sum()
+            codebook_loss = codebook_loss * loss_mask[:, codebook, :]
+            codebook_loss = codebook_loss.sum() / loss_mask[:, codebook, :].sum()
             if total_codebook_loss is None:
                 total_codebook_loss = codebook_loss
             else:
@@ -210,16 +217,63 @@ class EasyMagpieTTSAcousticModel(EasyMagpieTTSInferenceModel):
             ei = si + self.phoneme_vocab_size
             phoneme_logits = logits[:, :, si:ei]
             phoneme_targets = phoneme_tokens[:, codebook]
-            phoneme_targets = torch.where(loss_mask, phoneme_targets, self.ignore_index)
+            #phoneme_targets = torch.where(loss_mask, phoneme_targets, self.ignore_index)
             phoneme_loss = self.cross_entropy_loss(phoneme_logits.permute(0, 2, 1), phoneme_targets)
-            #phoneme_loss = phoneme_loss * loss_mask
-            #phoneme_loss = phoneme_loss.sum() / loss_mask.sum()
+            phoneme_loss = phoneme_loss * loss_mask
+            phoneme_loss = phoneme_loss.sum() / loss_mask.sum()
             if total_phoneme_loss is None:
                 total_phoneme_loss = phoneme_loss
             else:
                 total_phoneme_loss = total_phoneme_loss + phoneme_loss
         total_phoneme_loss = total_phoneme_loss / self.phoneme_stacking_factor
         return total_phoneme_loss, loss_mask
+
+    def create_infill_mask(self, input_lens):
+        batch_size = input_lens.shape[0]
+        len_mask = get_mask_from_lengths(input_lens)
+        max_len = len_mask.shape[1]
+
+        infill_percent = self.infill_dist.sample(sample_shape=torch.Size([batch_size])).to(input_lens.device)
+        infill_percent = self.infill_min + (self.infill_max - self.infill_min) * infill_percent
+        infill_len = infill_percent * input_lens.float()
+        infill_rank = torch.clamp_min(infill_len - 1, 0).long()
+        infill_rank = infill_rank.unsqueeze(1)
+
+        # [batch_size, time]
+        infill_vals = torch.rand(size=len_mask.shape, device=input_lens.device)
+        infill_vals = infill_vals * len_mask
+        infill_topk = torch.topk(infill_vals, k=max_len, dim=1, sorted=True).values
+        infill_min_val = torch.gather(infill_topk, index=infill_rank, dim=1)
+        infill_mask = infill_vals >= infill_min_val
+
+        infill_mask = infill_mask * len_mask
+
+        return infill_mask
+
+    def embed_audio_tokens_with_dropout(self, audio_tokens, audio_tokens_lens, num_codebooks, projection, dropout_codes):
+        audio_tokens_rearrange = audio_tokens[:, :num_codebooks, :]
+        audio_tokens_rearrange = rearrange(audio_tokens_rearrange, 'B C T -> C B T')
+        # [B, D, T]
+        audio_codes = self._codec_model.vector_quantizer.decode(indices=audio_tokens_rearrange, input_len=audio_tokens_lens)
+        audio_codes = rearrange(audio_codes, 'B D T -> B T D')
+        audio_embedding = projection(audio_codes)
+
+        if dropout_codes:
+            infill_mask = self.create_infill_mask(input_lens=audio_tokens_lens)
+            infill_mask = rearrange(infill_mask, 'B T -> B T 1')
+            audio_embedding = torch.where(infill_mask, audio_embedding, self.mask_emb)
+
+        audio_embedding = torch.where(torch.any(audio_tokens == self.audio_bos_id, dim=1).unsqueeze(2), self.audio_bos_emb, audio_embedding)
+        audio_embedding = torch.where(torch.any(audio_tokens == self.audio_eos_id, dim=1).unsqueeze(2), self.audio_eos_emb, audio_embedding)
+        audio_embedding = torch.where(
+            torch.any(audio_tokens == self.context_audio_bos_id, dim=1).unsqueeze(2), self.context_bos_emb, audio_embedding
+        )
+        audio_embedding = torch.where(
+            torch.any(audio_tokens == self.context_audio_eos_id, dim=1).unsqueeze(2), self.context_eos_emb, audio_embedding
+        )
+        mask = get_mask_from_lengths(audio_tokens_lens)
+        audio_embedding = audio_embedding * mask.unsqueeze(2)
+        return audio_embedding
 
     def log_val_audio_example(
         self,
@@ -531,6 +585,7 @@ class EasyMagpieTTSAcousticModel(EasyMagpieTTSInferenceModel):
         audio_codes: torch.Tensor,
         audio_codes_lens: torch.Tensor,
         delay: torch.Tensor,
+        dropout_codes: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Prepare audio embeddings as a channel input with delay handling.
@@ -591,8 +646,8 @@ class EasyMagpieTTSAcousticModel(EasyMagpieTTSInferenceModel):
         if self.cond_type == "embedding":
             audio_embedded = self.embed_audio_tokens(audio_codes_input, num_codebooks=self.num_audio_codebooks_train)  # (B, T'-1, E)
         else:
-            audio_embedded = self.embed_audio_tokens_with_projection(
-                audio_codes_input, audio_codes_lens_target, self.num_audio_codebooks_train, self.decoder_code_proj
+            audio_embedded = self.embed_audio_tokens_with_dropout(
+                audio_codes_input, audio_codes_lens_target, self.num_audio_codebooks_train, self.decoder_code_proj, dropout_codes=dropout_codes
             )
 
         # Create zero tensor for delay padding
@@ -774,6 +829,7 @@ class EasyMagpieTTSAcousticModel(EasyMagpieTTSInferenceModel):
             )
 
         # 5. Prepare audio channel embeddings
+        dropout_codes = self.training and not dropout_conditional_input
         (
             audio_channel_embedding,
             audio_channel_lens,
@@ -783,6 +839,7 @@ class EasyMagpieTTSAcousticModel(EasyMagpieTTSInferenceModel):
             audio_codes=audio_codes,
             audio_codes_lens=audio_codes_lens,
             delay=audio_delay,
+            dropout_codes=dropout_codes,
         )
 
         # 6. Sum the channel embeddings element-wise
