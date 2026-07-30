@@ -72,18 +72,13 @@ from nemo.collections.tts.models import EasyMagpieTTSModel
 import argparse
 import json
 import os
-import random
 import shutil
-from dataclasses import fields
 from pathlib import Path
 from typing import List, Optional, Tuple
 
 import numpy as np
-import torch
 
 from nemo.collections.asr.parts.utils.manifest_utils import read_manifest
-from nemo.collections.tts.models.easy_magpietts_inference import EasyModelInferenceParameters
-from nemo.collections.tts.models.magpietts import ModelInferenceParameters
 from nemo.collections.tts.modules.magpietts_inference.evaluate_generated_audio import load_evalset_config
 from nemo.collections.tts.modules.magpietts_inference.evaluation import (
     DEFAULT_VIOLIN_METRICS,
@@ -91,98 +86,33 @@ from nemo.collections.tts.modules.magpietts_inference.evaluation import (
     compute_mean_with_confidence_interval,
     evaluate_generated_audio_dir,
 )
-from nemo.collections.tts.modules.magpietts_inference.inference import (
-    BaseInferenceConfig,
-    BaseInferenceRunner,
-    EasyMagpieInferenceConfig,
-    EasyMagpieInferenceRunner,
-    MagpieInferenceConfig,
-    MagpieInferenceRunner,
-)
+from nemo.collections.tts.modules.magpietts_inference.inference import BaseInferenceConfig, BaseInferenceRunner
 from nemo.collections.tts.modules.magpietts_inference.utils import (
     ModelLoadConfig,
+    _add_common_args,
+    _add_easy_magpie_args,
+    _add_magpie_args,
+    _build_easy_magpie_config,
+    _build_magpie_config,
+    _configure_cuda_for_rank,
+    _get_torchrun_rank_info,
+    _merge_multiturn_rank_outputs,
+    _runner_eval_manifest_and_audio_dir,
+    _save_grouped_multiturn_filewise_metrics,
+    _select_runner_cls,
+    _wait_for_multiturn_rank_manifests,
+    append_metrics_to_csv,
+    create_formatted_metrics_mean_ci,
+    filter_datasets,
     get_experiment_name_from_checkpoint_path,
     load_easy_magpie_model,
     load_magpie_model,
     log_model_architecture_summary,
+    seed_all,
+    write_csv_header_if_needed,
 )
 from nemo.collections.tts.modules.magpietts_inference.visualization import create_combined_box_plot, create_violin_plot
-from nemo.collections.tts.modules.magpietts_modules import EOSDetectionMethod
 from nemo.utils import logging
-
-
-def parse_layer_list(layer_str: Optional[str]) -> Optional[List[int]]:
-    """Parse a comma-separated list of layer indices."""
-    if layer_str is None:
-        return None
-    return [int(l.strip()) for l in layer_str.split(",")]
-
-
-def write_csv_header_if_needed(csv_path: str, header: str) -> None:
-    """Write CSV header if file doesn't exist."""
-    if not os.path.exists(csv_path):
-        with open(csv_path, "w") as f:
-            f.write(header + "\n")
-
-
-def append_metrics_to_csv(csv_path: str, checkpoint_name: str, dataset: str, metrics: dict) -> None:
-    """Append metrics to a CSV file."""
-    values = [
-        checkpoint_name,
-        dataset,
-        metrics.get('cer_filewise_avg', ''),
-        metrics.get('wer_filewise_avg', ''),
-        metrics.get('cer_cumulative', ''),
-        metrics.get('wer_cumulative', ''),
-        metrics.get('ssim_pred_gt_avg', ''),
-        metrics.get('ssim_pred_context_avg', ''),
-        metrics.get('ssim_gt_context_avg', ''),
-        metrics.get('ssim_pred_gt_avg_alternate', ''),
-        metrics.get('ssim_pred_context_avg_alternate', ''),
-        metrics.get('ssim_gt_context_avg_alternate', ''),
-        metrics.get('cer_gt_audio_cumulative', ''),
-        metrics.get('wer_gt_audio_cumulative', ''),
-        metrics.get('utmosv2_avg', ''),
-        metrics.get('total_gen_audio_seconds', ''),
-        metrics.get('frechet_codec_distance', ''),
-        metrics.get('eou_cutoff_rate', ''),
-        metrics.get('eou_silence_rate', ''),
-        metrics.get('eou_noise_rate', ''),
-        metrics.get('eou_error_rate', ''),
-        metrics.get('katakana_cer_filewise_avg', ''),
-        metrics.get('katakana_cer_cumulative', ''),
-    ]
-    with open(csv_path, "a") as f:
-        f.write(",".join(str(v) for v in values) + "\n")
-    logging.info(f"Metrics appended to: {csv_path}")
-
-
-def create_formatted_metrics_mean_ci(metrics_mean_ci: dict) -> dict:
-    """Create formatted metrics mean CI."""
-    for k, v in metrics_mean_ci.items():
-        if isinstance(v, list):
-            mean, ci = float(v[0]), float(v[1])
-            logging.info(f"Metric {k}: {mean:.4f} ± {ci:.4f}")
-            metrics_mean_ci[k] = f"{mean:.4f} ± {ci:.4f}"
-    return metrics_mean_ci
-
-
-def filter_datasets(
-    dataset_meta_info: dict,
-    datasets: Optional[List[str]],
-) -> List[str]:
-    """Select datasets from the dataset meta info."""
-    if datasets is None:
-        # Dataset filtering not specified, return all datasets.
-        return list(dataset_meta_info.keys())
-    else:
-        datasets = datasets.split(",")
-        # Check if requested datasets are valid.
-        for dataset in datasets:
-            if dataset not in dataset_meta_info:
-                raise ValueError(f"Dataset {dataset} not found in dataset meta info")
-        # Return all requested datasets.
-        return datasets
 
 
 def run_inference_and_evaluation(
@@ -231,6 +161,13 @@ def run_inference_and_evaluation(
     # Remove UTMOSv2 from plots if disabled
     if not eval_config.with_utmosv2 and 'utmosv2' in violin_plot_metrics:
         violin_plot_metrics.remove('utmosv2')
+
+    rank, world_size, _ = _get_torchrun_rank_info()
+    is_distributed = world_size > 1
+    is_multiturn_user_audio = getattr(runner, "produces_turn_level_evaluation", False)
+
+    if hasattr(runner, "set_distributed_context"):
+        runner.set_distributed_context(rank=rank, world_size=world_size)
 
     # Build full checkpoint identifier (include MoE info if present)
     full_checkpoint_name = f"{checkpoint_name}_{moe_info}{inference_config.build_identifier()}_SV_{eval_config.sv_model}_{eval_config.language}"
@@ -285,13 +222,17 @@ def run_inference_and_evaluation(
 
         # Setup CSV files
         per_run_csv = os.path.join(eval_dir, "all_experiment_metrics.csv")
-        write_csv_header_if_needed(per_run_csv, csv_header)
+        if rank == 0:
+            write_csv_header_if_needed(per_run_csv, csv_header)
 
         metrics_all_repeats = []
         filewise_metrics_all_repeats = []
 
         for repeat_idx in range(num_repeats):
-            logging.info(f"Repeat {repeat_idx + 1}/{num_repeats} for dataset {dataset}")
+            repeat_log_msg = f"Repeat {repeat_idx + 1}/{num_repeats} for dataset {dataset}"
+            if is_distributed:
+                repeat_log_msg += f", rank {rank}/{world_size}"
+            logging.info(repeat_log_msg)
 
             repeat_audio_dir = os.path.join(audio_dir, f"repeat_{repeat_idx}")
             os.makedirs(repeat_audio_dir, exist_ok=True)
@@ -304,9 +245,21 @@ def run_inference_and_evaluation(
                     f"Dataset length mismatch: {len(test_dataset)} vs {len(manifest_records)} manifest records"
                 )
 
+            if is_distributed and not is_multiturn_user_audio:
+                raise RuntimeError(
+                    "torchrun multi-GPU sharding is currently implemented for "
+                    "--easy_magpie_inference_mode multiturn_user_audio only. "
+                    "Use the existing single-process path for single_turn/magpie, or add a "
+                    "rank-safe merge path for those runners."
+                )
+
+            inference_output_dir = repeat_audio_dir
+            if is_distributed and is_multiturn_user_audio:
+                inference_output_dir = os.path.join(repeat_audio_dir, f"rank_{rank:04d}")
+
             rtf_metrics_list, _, codec_file_paths = runner.run_inference_on_dataset(
                 dataset=test_dataset,
-                output_dir=repeat_audio_dir,
+                output_dir=inference_output_dir,
                 manifest_records=manifest_records,
                 audio_base_dir=meta['audio_dir'],
                 save_cross_attention_maps=True,
@@ -323,7 +276,10 @@ def run_inference_and_evaluation(
                     mean_rtf[f"{component_name}_{key}"] = value
                 logging.info(f"{component_name} FLOPs per token: {component_flops['total_flops_per_token']:,}")
 
-            with open(os.path.join(eval_dir, f"{dataset}_rtf_metrics_{repeat_idx}.json"), "w") as f:
+            rtf_metrics_filename = f"{dataset}_rtf_metrics_{repeat_idx}.json"
+            if is_distributed:
+                rtf_metrics_filename = f"{dataset}_rtf_metrics_{repeat_idx}_rank{rank:04d}.json"
+            with open(os.path.join(eval_dir, rtf_metrics_filename), "w") as f:
                 json.dump(mean_rtf, f, indent=4)
 
             if skip_evaluation:
@@ -331,6 +287,26 @@ def run_inference_and_evaluation(
                 continue
 
             # Run evaluation
+            if is_distributed and is_multiturn_user_audio:
+                if rank != 0:
+                    # Non-zero ranks only generate. Rank 0 waits and evaluates merged outputs.
+                    continue
+
+                _wait_for_multiturn_rank_manifests(repeat_audio_dir, world_size)
+                merged_manifest_path = _merge_multiturn_rank_outputs(
+                    repeat_audio_dir=repeat_audio_dir,
+                    world_size=world_size,
+                    save_predicted_codes=eval_config.with_fcd,
+                )
+                eval_manifest_path = merged_manifest_path
+                eval_audio_dir = repeat_audio_dir
+            else:
+                eval_manifest_path, eval_audio_dir = _runner_eval_manifest_and_audio_dir(
+                    runner,
+                    default_manifest=meta['manifest_path'],
+                    default_audio_dir=meta['audio_dir'],
+                )
+
             eval_config_for_dataset = EvaluationConfig(
                 sv_model=eval_config.sv_model,
                 asr_model_name=asr_model_name,
@@ -340,12 +316,15 @@ def run_inference_and_evaluation(
                 with_utmosv2=eval_config.with_utmosv2,
                 with_fcd=eval_config.with_fcd,
                 codec_model_path=eval_config.codec_model_path,
+                strip_text_annotations_for_metrics=eval_config.strip_text_annotations_for_metrics,
                 device=eval_config.device,
+                asr_batch_size=eval_config.asr_batch_size,
+                eou_batch_size=eval_config.eou_batch_size,
             )
 
             metrics, filewise_metrics = evaluate_generated_audio_dir(
-                manifest_path=meta['manifest_path'],
-                audio_dir=meta['audio_dir'],
+                manifest_path=eval_manifest_path,
+                audio_dir=eval_audio_dir,
                 generated_audio_dir=repeat_audio_dir,
                 config=eval_config_for_dataset,
             )
@@ -361,6 +340,15 @@ def run_inference_and_evaluation(
             with open(os.path.join(eval_dir, f"{dataset}_filewise_metrics_{repeat_idx}.json"), "w") as f:
                 json.dump(sorted_filewise, f, indent=4)
 
+            if is_multiturn_user_audio:
+                _save_grouped_multiturn_filewise_metrics(
+                    eval_dir=eval_dir,
+                    dataset=dataset,
+                    repeat_idx=repeat_idx,
+                    filewise_metrics=filewise_metrics,
+                    manifest_path=eval_manifest_path,
+                )
+
             # Append to per-run CSV
             append_metrics_to_csv(per_run_csv, full_checkpoint_name, dataset, metrics)
 
@@ -369,8 +357,16 @@ def run_inference_and_evaluation(
             create_violin_plot(filewise_metrics, violin_plot_metrics, violin_path)
 
             # Delete temporary predicted codes files
-            for codec_file_path in codec_file_paths:
-                os.remove(codec_file_path)
+            if is_distributed and is_multiturn_user_audio:
+                for codec_file_path in Path(repeat_audio_dir).glob("predicted_codes_*.pt"):
+                    if os.path.exists(codec_file_path):
+                        os.remove(codec_file_path)
+            else:
+                for codec_file_path in codec_file_paths:
+                    os.remove(codec_file_path)
+
+        if rank != 0:
+            continue
 
         if skip_evaluation or not metrics_all_repeats:
             continue
@@ -398,17 +394,17 @@ def run_inference_and_evaluation(
         cer_per_dataset.append(np.mean(cer_values))
 
     # Create combined plot if we have multiple datasets
-    if len(all_datasets_filewise_metrics) > 1:
+    if rank == 0 and len(all_datasets_filewise_metrics) > 1:
         combined_plot_path = os.path.join(out_dir, f"{full_checkpoint_name}_combined_violin_plot.png")
         create_combined_box_plot(all_datasets_filewise_metrics, violin_plot_metrics, combined_plot_path)
 
     # Clean up if requested
-    if clean_up_disk:
+    if rank == 0 and clean_up_disk:
         logging.info(f"Cleaning up output directory: {out_dir}")
         shutil.rmtree(out_dir)
 
     # Return averaged metrics
-    if ssim_per_dataset and cer_per_dataset:
+    if rank == 0 and ssim_per_dataset and cer_per_dataset:
         return np.mean(cer_per_dataset), np.mean(ssim_per_dataset)
     return None, None
 
@@ -679,51 +675,15 @@ def create_argument_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _build_inference_params_from_args(param_cls: type, args):
-    """Extract inference parameters from parsed CLI args for the given dataclass."""
-    params = {}
-    for f in fields(param_cls):
-        arg_val = vars(args).get(f.name)
-        if arg_val is not None:
-            if f.name in ("estimate_alignment_from_layers", "apply_prior_to_layers"):
-                params[f.name] = parse_layer_list(arg_val)
-            else:
-                params[f.name] = arg_val
-    return param_cls.from_dict(params)
-
-
-def _build_magpie_config(args) -> MagpieInferenceConfig:
-    return MagpieInferenceConfig(
-        model_inference_parameters=_build_inference_params_from_args(ModelInferenceParameters, args),
-        batch_size=args.batch_size,
-        use_cfg=args.use_cfg,
-        apply_attention_prior=args.apply_attention_prior,
-        use_local_transformer=args.use_local_transformer,
-        maskgit_n_steps=args.maskgit_n_steps,
-        maskgit_noise_scale=args.maskgit_noise_scale,
-        maskgit_fixed_schedule=args.maskgit_fixed_schedule,
-        maskgit_sampling_type=args.maskgit_sampling_type,
-        default_tokenizer_name=args.tokenizer_name,
-    )
-
-
-def _build_easy_magpie_config(args) -> EasyMagpieInferenceConfig:
-    return EasyMagpieInferenceConfig(
-        model_inference_parameters=_build_inference_params_from_args(EasyModelInferenceParameters, args),
-        batch_size=args.batch_size,
-        use_cfg=args.use_cfg,
-        use_local_transformer=args.use_local_transformer,
-        phoneme_input_type=args.phoneme_input_type,
-        phoneme_sampling_method=args.phoneme_sampling_method,
-        dropout_text_input=args.dropout_text_input,
-        default_tokenizer_name=args.tokenizer_name,
-    )
-
-
 def main(argv=None):
     """Entry point for TTS inference and evaluation."""
     parser = create_argument_parser()
     args = parser.parse_args(argv)
+    if args.model_type == 'easy_magpie' and args.easy_magpie_inference_mode == 'multiturn_user_audio':
+        _configure_cuda_for_rank()
+        if args.batch_size > 1:
+            parser.error("--easy_magpie_inference_mode multiturn_user_audio requires --batch_size 1.")
+
     if args.deterministic:
         seed_all(seed=9)
 
@@ -749,7 +709,7 @@ def main(argv=None):
     is_easy_magpie = args.model_type == 'easy_magpie'
     load_fn = load_easy_magpie_model if is_easy_magpie else load_magpie_model
     inference_config = _build_easy_magpie_config(args) if is_easy_magpie else _build_magpie_config(args)
-    runner_cls = EasyMagpieInferenceRunner if is_easy_magpie else MagpieInferenceRunner
+    runner_cls = _select_runner_cls(args)
 
     eval_config = EvaluationConfig(
         sv_model=args.sv_model,
@@ -760,6 +720,9 @@ def main(argv=None):
         with_utmosv2=not args.disable_utmosv2,
         with_fcd=not args.disable_fcd,
         codec_model_path=args.codecmodel_path if not args.disable_fcd else None,
+        strip_text_annotations_for_metrics=args.strip_text_annotations_for_metrics,
+        asr_batch_size=args.asr_batch_size,
+        eou_batch_size=args.eou_batch_size,
     )
 
     cer, ssim = None, None
