@@ -23,6 +23,7 @@ from nemo.collections.tts.models.audio_codec_moss import MossAudioCodecModel
 from nemo.collections.tts.models.easy_magpietts import EasyMagpieTTSModel
 from nemo.collections.tts.models.easy_magpietts_acoustic import EasyMagpieTTSAcousticModel
 from nemo.collections.tts.models.easy_magpietts_acoustic_linear import EasyMagpieTTSAcousticLinearModel
+from nemo.collections.tts.models.easy_magpietts_acoustic_transformer import EasyMagpieTTSAcousticTransformerModel
 from nemo.collections.tts.models.easy_magpietts_semantic import EasyMagpieTTSSemanticModel
 from nemo.collections.tts.models.easy_magpietts_inference import EasyMagpieTTSInferenceModel
 from nemo.collections.tts.models.easy_magpietts_preference_optimization import EasyMagpieTTSModelOnlinePO

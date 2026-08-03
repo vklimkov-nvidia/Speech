@@ -396,6 +396,11 @@ class EasyMagpieTTSInferenceModel(ModelPT):
         else:
             self.acoustic_decoder_linear = None
 
+        if 'acoustic_decoder_transformer' in cfg:
+            self.acoustic_decoder_transformer = safe_instantiate(cfg.acoustic_decoder_transformer)
+        else:
+            self.acoustic_decoder_transformer = None
+
         # If 'acoustic_model_path' is provided, the acoustic model will be initialized from the provided path.
         # It will then be registered as a submodule and automatically loaded from the 'acoustic_model' field
         if cfg.get("acoustic_model"):
@@ -1887,6 +1892,29 @@ class EasyMagpieTTSInferenceModel(ModelPT):
             audio_codes_next = torch.concat([audio_codes_next, acoustic_codes], dim=1)
             all_codes_next_argmax = torch.concat([all_codes_next_argmax, acoustic_codes], dim=1)
 
+        if self.acoustic_decoder_transformer is not None:
+            semantic_tokens_input = audio_codes_next[:, :1].unsqueeze(1)
+            if len(state.all_predictions) > 0:
+                # [B, C, T]
+                prev_semantic_tokens = torch.cat(state.all_predictions, dim=-1)  # (B, C, T_total_frames)
+                # [B, 1, T]
+                prev_semantic_tokens = prev_semantic_tokens[:, :1, :]
+                semantic_tokens_input = torch.concat([prev_semantic_tokens, semantic_tokens_input], dim=2)
+
+            acoustic_input = last_hidden[:actual_batch_size, :, :]
+            audio_codes_lens = semantic_tokens_input.shape[2] * torch.ones([actual_batch_size], device=last_hidden.device)
+
+            # [B, C, T]
+            acoustic_codes, _ = self.acoustic_decoder_transformer(
+                inputs=acoustic_input,
+                audio_lens=audio_codes_lens,
+                semantic_tokens=semantic_tokens_input,
+                vector_quantizer=self._codec_model.vector_quantizer,
+            )
+            acoustic_codes = acoustic_codes[:, :, -1] # (B, C)
+            audio_codes_next = torch.concat([audio_codes_next, acoustic_codes], dim=1)
+            all_codes_next_argmax = torch.concat([all_codes_next_argmax, acoustic_codes], dim=1)
+
         return audio_codes_next, all_codes_next_argmax
 
     def streaming_finalize(
@@ -2101,6 +2129,10 @@ class EasyMagpieTTSInferenceModel(ModelPT):
         grad_ctx = torch.inference_mode if use_inference_mode else torch.no_grad
 
         with grad_ctx():
+
+            if self.acoustic_decoder_transformer is not None:
+                self.acoustic_decoder_transformer.transformer.reset_cache(use_cache=True)
+
             start_time = time.time()
 
             # Extract tensors from batch
@@ -2269,6 +2301,9 @@ class EasyMagpieTTSInferenceModel(ModelPT):
                 )
                 predicted_phoneme_tokens_lens = phoneme_end - phoneme_start
                 phoneme_prediction_start_idx_out = phoneme_start
+
+            if self.acoustic_decoder_transformer is not None:
+                self.acoustic_decoder_transformer.transformer.reset_cache(use_cache=False)
 
             return InferBatchOutput(
                 predicted_audio=finalize_output.audio,

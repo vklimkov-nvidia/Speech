@@ -42,7 +42,6 @@ from nemo.collections.tts.modules.magpietts_modules import (
     remove_special_tokens,
     worker_init_fn,
 )
-from nemo.collections.tts.parts.utils.tts_dataset_utils import stack_tensors
 from nemo.collections.tts.parts.utils.helpers import (
     get_mask_from_lengths,
     get_speaker_embeddings_from_filepaths,
@@ -98,7 +97,7 @@ class ProcessBatchOutput:
     pred_audio_codes: torch.Tensor
 
 
-class EasyMagpieTTSAcousticModel(EasyMagpieTTSInferenceModel):
+class EasyMagpieTTSAcousticTransformerModel(EasyMagpieTTSInferenceModel):
     """
     Magpie-TTS Model Decoder Only Model with training support.
 
@@ -285,29 +284,10 @@ class EasyMagpieTTSAcousticModel(EasyMagpieTTSInferenceModel):
     ):
         wandb_audio_log = {}
 
-        '''
-        pred_audio_codes = self.logits_to_audio_codes(logits, audio_codes_lens_target)
-        pred_audio_codes, pred_audio_codes_lens = remove_eos_token(
-            codes=pred_audio_codes,
-            codes_len=audio_codes_lens_target,
-        )
-        pred_audio_codes = torch.clamp_max(pred_audio_codes, max=self.codebook_size - 1)
-        pred_audio_codes, pred_audio_codes_lens = self._prepare_codes_for_decode(
-            pred_audio_codes, pred_audio_codes_lens, num_codebooks=self.num_audio_codebooks_train,
-        )
-        '''
-
         pred_audio, pred_audio_lens, _ = self._codec_helper.codes_to_audio(
             pred_audio_codes,
             audio_codes_lens,
         )
-        #target_audio_codes, _ = remove_eos_token(
-        #    codes=target_audio_codes,
-        #    codes_len=audio_codes_lens_target,
-        #)
-        #target_audio_codes, target_audio_codes_lens = self._prepare_codes_for_decode(
-        #    target_audio_codes, audio_codes_lens_target - 1, num_codebooks=self.num_audio_codebooks_train,
-        #)
         target_audio, target_audio_lens, _ = self._codec_helper.codes_to_audio(
             target_audio_codes,
             audio_codes_lens,
@@ -644,10 +624,10 @@ class EasyMagpieTTSAcousticModel(EasyMagpieTTSInferenceModel):
 
         # Embed audio tokens
         if self.cond_type == "embedding":
-            audio_embedded = self.embed_audio_tokens(audio_codes_input, num_codebooks=self.num_audio_codebooks_train)  # (B, T'-1, E)
+            audio_embedded = self.embed_audio_tokens(audio_codes_input, num_codebooks=self.num_audio_codebooks)  # (B, T'-1, E)
         else:
             audio_embedded = self.embed_audio_tokens_with_dropout(
-                audio_codes_input, audio_codes_lens_target, self.num_audio_codebooks_train, self.decoder_code_proj, dropout_codes=dropout_codes
+                audio_codes_input, audio_codes_lens_target, self.num_audio_codebooks, self.decoder_code_proj, dropout_codes=dropout_codes
             )
 
         # Create zero tensor for delay padding
@@ -934,11 +914,10 @@ class EasyMagpieTTSAcousticModel(EasyMagpieTTSInferenceModel):
         acoustic_codes_target = audio_codes[:, self.num_audio_codebooks_train:, :]
 
         acoustic_input, _ = remove_embedded_eos_token(embedded=pred_embeddings, embedded_len=audio_codes_lens_target)
-        pred_acoustic_codes, acoustic_logits = self.acoustic_decoder(
+        pred_acoustic_codes, acoustic_logits = self.acoustic_decoder_transformer(
             inputs=acoustic_input,
             audio_lens=audio_codes_lens,
             semantic_tokens=semantic_codes,
-            acoustic_tokens=acoustic_codes_target,
             vector_quantizer=self._codec_model.vector_quantizer,
         )
 
