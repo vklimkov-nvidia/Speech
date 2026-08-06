@@ -38,7 +38,12 @@ transformer_2501 = pytest.importorskip("nemo.collections.tts.modules.transformer
 
 from conftest import build_vllm_config  # noqa: E402
 from easymagpie_vllm_omni.config import EasyMagpieOmniArch  # noqa: E402
-from easymagpie_vllm_omni.local_transformer import EasyMagpieCodePredictor  # noqa: E402
+from easymagpie_vllm_omni.local_transformer import (  # noqa: E402
+    EasyMagpieCodePredictor,
+    sample_codebook,
+    sample_codebook_with_logprobs,
+)
+from nemo.collections.tts.modules.magpietts_modules import LocalTransformerHelper  # noqa: E402
 from torch import nn  # noqa: E402
 
 # Two arch profiles: one where all widths are equal (in/out projections are
@@ -134,7 +139,7 @@ def _vllm_teacher_forced_logits(
     """
     num_tokens = dec_hidden.shape[0]
     n = cp.num_codebooks
-    lt_hidden = cp.lt_hidden
+    lt_hidden = cp._buf_inputs.shape[-1]
     buf = torch.zeros(num_tokens, n, lt_hidden, dtype=dec_hidden.dtype, device=dec_hidden.device)
     buf[:, 0, :] = cp.local_transformer_in_projection(dec_hidden)
     for k in range(n - 1):
@@ -154,14 +159,8 @@ def _copy_nemo_into_vllm(nemo: NeMoLocalTransformerStack, cp: EasyMagpieCodePred
     missing = []
     for name, param in cp.named_parameters():
         if name in nemo_sd:
-            src = nemo_sd[name]
-            # The FFN ships as kernel-1 Conv1d (``[out, in, 1]``) in NeMo but is a
-            # plain ``nn.Linear`` (``[out, in]``) here; squeeze the conv dim to
-            # match (mirrors ``EasyMagpieTTS.load_weights``).
-            if src.ndim == param.ndim + 1 and src.shape[-1] == 1:
-                src = src.squeeze(-1)
-            assert param.shape == src.shape, f"shape mismatch {name}"
-            param.data.copy_(src.to(param.dtype))
+            assert param.shape == nemo_sd[name].shape, f"shape mismatch {name}"
+            param.data.copy_(nemo_sd[name].to(param.dtype))
         else:
             missing.append(name)
     assert not missing, f"vLLM params with no NeMo counterpart: {missing}"
@@ -206,6 +205,43 @@ def test_local_transformer_matches_nemo(profile):
 
 
 @pytest.mark.unit
+def test_autoregressive_argmax_matches_nemo_helper():
+    """The fixed-buffer vLLM AR loop must match NeMo's growing-sequence helper."""
+    cp, nemo, arch = _build_pair(ARCH_PROFILES["equal_dims"])
+    cp.temperature = 0.0
+    topk = min(80, arch.num_all_tokens_per_codebook)
+    cp.top_k = topk
+    helper = LocalTransformerHelper(
+        local_transformer=nemo.local_transformer,
+        audio_embeddings=nemo.audio_embeddings,
+        audio_in_projection=nemo.audio_in_projection,
+        local_transformer_in_projection=nemo.local_transformer_in_projection,
+        local_transformer_audio_out_projection=nemo.local_transformer_audio_out_projection,
+        local_transformer_out_projections=nemo.local_transformer_out_projections,
+        num_audio_codebooks=arch.num_audio_codebooks,
+        frame_stacking_factor=arch.frame_stacking_factor,
+        audio_eos_id=arch.audio_eos_id,
+        mask_token_id=arch.mask_token_id,
+        codebook_size=arch.codebook_size,
+    )
+
+    torch.manual_seed(4321)
+    dec_hidden = torch.randn(4, arch.hidden_dim)
+    nemo_codes = helper.sample_autoregressive(
+        dec_output=dec_hidden,
+        temperature=0.0,
+        topk=topk,
+        use_cfg=False,
+        use_kv_cache=False,
+        sanitize_logits=True,
+    )
+    nemo_flat = nemo_codes.permute(0, 2, 1).reshape(dec_hidden.shape[0], -1)
+    vllm_flat = cp.generate_codes(dec_hidden)
+
+    assert torch.equal(vllm_flat, nemo_flat)
+
+
+@pytest.mark.unit
 def test_generate_codes_shape_dtype_and_range():
     """``generate_codes`` returns valid (num_tokens, num_codebooks) int64 codes within vocab."""
     cp, _, arch = _build_pair(ARCH_PROFILES["equal_dims"])
@@ -221,6 +257,29 @@ def test_generate_codes_shape_dtype_and_range():
 
 
 @pytest.mark.unit
+def test_generate_codes_with_logprobs_shape_and_finiteness():
+    """``generate_codes_with_logprobs`` returns finite selected-code logprobs."""
+    cp, _, arch = _build_pair(ARCH_PROFILES["equal_dims"])
+    num_tokens = 5
+
+    torch.manual_seed(0)
+    codes, model_logprobs, sampling_logprobs = cp.generate_codes_with_logprobs(
+        torch.randn(num_tokens, arch.hidden_dim)
+    )
+
+    expected_shape = (num_tokens, arch.num_stacked_codebooks)
+    assert codes.shape == expected_shape
+    assert model_logprobs.shape == expected_shape
+    assert sampling_logprobs.shape == expected_shape
+    assert model_logprobs.dtype == torch.float32
+    assert sampling_logprobs.dtype == torch.float32
+    assert torch.isfinite(model_logprobs).all()
+    assert torch.isfinite(sampling_logprobs).all()
+    assert (model_logprobs <= 0).all()
+    assert (sampling_logprobs <= 0).all()
+
+
+@pytest.mark.unit
 def test_generate_codes_respects_forbidden_mask():
     """With argmax sampling, forbidden special tokens are never emitted (only EOS stays reachable)."""
     cp, _, arch = _build_pair(ARCH_PROFILES["equal_dims"])
@@ -232,6 +291,89 @@ def test_generate_codes_respects_forbidden_mask():
     # Allowed = real codebook tokens [0, codebook_size) plus the audio EOS id.
     allowed = (codes < arch.codebook_size) | (codes == arch.audio_eos_id)
     assert allowed.all(), f"sampled forbidden tokens: {sorted(set(codes[~allowed].tolist()))}"
+
+
+@pytest.mark.unit
+def test_sampler_sanitizes_non_finite_logits():
+    """Match the NeMo inference path's logit sanitization before top-k sampling."""
+
+    logits = torch.tensor([[float("nan"), float("inf"), float("-inf"), 5.0]])
+
+    sampled = sample_codebook(logits, temperature=0.0, top_k=0, forbidden_mask=None)
+    sampled_with_lp, model_lp, sampling_lp = sample_codebook_with_logprobs(
+        logits,
+        temperature=0.0,
+        top_k=0,
+        forbidden_mask=None,
+    )
+
+    assert sampled.tolist() == [1]
+    assert sampled_with_lp.tolist() == [1]
+    assert torch.isfinite(model_lp).all()
+    assert torch.isfinite(sampling_lp).all()
+
+
+@pytest.mark.unit
+def test_sampler_sanitizes_non_finite_logits_with_temperature_topk():
+    """Finite logprobs are required for RL rollouts with sampled top-k audio."""
+
+    logits = torch.tensor(
+        [
+            [float("nan"), float("inf"), float("-inf"), 5.0],
+            [float("nan"), float("-inf"), -4.0, 2.0],
+        ]
+    )
+
+    torch.manual_seed(0)
+    sampled, model_lp, sampling_lp = sample_codebook_with_logprobs(
+        logits,
+        temperature=0.7,
+        top_k=3,
+        forbidden_mask=None,
+    )
+
+    assert sampled.shape == (2,)
+    assert torch.isfinite(model_lp).all()
+    assert torch.isfinite(sampling_lp).all()
+
+
+@pytest.mark.unit
+def test_selected_logprobs_split_raw_model_and_sampling_distributions():
+    """Model logprobs match raw logits while sampling logprobs match masked top-k."""
+
+    logits = torch.tensor(
+        [
+            [1.5, -2.0, 0.25, 3.0],
+            [-0.5, 2.5, 0.75, 1.0],
+        ],
+        dtype=torch.float32,
+    )
+    forbidden_mask = torch.tensor(
+        [
+            [False, True, False, False],
+            [False, False, True, False],
+        ],
+        dtype=torch.bool,
+    )
+    temperature = 0.7
+    top_k = 2
+
+    torch.manual_seed(11)
+    sampled, model_lp, sampling_lp = sample_codebook_with_logprobs(
+        logits,
+        temperature=temperature,
+        top_k=top_k,
+        forbidden_mask=forbidden_mask,
+    )
+
+    expected_model_lp = torch.log_softmax(logits, dim=-1).gather(-1, sampled.unsqueeze(-1)).squeeze(-1)
+    masked = logits.masked_fill(forbidden_mask, float("-inf"))
+    vals, idxs = torch.topk(masked / temperature, k=top_k, dim=-1)
+    sampled_in_k = (idxs == sampled.unsqueeze(-1)).nonzero(as_tuple=False)[:, -1]
+    expected_sampling_lp = torch.log_softmax(vals, dim=-1).gather(-1, sampled_in_k.unsqueeze(-1)).squeeze(-1)
+
+    assert torch.allclose(model_lp, expected_model_lp, atol=1e-6)
+    assert torch.allclose(sampling_lp, expected_sampling_lp, atol=1e-6)
 
 
 @pytest.mark.unit

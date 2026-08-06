@@ -15,8 +15,8 @@
 
 The model definition (``easymagpie_vllm_omni.local_transformer`` etc.) is plain
 PyTorch: the ``@support_torch_compile`` decorator short-circuits to eager when
-``compilation_config.mode == CompilationMode.NONE``, and the modules only read a
-handful of scalars off the ``VllmConfig``. So the whole stack can be exercised as
+the compilation config disables compilation, and the modules only read a handful
+of scalars off the ``VllmConfig``. So the whole stack can be exercised as
 ordinary PyTorch with a tiny stand-in config — **no model directory, no engine,
 no GPU required** — which is what these fixtures provide.
 
@@ -55,20 +55,32 @@ def build_vllm_config(**arch_overrides):
     * ``model_config.hf_config`` — arch scalars (read via ``from_hf_config``);
     * ``model_config.dtype`` — buffer dtype;
     * ``scheduler_config.max_num_batched_tokens`` — scratch-buffer length;
-    * ``compilation_config.mode`` — ``CompilationMode.NONE`` so the
+    * ``compilation_config`` — disables compilation so the
       ``@support_torch_compile`` wrapper stays in eager mode.
 
     Any keyword overrides are merged into the default tiny arch profile.
     """
     import torch
-    from vllm.config import CompilationMode
+
+    try:
+        from vllm.config import CompilationLevel
+    except ImportError:
+        from vllm.config.compilation import CompilationLevel
+    try:
+        from vllm.config import CompilationMode
+        compilation_mode = CompilationMode.NONE
+    except ImportError:
+        compilation_mode = None
 
     arch = {**_DEFAULT_ARCH, **arch_overrides}
     hf_config = types.SimpleNamespace(**arch)
     return types.SimpleNamespace(
         model_config=types.SimpleNamespace(hf_config=hf_config, dtype=torch.float32),
         scheduler_config=types.SimpleNamespace(max_num_batched_tokens=128),
-        compilation_config=types.SimpleNamespace(mode=CompilationMode.NONE),
+        compilation_config=types.SimpleNamespace(
+            level=CompilationLevel.NO_COMPILATION,
+            mode=compilation_mode,
+        ),
     )
 
 
