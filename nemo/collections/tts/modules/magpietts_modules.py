@@ -18,6 +18,7 @@ import copy
 from enum import Enum
 from typing import Dict, List, Optional
 
+from einops import rearrange
 import numpy as np
 import torch
 from einops import rearrange

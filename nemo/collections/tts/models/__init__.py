@@ -52,6 +52,7 @@ __all__ = [
     "MagpieTTSModel",
     "OnlineCFGDistillation",
     "EasyMagpieTTSModel",
+    "EasyMagpieTTSAcousticModel",
     "EasyMagpieTTSInferenceModel",
     "EasyMagpieTTSModelOnlinePO",
     "MagpieTTSModelOfflinePODataGen",

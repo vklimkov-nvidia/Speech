@@ -19,6 +19,7 @@ from dataclasses import dataclass, fields
 from functools import partial
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
+from einops import rearrange
 import numpy as np
 import soundfile as sf
 import torch
@@ -44,6 +45,7 @@ from nemo.collections.tts.modules.magpietts_modules import (
     LocalTransformerType,
     SpecialAudioToken,
     add_special_tokens,
+    create_infill_mask,
 )
 from nemo.collections.tts.parts.utils.helpers import get_mask_from_lengths
 from nemo.collections.tts.parts.utils.tts_dataset_utils import stack_tensors
@@ -560,6 +562,7 @@ class EasyMagpieTTSInferenceModel(ModelPT):
                     'p_dropout': cfg.get('speaker_encoder_p_dropout', 0.0),
                     'is_causal': False,
                     'use_learnable_pos_emb': True,
+                    'max_length_causal_mask': cfg.get('speaker_encoder_max_length_causal_mask', 4096),
                 }
             self.speaker_encoder = transformer_2501.Transformer(**speaker_encoder_cfg)
             # Train-only probability to bypass speaker encoder and feed batch-shuffled
@@ -878,7 +881,13 @@ class EasyMagpieTTSInferenceModel(ModelPT):
                     num_codebooks=C,
                 )  # (B, C*S, T)
 
-            audio_emb = self.embed_audio_tokens(profile_audio_stacked)
+            if self.cond_type == "embedding":
+                audio_emb = self.embed_audio_tokens(profile_audio_stacked)
+            else:
+                audio_emb_len = torch.full((B,), T * S, dtype=torch.long, device=device)
+                audio_emb = self.embed_audio_tokens_with_projection(
+                    profile_audio_stacked, audio_emb_len, self.num_audio_codebooks, self.context_code_proj
+                )
 
             # Match training channel sum: text + audio profile-token/silence input.
             combined_emb = text_emb + audio_emb
@@ -1777,6 +1786,13 @@ class EasyMagpieTTSInferenceModel(ModelPT):
                         gt_audio_codes, gt_audio_codes_lens, self.num_audio_codebooks_train, self.decoder_code_proj
                     )
                 gt_audio_lens_state = gt_audio_codes_lens
+                if self.cond_type == "embedding":
+                    gt_audio_embeddings = self.embed_audio_tokens(gt_audio_codes)  # (B, T', E)
+                else:
+                    gt_audio_embeddings = self.embed_audio_tokens_with_projection(
+                        gt_audio_codes, gt_audio_lens_state, self.num_audio_codebooks, self.decoder_code_proj
+                    )
+
 
             # Initialize static config and mutable streaming state
             config = StreamingConfig(
@@ -2660,6 +2676,9 @@ class EasyMagpieTTSInferenceModel(ModelPT):
                 self.acoustic_decoder_transformer.reset_cache(use_cache=True)
 
             start_time = time.time()
+
+            if self.acoustic_decoder is not None:
+                self.acoustic_decoder.transformer.reset_cache(use_cache=True)
 
             # Extract tensors from batch
             text = batch['text']
