@@ -229,10 +229,13 @@ class EasyMagpieTTSAcousticModel(EasyMagpieTTSInferenceModel):
             - The length-based loss mask with shape ``(B, C, T)``.
         """
         loss_mask = get_mask_from_lengths(audio_codes_lens)
-        loss_mask = loss_mask.unsqueeze(1).repeat(1, audio_codes.size(1), 1)
+        #loss_mask = loss_mask.unsqueeze(1).repeat(1, audio_codes.size(1), 1)
 
         if agent_mask_target is not None:
             agent_mask_target = agent_mask_target.to(device=audio_codes.device, dtype=loss_mask.dtype)
+            loss_mask = loss_mask * agent_mask_target
+
+        effective_mask = loss_mask
 
         total_codebook_loss = None
         for codebook in range(audio_codes.size(1)):
@@ -244,9 +247,9 @@ class EasyMagpieTTSAcousticModel(EasyMagpieTTSInferenceModel):
                 codebook_logits.permute(0, 2, 1),
                 codebook_targets.long(),
             )  # (B, T')
-            effective_mask = loss_mask[:, codebook, :]
-            if agent_mask_target is not None:
-                effective_mask = effective_mask * agent_mask_target
+            #effective_mask = loss_mask[:, codebook, :]
+            #if agent_mask_target is not None:
+            #    effective_mask = effective_mask * agent_mask_target
             codebook_loss = raw_loss * effective_mask
             codebook_loss = codebook_loss.sum() / effective_mask.sum().clamp_min(1.0)
             total_codebook_loss = codebook_loss if total_codebook_loss is None else total_codebook_loss + codebook_loss
@@ -279,7 +282,7 @@ class EasyMagpieTTSAcousticModel(EasyMagpieTTSInferenceModel):
             - The length-based loss mask with shape ``(B, S, T)``.
         """
         loss_mask = get_mask_from_lengths(phoneme_tokens_lens)
-        loss_mask = loss_mask.unsqueeze(1).repeat(1, phoneme_tokens.size(1), 1)
+        #loss_mask = loss_mask.unsqueeze(1).repeat(1, phoneme_tokens.size(1), 1)
 
         if custom_mask is not None:
             custom_mask = custom_mask.bool()
@@ -300,6 +303,9 @@ class EasyMagpieTTSAcousticModel(EasyMagpieTTSInferenceModel):
                 device=phoneme_tokens.device,
                 dtype=loss_mask.dtype,
             )
+            loss_mask = loss_mask * custom_mask
+
+        effective_mask = loss_mask
 
         total_phoneme_loss = None
 
@@ -315,10 +321,10 @@ class EasyMagpieTTSAcousticModel(EasyMagpieTTSInferenceModel):
                 phoneme_targets.long(),
             )  # (B, T')
 
-            effective_mask = loss_mask[:, codebook, :]
+            #effective_mask = loss_mask[:, codebook, :]
 
-            if custom_mask is not None:
-                effective_mask = effective_mask * custom_mask
+            #if custom_mask is not None:
+            #    effective_mask = effective_mask * custom_mask
 
             phoneme_loss = raw_loss * effective_mask
             phoneme_loss = phoneme_loss.sum() / effective_mask.sum().clamp_min(1.0)
@@ -1956,6 +1962,21 @@ class EasyMagpieTTSAcousticModel(EasyMagpieTTSInferenceModel):
     def on_validation_epoch_start(self) -> None:
         if torch.distributed.is_initialized():
             self.trainer.strategy.model.require_backward_grad_sync = False
+
+    def on_before_optimizer_step(self, optimizer):
+        #for name, param in self.named_parameters():
+        #    if param.grad is None and param.requires_grad:
+        #        print(f"No gradient found for {name}")
+
+        # Iterate over the model's parameters to check gradients
+        for name, param in self.named_parameters():
+            if param.grad is not None:
+                # Check for NaNs or Infs
+                if torch.isnan(param.grad).any() or torch.isinf(param.grad).any():
+                    # Zero out the gradients to prevent corruption
+                    optimizer.zero_grad()
+                    logging.warning(f'detected inf or nan values in gradients for {name}! Setting gradients to zero.')
+                    return  # Skip the optimizer step
 
     def on_validation_epoch_end(self):
         collect = lambda key: torch.stack([x[key] for x in self.validation_step_outputs]).mean()
