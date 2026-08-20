@@ -1905,7 +1905,7 @@ class EasyMagpieTTSInferenceModel(ModelPT):
             audio_codes_lens = semantic_tokens_input.shape[2] * torch.ones([actual_batch_size], device=last_hidden.device)
 
             # [B, C, T]
-            acoustic_codes, _ = self.acoustic_decoder_transformer(
+            acoustic_codes, _, _ = self.acoustic_decoder_transformer(
                 inputs=acoustic_input,
                 audio_lens=audio_codes_lens,
                 semantic_tokens=semantic_tokens_input,

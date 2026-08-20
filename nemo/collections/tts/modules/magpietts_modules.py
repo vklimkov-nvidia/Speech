@@ -963,9 +963,9 @@ class AcousticDecoderLinear(torch.nn.Module):
 
         return audio_tokens, audio_logits
 
+
 class AcousticDecoderTransformer(torch.nn.Module):
-    """
-    """
+    """Causal acoustic decoder with optional confidence-ordered prediction stages."""
 
     def __init__(
         self,
@@ -975,19 +975,55 @@ class AcousticDecoderTransformer(torch.nn.Module):
         num_codebooks,
         codebook_size,
         transformer,
+        num_prediction_steps=1,
     ):
         super(AcousticDecoderTransformer, self).__init__()
 
         self.num_codebooks = num_codebooks
         self.codebook_size = codebook_size
         self.num_logits = self.num_codebooks * self.codebook_size
+        self.num_prediction_steps = num_prediction_steps
 
         self.semantic_layer = semantic_layer
         self.input_proj = torch.nn.Linear(input_dim, d_model)
         self.transformer = transformer
         self.acoustic_token_layer = torch.nn.Linear(d_model, self.num_logits)
+        if self.transformer.n_layers % self.num_prediction_steps:
+            raise ValueError("Transformer layers must be divisible by num_prediction_steps")
+        if self.num_codebooks % self.num_prediction_steps:
+            raise ValueError("Codebooks must be divisible by num_prediction_steps")
+        self.layers_per_step = self.transformer.n_layers // self.num_prediction_steps
+        self.codebooks_per_step = self.num_codebooks // self.num_prediction_steps
 
-    def forward(self, inputs, audio_lens, semantic_tokens, vector_quantizer):
+    @staticmethod
+    def select_codebooks(confidence, unresolved, num_to_select):
+        """Select a fixed number of the most confident unresolved codebooks."""
+        scores = confidence.masked_fill(~unresolved, float("-inf"))
+        indices = torch.topk(scores, k=num_to_select, dim=-1, sorted=False).indices
+        return (
+            torch.zeros_like(unresolved).scatter(-1, indices, torch.ones_like(indices, dtype=torch.bool)) & unresolved
+        )
+
+    def _embed_selected(self, tokens, selected):
+        """Use codebook-specific output weights as tied teacher-forcing embeddings."""
+        embedding = 0.0
+        for codebook in range(self.num_codebooks):
+            start = codebook * self.codebook_size
+            end = start + self.codebook_size
+            codebook_embedding = torch.nn.functional.embedding(
+                tokens[..., codebook], self.acoustic_token_layer.weight[start:end]
+            )
+            embedding = embedding + codebook_embedding * selected[..., codebook, None]
+        return embedding / self.codebooks_per_step**0.5
+
+    def _compute_stage_loss(self, logits, targets, unresolved):
+        """Compute masked cross entropy in FP32 for mixed-precision stability."""
+        loss = torch.nn.functional.cross_entropy(
+            logits.float().flatten(0, 2), targets.flatten(), reduction="none"
+        ).view_as(unresolved)
+        return (loss * unresolved).sum() / unresolved.sum().clamp_min(1)
+
+    def forward(self, inputs, audio_lens, semantic_tokens, vector_quantizer, acoustic_tokens=None):
         audio_mask = get_mask_from_lengths(audio_lens)
         audio_mask_3d = rearrange(audio_mask, 'B T -> B T 1')
 
@@ -997,25 +1033,49 @@ class AcousticDecoderTransformer(torch.nn.Module):
         semantic_codes = rearrange(semantic_codes, 'B D T -> B T D')
 
         res = self.semantic_layer(audio_codes=semantic_codes, audio_lens=audio_lens)
-        dec_inp = self.input_proj(inputs) + res
-        dec_inp = dec_inp * audio_mask_3d
+        dec_inp = (self.input_proj(inputs) + res) * audio_mask_3d
+        if self.transformer.use_learnable_pos_emb:
+            positions = torch.arange(dec_inp.size(1), device=dec_inp.device).unsqueeze(0)
+            dec_inp = dec_inp + self.transformer.position_embeddings(positions)
+        elif self.transformer.use_static_pos_emb:
+            positions = torch.arange(dec_inp.size(1), device=dec_inp.device).to(dtype=dec_inp.dtype)
+            dec_inp = dec_inp + self.transformer.position_embeddings(positions)
 
-        dec_output = self.transformer(x=dec_inp, x_mask=audio_mask)['output']
+        hidden = self.transformer.dropout(dec_inp) * audio_mask_3d
+        unresolved = audio_mask[..., None].expand(-1, -1, self.num_codebooks).clone()
+        predicted = torch.zeros_like(unresolved, dtype=torch.long)
+        targets = rearrange(acoustic_tokens, 'B C T -> B T C').long() if acoustic_tokens is not None else None
+        total_loss = torch.zeros((), device=inputs.device, dtype=torch.float32) if targets is not None else None
 
-        # [batch_size, audio_len, num_codebook * codebook_size]
-        audio_logits = self.acoustic_token_layer(dec_output)
-        audio_logits = audio_logits * audio_mask_3d
+        for layer_index, layer in enumerate(self.transformer.layers):
+            hidden = layer(hidden, audio_mask)['output']
+            if (layer_index + 1) % self.layers_per_step:
+                continue
 
-        # [batch_size, audio_len, num_codebook, codebook_size]
-        logit_shape = (audio_logits.shape[0], audio_logits.shape[1], self.num_codebooks, self.codebook_size)
+            prediction_hidden = self.transformer.dropout_out(self.transformer.norm_out(hidden))
+            logits = self.acoustic_token_layer(prediction_hidden).view(
+                inputs.size(0), inputs.size(1), self.num_codebooks, self.codebook_size
+            )
+            candidates = logits.argmax(dim=-1)
 
-        audio_logits = torch.reshape(audio_logits, logit_shape)
-        # [batch_size, audio_len, num_codebook]
-        audio_tokens = audio_logits.max(dim=3).indices
+            if targets is not None:
+                total_loss = total_loss + self._compute_stage_loss(logits, targets, unresolved)
 
-        audio_tokens = audio_tokens * audio_mask_3d
+            if layer_index + 1 == self.transformer.n_layers:
+                predicted = torch.where(unresolved, candidates, predicted)
+                break
 
-        audio_logits = rearrange(audio_logits, 'B T C W -> B T (C W)')
-        audio_tokens = rearrange(audio_tokens, 'B T C -> B C T')
+            confidence = torch.log_softmax(logits.detach().float(), dim=-1).amax(dim=-1)
+            selected = self.select_codebooks(confidence, unresolved, self.codebooks_per_step)
+            predicted = torch.where(selected, candidates, predicted)
+            feedback_tokens = targets if targets is not None else candidates
+            feedback = self._embed_selected(feedback_tokens, selected).to(dtype=hidden.dtype)
+            hidden = hidden + feedback
+            unresolved = unresolved & ~selected
 
-        return audio_tokens, audio_logits
+        predicted = rearrange(predicted * audio_mask_3d, 'B T C -> B C T')
+        packed_logits = rearrange(logits * audio_mask_3d.unsqueeze(-1), 'B T C W -> B T (C W)')
+        if total_loss is not None:
+            total_loss = total_loss / self.num_prediction_steps
+
+        return predicted, packed_logits, total_loss

@@ -914,11 +914,12 @@ class EasyMagpieTTSAcousticTransformerModel(EasyMagpieTTSInferenceModel):
         acoustic_codes_target = audio_codes[:, self.num_audio_codebooks_train:, :]
 
         acoustic_input, _ = remove_embedded_eos_token(embedded=pred_embeddings, embedded_len=audio_codes_lens_target)
-        pred_acoustic_codes, acoustic_logits = self.acoustic_decoder_transformer(
+        pred_acoustic_codes, _, acoustic_codebook_loss = self.acoustic_decoder_transformer(
             inputs=acoustic_input,
             audio_lens=audio_codes_lens,
             semantic_tokens=semantic_codes,
             vector_quantizer=self._codec_model.vector_quantizer,
+            acoustic_tokens=acoustic_codes_target,
         )
 
         pred_semantic_codes = self.logits_to_audio_codes(logits, audio_codes_lens_target)
@@ -938,12 +939,6 @@ class EasyMagpieTTSAcousticTransformerModel(EasyMagpieTTSInferenceModel):
             audio_codes=semantic_codes_target,
             audio_codes_lens=audio_codes_lens_target,
             codebook_size=self.num_all_tokens_per_codebook
-        )
-        acoustic_codebook_loss, _ = self.compute_loss(
-            logits=acoustic_logits,
-            audio_codes=acoustic_codes_target,
-            audio_codes_lens=audio_codes_lens,
-            codebook_size=self.codebook_size,
         )
         loss = self.codebook_loss_scale * (codebook_loss + acoustic_codebook_loss)
 
