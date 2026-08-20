@@ -1053,8 +1053,8 @@ class AcousticDecoderTransformer(torch.nn.Module):
                 continue
 
             prediction_hidden = self.transformer.dropout_out(self.transformer.norm_out(hidden))
-            logits = self.acoustic_token_layer(prediction_hidden).view(
-                inputs.size(0), inputs.size(1), self.num_codebooks, self.codebook_size
+            logits = self.acoustic_token_layer(prediction_hidden).unflatten(
+                -1, (self.num_codebooks, self.codebook_size)
             )
             candidates = logits.argmax(dim=-1)
 

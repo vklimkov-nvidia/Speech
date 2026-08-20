@@ -90,7 +90,7 @@ def test_four_stage_cached_inference_is_finite():
 
     for length in (1, 2):
         predicted, logits, loss = decoder(
-            inputs[:, :length],
+            inputs[:, :1],
             torch.tensor([length]),
             semantic_tokens[:, :, :length],
             _VectorQuantizer(),
