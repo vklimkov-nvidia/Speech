@@ -130,3 +130,32 @@ def test_validate_rejects_unsupported_architectures(kwargs, message):
 def test_from_hf_config_validates_text_eos_id():
     with pytest.raises(ValueError, match="text_eos_id"):
         EasyMagpieOmniArch.from_hf_config(types.SimpleNamespace(text_vocab_size=10, text_eos_id=10))
+
+
+def test_reference_audio_capability_requires_converted_encoder_artifacts(tmp_path):
+    arch = EasyMagpieOmniArch(codec_encoder_bundled=True)
+
+    with pytest.raises(FileNotFoundError, match="codec_encoder.json"):
+        arch.require_reference_audio(tmp_path)
+
+    (tmp_path / "codec_encoder.json").touch()
+    (tmp_path / "codec_encoder.safetensors").touch()
+    arch.require_reference_audio(tmp_path)
+
+
+def test_reference_audio_capability_keeps_externally_released_artifact_path_available():
+    arch = EasyMagpieOmniArch(codec_encoder_bundled=False)
+
+    assert arch.supports_reference_audio is False
+    with pytest.raises(RuntimeError, match="speaker_id/speaker_embedding"):
+        arch.require_reference_audio()
+
+
+def test_codec_row_counts_come_from_checkpoint_metadata():
+    arch = EasyMagpieOmniArch(
+        codec_samples_per_frame=640,
+        frame_stacking_factor=2,
+    )
+
+    assert arch.codec_num_frames(32_000) == 50
+    assert arch.reference_audio_num_rows(32_000) == 27

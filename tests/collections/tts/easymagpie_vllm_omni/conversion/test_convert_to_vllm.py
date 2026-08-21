@@ -13,6 +13,7 @@
 # limitations under the License.
 from __future__ import annotations
 
+import json
 import sys
 import types
 from pathlib import Path
@@ -37,6 +38,19 @@ class _FakeEmbeddingModel(torch.nn.Module):
         return ids.unsqueeze(-1).expand(-1, -1, self.cfg.embedding_dim).float()
 
 
+def _fake_reference_speaker_encoder():
+    layer = types.SimpleNamespace(
+        pos_ff=types.SimpleNamespace(
+            proj=types.SimpleNamespace(conv=types.SimpleNamespace(out_channels=8, kernel_size=(1,)))
+        ),
+        self_attention=types.SimpleNamespace(n_heads=2),
+    )
+    return types.SimpleNamespace(
+        layers=[layer],
+        position_embeddings=types.SimpleNamespace(num_embeddings=128),
+    )
+
+
 def test_precompute_text_embeddings_includes_multiturn_interruption_token():
     table = converter.precompute_text_embeddings(_FakeEmbeddingModel(), batch_size=8)
 
@@ -54,7 +68,28 @@ def test_precompute_text_embeddings_uses_explicit_cas_only_vocabulary_size():
     torch.testing.assert_close(table[-1], torch.tensor([19.0, 19.0]))
 
 
-def test_build_config_exports_multiturn_text_metadata(monkeypatch):
+def test_codec_bundling_is_explicit_opt_in(monkeypatch):
+    required = [
+        "convert_to_vllm.py",
+        "--nemo_file",
+        "model.nemo",
+        "--codec_model_path",
+        "codec.nemo",
+        "--outdir",
+        "converted",
+    ]
+
+    monkeypatch.setattr(sys, "argv", required)
+    assert converter.parse_args().bundle_codec is False
+
+    monkeypatch.setattr(sys, "argv", [*required, "--bundle-codec"])
+    assert converter.parse_args().bundle_codec is True
+
+    monkeypatch.setattr(sys, "argv", [*required, "--bundle_codec"])
+    assert converter.parse_args().bundle_codec is True
+
+
+def test_build_config_exports_reference_speaker_metadata(monkeypatch):
     class _FakeNemotronHConfig:
         def __init__(self, **kwargs):
             self.__dict__.update(kwargs)
@@ -69,6 +104,7 @@ def test_build_config_exports_multiturn_text_metadata(monkeypatch):
         streaming_phonemes_delay=3,
         streaming_speech_delay=5,
     )
+    speaker_encoder = _fake_reference_speaker_encoder()
     model = types.SimpleNamespace(
         cfg=OmegaConf.create(
             {
@@ -83,8 +119,11 @@ def test_build_config_exports_multiturn_text_metadata(monkeypatch):
         eos_id=101,
         interruption_token_id=103,
         num_audio_codebooks=2,
+        speaker_encoder=speaker_encoder,
+        sample_rate=16000,
+        codec_model_samples_per_frame=640,
         codebook_size=32,
-        frame_stacking_factor=1,
+        frame_stacking_factor=2,
         phoneme_tokenizer=None,
         mode_name_to_mode={"default": mode},
         default_inference_mode="default",
@@ -101,6 +140,14 @@ def test_build_config_exports_multiturn_text_metadata(monkeypatch):
     assert config["text_interruption_id"] == 103
     assert config["use_multiturn_dataset"] is True
     assert config["enable_phoneme_text_input"] is False
+    assert config["codec_input_sample_rate"] == 16000
+    assert config["codec_samples_per_frame"] == 640
+    assert "codec_encoder_bundled" not in config
+    assert config["reference_speaker_encoder_n_layers"] == 1
+    assert config["reference_speaker_encoder_d_ffn"] == 8
+    assert config["reference_speaker_encoder_n_heads"] == 2
+    assert config["reference_speaker_encoder_kernel_size"] == 1
+    assert config["reference_speaker_encoder_max_length"] == 128
 
 
 def test_build_config_exports_pronunciation_control_metadata(monkeypatch):
@@ -133,6 +180,9 @@ def test_build_config_exports_pronunciation_control_metadata(monkeypatch):
         num_audio_codebooks=2,
         codebook_size=32,
         frame_stacking_factor=1,
+        speaker_encoder=_fake_reference_speaker_encoder(),
+        sample_rate=16000,
+        codec_model_samples_per_frame=640,
         phoneme_tokenizer=phoneme_tokenizer,
         phoneme_stacking_factor=1,
         phoneme_vocab_size=8,
@@ -180,6 +230,57 @@ def test_save_phoneme_text_tokenizer_exports_raw_tokenizer(tmp_path):
     assert (tmp_path / "phoneme_text_tokenizer" / "tokenizer.json").is_file()
 
 
+def test_bundle_native_codec_always_exports_complete_raw_audio_tower(monkeypatch, tmp_path):
+    calls = []
+    monkeypatch.setattr(converter.subprocess, "run", lambda command, **kwargs: calls.append((command, kwargs)))
+
+    encoder_path = converter.bundle_native_codec("codec.nemo", str(tmp_path))
+
+    assert encoder_path == str(tmp_path / "codec_encoder.safetensors")
+    assert calls[0][0][-2:] == ["--encoder-output", encoder_path]
+    assert calls[0][1]["check"] is True
+
+
+def test_configure_codec_reference_speaker_encoder_updates_separate_tower_config(tmp_path):
+    (tmp_path / "codec_encoder.json").write_text('{"sample_rate": 16000}')
+    config = {
+        "codebook_size": 32,
+        "embedding_dim": 4,
+        "reference_speaker_encoder_n_layers": 1,
+        "reference_speaker_encoder_d_ffn": 8,
+        "reference_speaker_encoder_n_heads": 2,
+        "reference_speaker_encoder_kernel_size": 1,
+        "reference_speaker_encoder_max_length": 16,
+    }
+
+    converter.configure_codec_reference_speaker_encoder(str(tmp_path), config)
+
+    updated = json.loads((tmp_path / "codec_encoder.json").read_text())
+    assert "use_speaker_encoder" not in updated
+    assert updated["reference_speaker_encoder_d_ffn"] == 8
+    assert updated["context_audio_bos_id"] == 34
+    assert updated["context_audio_eos_id"] == 35
+
+
+def test_append_reference_speaker_encoder_weights_keeps_them_in_codec_tower_shard(tmp_path):
+    encoder_path = tmp_path / "codec_encoder.safetensors"
+    converter.save_file({"audio_encoder.anchor": torch.ones(1)}, str(encoder_path))
+    state = {
+        "speaker_encoder.layers.0.norm_self.weight": torch.ones(4, dtype=torch.float16),
+        "speaker_encoder.layers.0.self_attention.causal_mask": torch.ones(1),
+        "decoder.weight": torch.zeros(1),
+    }
+
+    converter.append_reference_speaker_encoder_weights(str(encoder_path), state)
+
+    loaded = converter.load_file(str(encoder_path), device="cpu")
+    assert set(loaded) == {
+        "audio_encoder.anchor",
+        "reference_speaker_encoder.layers.0.norm_self.weight",
+    }
+    assert loaded["reference_speaker_encoder.layers.0.norm_self.weight"].dtype == torch.float32
+
+
 def _validation_model():
     mode = types.SimpleNamespace(
         text_input_mode="streaming",
@@ -205,7 +306,7 @@ def _validation_model():
     ("field", "value", "message"),
     [
         ("decoder_type", "huggingface", "Nemotron-H"),
-        ("local_transformer_type", "none", "local_transformer_type='autoregressive'"),
+        ("local_transformer_type", "none", "local_transformer_type='ar'/'autoregressive'"),
         ("hidden_dim", 8, "hidden_dim.*embedding_dim"),
     ],
 )
@@ -230,3 +331,10 @@ def test_validate_model_config_rejects_non_streaming_default_mode():
 
     with pytest.raises(ValueError, match="text_input_mode='streaming'"):
         converter.validate_model_config(model)
+
+
+def test_validate_model_config_accepts_autoregressive_alias():
+    model = _validation_model()
+    model.cfg.local_transformer_type = "autoregressive"
+
+    converter.validate_model_config(model)

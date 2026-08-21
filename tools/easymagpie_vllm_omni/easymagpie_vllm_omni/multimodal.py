@@ -1,0 +1,248 @@
+# Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""vLLM multimodal input processing for EasyMagpie reference audio."""
+from __future__ import annotations
+
+import math
+from collections.abc import Mapping, Sequence
+from typing import Any
+
+import numpy as np
+import torch
+from easymagpie_vllm_omni.config import EasyMagpieOmniArch
+from transformers import BatchFeature
+from vllm.config.multimodal import BaseDummyOptions
+from vllm.inputs import MultiModalDataDict
+from vllm.multimodal.inputs import MultiModalFieldConfig, MultiModalKwargsItems
+from vllm.multimodal.parse import MultiModalDataItems, MultiModalDataParser
+from vllm.multimodal.processing import (
+    BaseDummyInputsBuilder,
+    BaseMultiModalProcessor,
+    BaseProcessingInfo,
+    ProcessorInputs,
+    PromptReplacement,
+)
+
+AUDIO_ROLE_SPEAKER_REFERENCE = 1
+_AUDIO_ROLE_NAMES = {
+    "speaker": AUDIO_ROLE_SPEAKER_REFERENCE,
+    "speaker_reference": AUDIO_ROLE_SPEAKER_REFERENCE,
+}
+
+
+def _normalize_audio_roles(value: object, count: int) -> list[int]:
+    if value is None:
+        return [AUDIO_ROLE_SPEAKER_REFERENCE] * count
+    values = [value] if isinstance(value, (str, int)) else list(value)
+    if len(values) != count:
+        raise ValueError(f"audio_roles has {len(values)} entries for {count} audio items")
+    try:
+        roles = [int(_AUDIO_ROLE_NAMES[item]) if isinstance(item, str) else int(item) for item in values]
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError("audio_roles entries must be 'speaker'/'speaker_reference'") from error
+    if any(role != AUDIO_ROLE_SPEAKER_REFERENCE for role in roles):
+        raise ValueError("Reference-audio requests only support the speaker_reference role")
+    return roles
+
+
+def _validate_audio_role_capabilities(arch: EasyMagpieOmniArch, roles: list[int]) -> None:
+    if roles:
+        arch.require_reference_audio()
+
+
+class EasyMagpieAudioParser(MultiModalDataParser):
+    """Require explicit mono audio at the codec encoder input rate."""
+
+    def __init__(self, sample_rate: int, expected_hidden_size: int | None) -> None:
+        super().__init__(expected_hidden_size=expected_hidden_size)
+        self.sample_rate = sample_rate
+
+    def _get_audio_with_sr(self, audio):
+        waveform, sample_rate = super()._get_audio_with_sr(audio)
+        if sample_rate is None:
+            raise ValueError(
+                "EasyMagpie audio must be passed as a (mono_waveform, sample_rate) tuple so its format can be checked"
+            )
+        if int(sample_rate) != self.sample_rate:
+            raise ValueError(f"EasyMagpie codec input must be {self.sample_rate} Hz; received {int(sample_rate)} Hz")
+        waveform = np.asarray(waveform)
+        if waveform.ndim != 1:
+            raise ValueError(f"EasyMagpie codec input must be mono [samples]; received shape {waveform.shape}")
+        return waveform, None
+
+
+class EasyMagpieProcessingInfo(BaseProcessingInfo):
+    """Describe raw-audio limits and codec-frame expansion to vLLM."""
+
+    @property
+    def arch(self) -> EasyMagpieOmniArch:
+        return EasyMagpieOmniArch.from_hf_config(self.get_hf_config())
+
+    def get_data_parser(self) -> MultiModalDataParser:
+        return EasyMagpieAudioParser(
+            sample_rate=self.arch.codec_input_sample_rate,
+            expected_hidden_size=self._get_expected_hidden_size(),
+        )
+
+    def get_supported_mm_limits(self) -> Mapping[str, int | None]:
+        return {"audio": 1} if self.arch.supports_reference_audio else {}
+
+    def get_mm_max_tokens_per_item(
+        self,
+        seq_len: int,
+        mm_counts: Mapping[str, int],
+    ) -> Mapping[str, int]:
+        del seq_len, mm_counts
+        return {"audio": self.get_max_audio_tokens()}
+
+    def get_max_audio_samples(self) -> int:
+        return math.ceil(self.arch.max_user_audio_seconds * self.arch.codec_input_sample_rate)
+
+    def get_max_audio_tokens(self) -> int:
+        max_samples = self.get_max_audio_samples()
+        return self.arch.reference_audio_num_rows(max_samples)
+
+
+class EasyMagpieDummyInputsBuilder(BaseDummyInputsBuilder[EasyMagpieProcessingInfo]):
+    """Build maximum-size raw audio for vLLM memory profiling."""
+
+    def get_dummy_text(self, mm_counts: Mapping[str, int]) -> str:
+        del mm_counts
+        return ""
+
+    def get_dummy_mm_data(
+        self,
+        seq_len: int,
+        mm_counts: Mapping[str, int],
+        mm_options: Mapping[str, BaseDummyOptions],
+    ) -> MultiModalDataDict:
+        del seq_len
+        audio_overrides = mm_options.get("audio")
+        audios = self._get_dummy_audios(
+            length=self.info.get_max_audio_samples(),
+            num_audios=mm_counts.get("audio", 0),
+            overrides=audio_overrides,
+        )
+        return {"audio": [(audio, self.info.arch.codec_input_sample_rate) for audio in audios]}
+
+    def get_dummy_processor_inputs(
+        self,
+        seq_len: int,
+        mm_counts: Mapping[str, int],
+        mm_options: Mapping[str, BaseDummyOptions],
+    ) -> ProcessorInputs:
+        dummy_mm_data = self.get_dummy_mm_data(seq_len, mm_counts, mm_options)
+        return ProcessorInputs(
+            prompt=[self.info.arch.audio_input_token_id] * mm_counts.get("audio", 0),
+            mm_data_items=self.info.parse_mm_data(dummy_mm_data, validate=False),
+            tokenization_kwargs={"truncation": False},
+        )
+
+
+class EasyMagpieMultiModalProcessor(BaseMultiModalProcessor[EasyMagpieProcessingInfo]):
+    """Pass normalized waveforms through and expand their prompt placeholder."""
+
+    def _call_hf_processor(
+        self,
+        prompt: str,
+        mm_data: Mapping[str, object],
+        mm_kwargs: Mapping[str, object],
+        tok_kwargs: Mapping[str, object],
+    ) -> BatchFeature:
+        tokenizer = self.info.get_tokenizer()
+        input_ids = tokenizer.encode(prompt, add_special_tokens=bool(tok_kwargs.get("add_special_tokens", False)))
+
+        audios = mm_data.get("audios", [])
+        audio_values: list[torch.Tensor] = []
+        for audio in audios if isinstance(audios, (list, tuple)) else [audios]:
+            value = torch.as_tensor(np.asarray(audio), dtype=torch.float32)
+            if value.ndim != 1 or value.numel() == 0:
+                raise ValueError(
+                    f"EasyMagpie reference audio must be a non-empty mono waveform, got {tuple(value.shape)}"
+                )
+            if value.numel() > self.info.get_max_audio_samples():
+                raise ValueError(
+                    f"EasyMagpie reference audio has {value.numel()} samples; the configured maximum is "
+                    f"{self.info.get_max_audio_samples()} ({self.info.arch.max_user_audio_seconds:g} seconds at {self.info.arch.codec_input_sample_rate} Hz)"
+                )
+            audio_values.append(value.contiguous())
+
+        audio_roles = _normalize_audio_roles(mm_kwargs.get("audio_roles"), len(audio_values))
+        _validate_audio_role_capabilities(self.info.arch, audio_roles)
+
+        return BatchFeature(
+            {
+                "input_ids": [input_ids],
+                "audio_values": audio_values,
+                "audio_lens": torch.tensor([audio.numel() for audio in audio_values], dtype=torch.long),
+                "audio_roles": torch.tensor(audio_roles, dtype=torch.long),
+            }
+        )
+
+    def _cached_apply_hf_processor(self, inputs, timing_ctx):
+        # vLLM's parsed audio items retain the waveform but not its sample rate.
+        # Its preprocessing-cache miss path reparses those internal arrays,
+        # which is incompatible with validating the explicit sample rate at the
+        # request boundary. Bypass this cache; downstream encoder hashes remain.
+        return self._apply_hf_processor(inputs, timing_ctx)
+
+    def _hf_processor_applies_updates(
+        self,
+        prompt_text: str,
+        mm_items: MultiModalDataItems,
+        hf_processor_mm_kwargs: Mapping[str, object],
+        tokenization_kwargs: Mapping[str, object],
+    ) -> bool:
+        del prompt_text, mm_items, hf_processor_mm_kwargs, tokenization_kwargs
+        return False
+
+    def _get_mm_fields_config(
+        self,
+        hf_inputs: BatchFeature,
+        hf_processor_mm_kwargs: Mapping[str, object],
+    ) -> Mapping[str, MultiModalFieldConfig]:
+        del hf_inputs, hf_processor_mm_kwargs
+        return {
+            "audio_values": MultiModalFieldConfig.batched("audio"),
+            "audio_lens": MultiModalFieldConfig.batched("audio"),
+            "audio_roles": MultiModalFieldConfig.batched("audio"),
+        }
+
+    def _get_prompt_updates(
+        self,
+        mm_items: MultiModalDataItems,
+        hf_processor_mm_kwargs: Mapping[str, Any],
+        out_mm_kwargs: MultiModalKwargsItems,
+    ) -> Sequence[PromptReplacement]:
+        del out_mm_kwargs
+
+        audio_items = mm_items["audio"]
+        audio_roles = _normalize_audio_roles(
+            hf_processor_mm_kwargs.get("audio_roles"),
+            audio_items.get_count(),
+        )
+        _validate_audio_role_capabilities(self.info.arch, audio_roles)
+
+        def get_replacement(item_idx: int) -> list[int]:
+            audio_len = audio_items.get_audio_length(item_idx)
+            num_rows = self.info.arch.reference_audio_num_rows(audio_len)
+            return [self.info.arch.audio_input_token_id] * num_rows
+
+        return [
+            PromptReplacement(
+                modality="audio",
+                target=[self.info.arch.audio_input_token_id],
+                replacement=get_replacement,
+            )
+        ]

@@ -17,13 +17,22 @@ Deployment knobs are in [`deploy/easymagpie.yaml`](deploy/easymagpie.yaml).
 
 ### Convert a NeMo checkpoint
 
-This step turns the training-time `.nemo` checkpoints into a self-contained
-vLLM-Omni model directory: it converts EasyMagpie LM and the causal codec to native
-vLLM models, precomputes the text-embedding lookup, and saves the tokenizer and
-optional speaker embedding. Run it in the **NeMo environment** from the repository root:
+This step converts the EasyMagpie LM, precomputes the text-embedding lookup,
+and saves the tokenizer and optional precomputed speaker embedding. Codec
+bundling is disabled by default: no codec decoder or raw-audio encoder weights
+are copied. The resulting artifact uses speaker names or precomputed embeddings,
+matching externally released EasyMagpie artifacts.
+
+Pass `--bundle-codec` only when you intend to package the codec encoder, the
+reference-speaker Transformer, and the Stage-1 decoder. This opt-in enables
+request-time reference audio and therefore zero-shot voice cloning. Run
+conversion in the **NeMo environment** from
+the repository root. Prepending the repository root to `PYTHONPATH` is
+important when the environment has an editable NeMo install pointing at a
+different checkout:
 
 ```bash
-python tools/easymagpie_vllm_omni/scripts/convert_to_vllm.py \
+PYTHONPATH="$PWD" python tools/easymagpie_vllm_omni/scripts/convert_to_vllm.py \
   --nemo_file /path/to/emptts.nemo \
   --codec_model_path /path/to/25fps_spectral_codec.nemo \
   --phoneme_tokenizer_path /path/to/bpe_ipa_tokenizer.json \
@@ -58,6 +67,48 @@ better kernels; for an explicit sweep, run `python scripts/tune_mamba_ssu.py --m
 
 See the [`offline_demo.ipynb`](../../tutorials/tts/easymagpie_vllm_omni/offline_demo.ipynb) tutorial to check how
 `AsyncOmni` is initialized and used.
+
+### Request-time reference audio
+
+Every source EasyMagpie NeMo checkpoint contains the codec encoder and
+reference-speaker Transformer. A converted artifact accepts raw reference audio
+only when conversion was explicitly run with `--bundle-codec`; externally
+released artifacts that omit those bundled files continue to use
+`speaker_id`/`speaker_embedding`.
+
+Pass audio as `(waveform, sample_rate)`. The waveform must already be mono and
+match `arch.codec_input_sample_rate`; the serving path deliberately does not
+downmix or resample it.
+
+```python
+prompt = {
+    "prompt_token_ids": (
+        [0] * task_rows
+        + [arch.audio_input_token_id]
+        + [0] * len(context_token_ids)
+        + [0] * arch.text_prefill_num
+    ),
+    "multi_modal_data": {
+        "audio": [(reference_waveform, reference_sample_rate)],
+    },
+    "mm_processor_kwargs": {
+        "audio_roles": ["speaker_reference"],
+    },
+    "additional_information": {
+        "context_text": "[EN]",
+        "speaker_reference_audio": True,
+        "text": target_text,
+        "text_prefill_num": arch.text_prefill_num,
+        "prefill_text_tokens": target_token_ids[: arch.text_prefill_num],
+        "temperature": 0.7,
+        "top_k": 80,
+    },
+}
+```
+
+The OpenAI-compatible speech and WebSocket endpoints currently accept TTS text
+input only. Use the direct `AsyncOmni` input path for request-time reference
+audio until an audio request adapter is added.
 
 ### Serve over HTTP and WebSocket
 
