@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""vLLM multimodal input processing for EasyMagpie reference audio."""
+"""vLLM multimodal input processing for EasyMagpie user speech."""
 from __future__ import annotations
 
 import math
@@ -34,31 +34,35 @@ from vllm.multimodal.processing import (
     PromptReplacement,
 )
 
+AUDIO_ROLE_USER = 0
 AUDIO_ROLE_SPEAKER_REFERENCE = 1
 _AUDIO_ROLE_NAMES = {
+    "user": AUDIO_ROLE_USER,
     "speaker": AUDIO_ROLE_SPEAKER_REFERENCE,
     "speaker_reference": AUDIO_ROLE_SPEAKER_REFERENCE,
 }
 
 
-def _normalize_audio_roles(value: object, count: int) -> list[int]:
+def _normalize_audio_roles(value: object, count: int, *, default_role: int = AUDIO_ROLE_USER) -> list[int]:
     if value is None:
-        return [AUDIO_ROLE_SPEAKER_REFERENCE] * count
+        return [default_role] * count
     values = [value] if isinstance(value, (str, int)) else list(value)
     if len(values) != count:
         raise ValueError(f"audio_roles has {len(values)} entries for {count} audio items")
     try:
         roles = [int(_AUDIO_ROLE_NAMES[item]) if isinstance(item, str) else int(item) for item in values]
     except (KeyError, TypeError, ValueError) as error:
-        raise ValueError("audio_roles entries must be 'speaker'/'speaker_reference'") from error
-    if any(role != AUDIO_ROLE_SPEAKER_REFERENCE for role in roles):
-        raise ValueError("Reference-audio requests only support the speaker_reference role")
+        raise ValueError("audio_roles entries must be 'speaker'/'speaker_reference' or 'user'") from error
+    if any(role not in {AUDIO_ROLE_USER, AUDIO_ROLE_SPEAKER_REFERENCE} for role in roles):
+        raise ValueError("audio_roles contains an unsupported numeric role id")
     return roles
 
 
 def _validate_audio_role_capabilities(arch: EasyMagpieOmniArch, roles: list[int]) -> None:
-    if roles:
+    if AUDIO_ROLE_SPEAKER_REFERENCE in roles:
         arch.require_reference_audio()
+    if AUDIO_ROLE_USER in roles:
+        arch.require_user_audio_prefill()
 
 
 class EasyMagpieAudioParser(MultiModalDataParser):
@@ -96,7 +100,10 @@ class EasyMagpieProcessingInfo(BaseProcessingInfo):
         )
 
     def get_supported_mm_limits(self) -> Mapping[str, int | None]:
-        return {"audio": 1} if self.arch.supports_reference_audio else {}
+        if not self.arch.codec_encoder_bundled:
+            return {}
+        count = 1 + int(self.arch.use_multiturn_dataset and self.arch.condition_on_user_speech)
+        return {"audio": count}
 
     def get_mm_max_tokens_per_item(
         self,
@@ -111,7 +118,10 @@ class EasyMagpieProcessingInfo(BaseProcessingInfo):
 
     def get_max_audio_tokens(self) -> int:
         max_samples = self.get_max_audio_samples()
-        return self.arch.reference_audio_num_rows(max_samples)
+        return max(
+            self.arch.reference_audio_num_rows(max_samples),
+            self.arch.user_audio_num_rows(max_samples),
+        )
 
 
 class EasyMagpieDummyInputsBuilder(BaseDummyInputsBuilder[EasyMagpieProcessingInfo]):
@@ -143,9 +153,12 @@ class EasyMagpieDummyInputsBuilder(BaseDummyInputsBuilder[EasyMagpieProcessingIn
         mm_options: Mapping[str, BaseDummyOptions],
     ) -> ProcessorInputs:
         dummy_mm_data = self.get_dummy_mm_data(seq_len, mm_counts, mm_options)
+        audio_count = mm_counts.get("audio", 0)
+        audio_roles = [AUDIO_ROLE_SPEAKER_REFERENCE] + [AUDIO_ROLE_USER] * (audio_count - 1) if audio_count else []
         return ProcessorInputs(
-            prompt=[self.info.arch.audio_input_token_id] * mm_counts.get("audio", 0),
+            prompt=[self.info.arch.audio_input_token_id] * audio_count,
             mm_data_items=self.info.parse_mm_data(dummy_mm_data, validate=False),
+            hf_processor_mm_kwargs={"audio_roles": audio_roles},
             tokenization_kwargs={"truncation": False},
         )
 
@@ -168,17 +181,20 @@ class EasyMagpieMultiModalProcessor(BaseMultiModalProcessor[EasyMagpieProcessing
         for audio in audios if isinstance(audios, (list, tuple)) else [audios]:
             value = torch.as_tensor(np.asarray(audio), dtype=torch.float32)
             if value.ndim != 1 or value.numel() == 0:
-                raise ValueError(
-                    f"EasyMagpie reference audio must be a non-empty mono waveform, got {tuple(value.shape)}"
-                )
+                raise ValueError(f"EasyMagpie user audio must be a non-empty mono waveform, got {tuple(value.shape)}")
             if value.numel() > self.info.get_max_audio_samples():
                 raise ValueError(
-                    f"EasyMagpie reference audio has {value.numel()} samples; the configured maximum is "
+                    f"EasyMagpie user audio has {value.numel()} samples; the configured maximum is "
                     f"{self.info.get_max_audio_samples()} ({self.info.arch.max_user_audio_seconds:g} seconds at {self.info.arch.codec_input_sample_rate} Hz)"
                 )
             audio_values.append(value.contiguous())
 
-        audio_roles = _normalize_audio_roles(mm_kwargs.get("audio_roles"), len(audio_values))
+        default_role = AUDIO_ROLE_USER if self.info.arch.condition_on_user_speech else AUDIO_ROLE_SPEAKER_REFERENCE
+        audio_roles = _normalize_audio_roles(
+            mm_kwargs.get("audio_roles"),
+            len(audio_values),
+            default_role=default_role,
+        )
         _validate_audio_role_capabilities(self.info.arch, audio_roles)
 
         return BatchFeature(
@@ -228,15 +244,21 @@ class EasyMagpieMultiModalProcessor(BaseMultiModalProcessor[EasyMagpieProcessing
         del out_mm_kwargs
 
         audio_items = mm_items["audio"]
+        default_role = AUDIO_ROLE_USER if self.info.arch.condition_on_user_speech else AUDIO_ROLE_SPEAKER_REFERENCE
         audio_roles = _normalize_audio_roles(
             hf_processor_mm_kwargs.get("audio_roles"),
             audio_items.get_count(),
+            default_role=default_role,
         )
         _validate_audio_role_capabilities(self.info.arch, audio_roles)
 
         def get_replacement(item_idx: int) -> list[int]:
             audio_len = audio_items.get_audio_length(item_idx)
-            num_rows = self.info.arch.reference_audio_num_rows(audio_len)
+            if audio_roles[item_idx] == AUDIO_ROLE_SPEAKER_REFERENCE:
+                num_rows = self.info.arch.reference_audio_num_rows(audio_len)
+            else:
+                min_samples = self.info.arch.streaming_speech_delay * self.info.arch.codec_samples_per_row
+                num_rows = self.info.arch.user_audio_num_rows(max(audio_len, min_samples))
             return [self.info.arch.audio_input_token_id] * num_rows
 
         return [

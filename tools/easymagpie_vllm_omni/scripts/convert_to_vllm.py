@@ -30,12 +30,11 @@ It contains:
 * ``speaker_embeddings/<name>.pt`` (optional) — pre-computed speaker-encoder
   outputs for one or more reference audio files, used as the ``speaker_embedding``
   input at inference time.
-* ``codec_encoder.safetensors`` + ``codec_encoder.json`` (with
-  ``--bundle-codec``) — the codec encoder and reference-speaker Transformer
-  used for request-time reference audio and zero-shot voice cloning.
-* ``codec_native/`` (explicit opt-in) — the causal audio codec converted to a
-  stateful vLLM model for the in-engine second stage. Pass ``--bundle-codec``
-  only when codec weights and raw/reference-audio capabilities are intended.
+* ``codec_native/`` — the causal audio codec decoder converted to a stateful
+  vLLM model for the in-engine second stage.
+* ``codec_encoder.safetensors`` + ``codec_encoder.json`` (only with
+  ``--bundle-audio-encoders``) — the codec encoder and reference-speaker
+  Transformer used for zero-shot voice cloning and multi-turn user history.
 
 Compared to running the reference model, the character-aware subword (CAS)
 encoder is collapsed into a single pre-computed lookup table mapping
@@ -60,6 +59,7 @@ import logging
 import os
 import subprocess
 import sys
+from math import prod
 
 import torch
 import tqdm
@@ -162,13 +162,13 @@ def parse_args():
         help="Name for the saved speaker embedding (speaker_embeddings/<name>.pt).",
     )
     parser.add_argument(
-        "--bundle-codec",
-        "--bundle_codec",
-        dest="bundle_codec",
-        action=argparse.BooleanOptionalAction,
+        "--bundle-audio-encoders",
+        "--bundle_audio_encoders",
+        dest="bundle_audio_encoders",
+        action="store_true",
         default=False,
-        help="Explicitly bundle codec weights for in-engine decoding and raw/reference-audio conditioning. "
-        "This can make a capable checkpoint usable for zero-shot TTS and is disabled by default.",
+        help="Explicitly bundle the codec encoder and reference-speaker encoder. This enables raw/reference-audio "
+        "conditioning and can make a capable checkpoint usable for zero-shot TTS; disabled by default.",
     )
     parser.add_argument("--context_audio_duration", type=float, default=5.0)
     parser.add_argument(
@@ -274,10 +274,11 @@ def extract_speaker_embedding(model, context_audio_path: str, context_audio_dura
     )
 
     context_audio_embedded = model.embed_audio_tokens(context_audio_codes)  # (B, T_audio, E)
-    context_audio_embedded = model.encode_context_audio_embeddings(
-        context_audio_embedded=context_audio_embedded,
-        context_audio_lens=context_audio_codes_lens,
-    )
+    if bool(getattr(model, "use_speaker_encoder", False)):
+        context_audio_embedded = model.encode_context_audio_embeddings(
+            context_audio_embedded=context_audio_embedded,
+            context_audio_lens=context_audio_codes_lens,
+        )
 
     audio_len = int(context_audio_codes_lens[0].item())
     return context_audio_embedded[0, :audio_len].contiguous().float().detach().cpu()
@@ -325,7 +326,7 @@ def validate_model_config(model) -> None:
         )
 
 
-def build_config(model, vocab_size: int, torch_dtype: str) -> dict:
+def build_config(model, vocab_size: int, torch_dtype: str, *, bundle_audio_encoders: bool = False) -> dict:
     """Build the flat vLLM ``config.json`` dict from the loaded NeMo model."""
     from nemo.collections.tts.modules.nemotron_h_decoder import NemotronHConfig
 
@@ -357,17 +358,26 @@ def build_config(model, vocab_size: int, torch_dtype: str) -> dict:
     config["text_vocab_size"] = vocab_size
     config["text_eos_id"] = int(model.eos_id)
     config["use_multiturn_dataset"] = bool(cfg.get("use_multiturn_dataset", False))
-    config["audio_input_token_id"] = 1
-    config["max_user_audio_seconds"] = 30.0
-    speaker_encoder = model.speaker_encoder
-    first_layer = speaker_encoder.layers[0]
-    config["codec_input_sample_rate"] = int(model.sample_rate)
-    config["codec_samples_per_frame"] = int(model.codec_model_samples_per_frame)
-    config["reference_speaker_encoder_n_layers"] = len(speaker_encoder.layers)
-    config["reference_speaker_encoder_d_ffn"] = int(first_layer.pos_ff.proj.conv.out_channels)
-    config["reference_speaker_encoder_n_heads"] = int(first_layer.self_attention.n_heads)
-    config["reference_speaker_encoder_kernel_size"] = int(first_layer.pos_ff.proj.conv.kernel_size[0])
-    config["reference_speaker_encoder_max_length"] = int(speaker_encoder.position_embeddings.num_embeddings)
+    config["condition_on_user_speech"] = bool(cfg.get("condition_on_user_speech", False))
+    config["use_user_speaking_token"] = bool(cfg.get("use_user_speaking_token", False))
+    config["use_user_speaking_end_token"] = bool(cfg.get("use_user_speaking_end_token", False))
+    config["codec_encoder_bundled"] = bundle_audio_encoders
+    if bundle_audio_encoders:
+        config["audio_input_token_id"] = 1
+        config["max_user_audio_seconds"] = 30.0
+        speaker_encoder = getattr(model, "speaker_encoder", None)
+        if speaker_encoder is None or not bool(getattr(model, "use_speaker_encoder", False)):
+            raise ValueError(
+                "--bundle-audio-encoders requires a checkpoint with use_speaker_encoder=True and speaker weights"
+            )
+        first_layer = speaker_encoder.layers[0]
+        config["codec_input_sample_rate"] = int(model.sample_rate)
+        config["codec_samples_per_frame"] = int(model.codec_model_samples_per_frame)
+        config["reference_speaker_encoder_n_layers"] = len(speaker_encoder.layers)
+        config["reference_speaker_encoder_d_ffn"] = int(first_layer.pos_ff.proj.conv.out_channels)
+        config["reference_speaker_encoder_n_heads"] = int(first_layer.self_attention.n_heads)
+        config["reference_speaker_encoder_kernel_size"] = int(first_layer.pos_ff.proj.conv.kernel_size[0])
+        config["reference_speaker_encoder_max_length"] = int(speaker_encoder.position_embeddings.num_embeddings)
     if hasattr(model, "interruption_token_id"):
         config["text_interruption_id"] = int(model.interruption_token_id)
     config["embedding_dim"] = embedding_dim
@@ -425,6 +435,10 @@ def build_config(model, vocab_size: int, torch_dtype: str) -> dict:
     config["forced_audio_eos_id"] = int(model.audio_eos_id)
     config["forced_mask_token_id"] = int(model.mask_token_id)
 
+    config["forced_audio_user_speaking_id"] = int(getattr(model, "audio_user_speaking_id", model.codebook_size + 5))
+    config["forced_audio_user_speaking_end_id"] = int(
+        getattr(model, "audio_user_speaking_end_id", model.codebook_size + 6)
+    )
     return config
 
 
@@ -456,8 +470,67 @@ def select_weights(state_dict: dict, hidden_dim: int, dtype: torch.dtype) -> dic
     return weights
 
 
-def bundle_native_codec(codec_model_path: str, outdir: str) -> str:
-    """Convert the decoder and the complete Stage-0 raw-audio tower."""
+def resolve_codec_layout(model) -> tuple[int, list[int], int]:
+    """Return the checkpoint codec layout supported by the native vLLM codec."""
+    codec_converter = getattr(model, "_codec_converter", None)
+    if codec_converter is not None:
+        quantizer = getattr(codec_converter, "vector_quantizer_new", None)
+    else:
+        codec_model = getattr(model, "_codec_model", None)
+        quantizer = getattr(codec_model, "vector_quantizer", None)
+
+    fsqs = getattr(quantizer, "fsqs", None)
+    if fsqs is None or len(fsqs) == 0:
+        raise ValueError("The native vLLM codec reimplementation supports only GroupFiniteScalarQuantizer layouts")
+
+    levels_by_group: list[list[int]] = []
+    for fsq in fsqs:
+        num_levels = getattr(fsq, "num_levels", None)
+        if not isinstance(num_levels, torch.Tensor) or num_levels.numel() == 0:
+            raise ValueError(
+                "The native vLLM codec reimplementation requires each FSQ group to expose non-empty num_levels"
+            )
+        levels_by_group.append([int(level) for level in num_levels.reshape(-1).tolist()])
+
+    levels = levels_by_group[0]
+    if any(group_levels != levels for group_levels in levels_by_group[1:]):
+        raise ValueError("The native vLLM codec reimplementation requires one shared num_levels_per_group layout")
+
+    num_codebooks = int(getattr(quantizer, "num_codebooks", len(fsqs)))
+    if num_codebooks != len(fsqs):
+        raise ValueError(
+            "The checkpoint codec layout is inconsistent: "
+            f"num_codebooks={num_codebooks}, but the quantizer contains {len(fsqs)} FSQ groups"
+        )
+    if num_codebooks != int(model.num_audio_codebooks):
+        raise ValueError(
+            "The checkpoint codec layout is inconsistent: "
+            f"quantizer has {num_codebooks} codebooks, model expects {model.num_audio_codebooks}"
+        )
+
+    codebook_size = prod(levels)
+    if codebook_size != int(model.codebook_size):
+        raise ValueError(
+            "The checkpoint codec layout is inconsistent: "
+            f"num_levels_per_group implies codebook_size={codebook_size}, model expects {model.codebook_size}"
+        )
+
+    frame_stacking_factor = int(model.frame_stacking_factor)
+    if frame_stacking_factor <= 0:
+        raise ValueError(f"frame_stacking_factor must be positive, got {frame_stacking_factor}")
+    return num_codebooks, levels, frame_stacking_factor
+
+
+def bundle_native_codec(
+    codec_model_path: str,
+    outdir: str,
+    *,
+    num_codebooks: int,
+    frame_stacking_factor: int,
+    num_levels_per_group: list[int],
+    bundle_audio_encoders: bool = False,
+) -> str | None:
+    """Always convert the decoder; optionally export the guarded raw-audio tower."""
     script_dir = os.path.dirname(os.path.abspath(__file__))
     project_dir = os.path.abspath(os.path.join(script_dir, ".."))
     converter = os.path.join(script_dir, "convert_codec.py")
@@ -466,9 +539,22 @@ def bundle_native_codec(codec_model_path: str, outdir: str) -> str:
     existing_pythonpath = env.get("PYTHONPATH")
     env["PYTHONPATH"] = project_dir + (os.pathsep + existing_pythonpath if existing_pythonpath else "")
     logging.info("Converting native stateful codec %s -> %s", codec_model_path, output)
-    command = [sys.executable, converter, codec_model_path, output]
-    encoder_output = os.path.join(outdir, "codec_encoder.safetensors")
-    command.extend(["--encoder-output", encoder_output])
+    command = [
+        sys.executable,
+        converter,
+        codec_model_path,
+        output,
+        "--num-codebooks",
+        str(num_codebooks),
+        "--frame-stacking-factor",
+        str(frame_stacking_factor),
+        "--num-levels-per-group",
+        *[str(level) for level in num_levels_per_group],
+    ]
+    encoder_output = None
+    if bundle_audio_encoders:
+        encoder_output = os.path.join(outdir, "codec_encoder.safetensors")
+        command.extend(["--encoder-output", encoder_output])
     subprocess.run(command, check=True, env=env)
     return encoder_output
 
@@ -569,17 +655,23 @@ def convert(args) -> None:
     logging.info(f"Loaded EasyMagpieTTS checkpoint: {ckpt_name}")
 
     hidden_dim = int(model.cfg.hidden_dim)
+    num_codebooks, num_levels_per_group, frame_stacking_factor = resolve_codec_layout(model)
 
     # ── 1. Pre-compute the per-subword text embedding table ──────────────
     text_table = precompute_text_embeddings(model, args.precompute_batch_size)
     vocab_size = int(text_table.shape[0])
 
     # ── 2. config.json ───────────────────────────────────────────────────
-    config = build_config(model, vocab_size, args.dtype)
-    config["codec_encoder_bundled"] = bool(args.bundle_codec)
-    encoder_path = None
-    if args.bundle_codec:
-        encoder_path = bundle_native_codec(args.codec_model_path, args.outdir)
+    config = build_config(model, vocab_size, args.dtype, bundle_audio_encoders=args.bundle_audio_encoders)
+    encoder_path = bundle_native_codec(
+        args.codec_model_path,
+        args.outdir,
+        num_codebooks=num_codebooks,
+        frame_stacking_factor=frame_stacking_factor,
+        num_levels_per_group=num_levels_per_group,
+        bundle_audio_encoders=args.bundle_audio_encoders,
+    )
+    if encoder_path is not None:
         configure_codec_reference_speaker_encoder(args.outdir, config)
     with open(os.path.join(args.outdir, "config.json"), "w") as f:
         json.dump(config, f, indent=2)

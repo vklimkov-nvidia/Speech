@@ -17,16 +17,18 @@ Deployment knobs are in [`deploy/easymagpie.yaml`](deploy/easymagpie.yaml).
 
 ### Convert a NeMo checkpoint
 
-This step converts the EasyMagpie LM, precomputes the text-embedding lookup,
-and saves the tokenizer and optional precomputed speaker embedding. Codec
-bundling is disabled by default: no codec decoder or raw-audio encoder weights
-are copied. The resulting artifact uses speaker names or precomputed embeddings,
-matching externally released EasyMagpie artifacts.
+This step converts the EasyMagpie LM and Stage-1 codec decoder, precomputes
+the text-embedding lookup, and saves the tokenizer and optional precomputed
+speaker embedding. The codec decoder is always included so the documented
+two-stage pipeline is immediately usable. The codec encoder and reference-speaker
+encoder are deliberately omitted by default, so the resulting artifact accepts
+only speaker names or precomputed embeddings.
 
-Pass `--bundle-codec` only when you intend to package the codec encoder, the
-reference-speaker Transformer, and the Stage-1 decoder. This opt-in enables
-request-time reference audio and therefore zero-shot voice cloning. Run
-conversion in the **NeMo environment** from
+Pass `--bundle-audio-encoders` only when you intend to package both the codec
+encoder and the reference-speaker Transformer. This opt-in enables request-time
+reference audio and therefore zero-shot voice cloning. It does not make a
+single-turn checkpoint multi-turn; raw user-audio history additionally requires
+the source checkpoint's independent multi-turn configuration. Run conversion in the **NeMo environment** from
 the repository root. Prepending the repository root to `PYTHONPATH` is
 important when the environment has an editable NeMo install pointing at a
 different checkout:
@@ -68,17 +70,21 @@ better kernels; for an explicit sweep, run `python scripts/tune_mamba_ssu.py --m
 See the [`offline_demo.ipynb`](../../tutorials/tts/easymagpie_vllm_omni/offline_demo.ipynb) tutorial to check how
 `AsyncOmni` is initialized and used.
 
-### Request-time reference audio
+### Request-time reference and user audio
 
-Every source EasyMagpie NeMo checkpoint contains the codec encoder and
-reference-speaker Transformer. A converted artifact accepts raw reference audio
-only when conversion was explicitly run with `--bundle-codec`; externally
-released artifacts that omit those bundled files continue to use
-`speaker_id`/`speaker_embedding`.
+A converted artifact accepts raw reference or user audio only when it was
+created from a compatible checkpoint with `--bundle-audio-encoders`. That flag
+exports `codec_encoder.safetensors` and `codec_encoder.json`; the bundled tower
+returns both acoustic tokens and reference-speaker conditioning. Multi-turn is
+independent: user-audio history is accepted only when the source configuration
+also has `use_multiturn_dataset` and `condition_on_user_speech` enabled.
 
 Pass audio as `(waveform, sample_rate)`. The waveform must already be mono and
 match `arch.codec_input_sample_rate`; the serving path deliberately does not
 downmix or resample it.
+
+Identify each audio item's purpose using request-level `audio_roles`. This
+first history-preserving turn batches reference and user audio:
 
 ```python
 prompt = {
@@ -86,29 +92,52 @@ prompt = {
         [0] * task_rows
         + [arch.audio_input_token_id]
         + [0] * len(context_token_ids)
-        + [0] * arch.text_prefill_num
+        + [arch.audio_input_token_id]
     ),
     "multi_modal_data": {
-        "audio": [(reference_waveform, reference_sample_rate)],
+        "audio": [
+            (reference_waveform, reference_sample_rate),
+            (user_waveform, user_sample_rate),
+        ]
     },
     "mm_processor_kwargs": {
-        "audio_roles": ["speaker_reference"],
+        "audio_roles": ["speaker_reference", "user"],
     },
     "additional_information": {
         "context_text": "[EN]",
         "speaker_reference_audio": True,
-        "text": target_text,
+        "user_audio_prefill": True,
+        "text": response_text,
         "text_prefill_num": arch.text_prefill_num,
-        "prefill_text_tokens": target_token_ids[: arch.text_prefill_num],
         "temperature": 0.7,
         "top_k": 80,
+        "reset_codec_on_segment": True,
     },
 }
 ```
 
+For independent synthesis, submit only the reference item, set
+`audio_roles=["speaker_reference"]` and `user_audio_prefill=False`, and replace
+the final user-audio marker above with `arch.text_prefill_num` zero rows. Also
+provide `prefill_text_tokens`, the first `arch.text_prefill_num` encoded target
+tokens.
+
+For later turns on the same Stage 0 request, submit only the new user audio
+marker/waveform and target text. Set `audio_roles=["user"]`,
+`speaker_reference_audio=False`, and `user_audio_prefill=True`; do not repeat
+the reference/context rows.
+
+Yielding the turns as `StreamingInput` items from one async input generator
+keeps the existing Stage 0 causal/Mamba state. Using a new `omni.generate(...)`
+request instead starts synthesis from scratch. vLLM-Omni marks each appended
+audio-bearing span as prefill and switches back to decoding after that span; the
+client does not select an engine stage manually. Set
+`reset_codec_on_segment=True` on each dialogue reply so Stage 1 flushes and
+resets its response-local codec state while Stage 0 remains resumable.
+
 The OpenAI-compatible speech and WebSocket endpoints currently accept TTS text
-input only. Use the direct `AsyncOmni` input path for request-time reference
-audio until an audio request adapter is added.
+input only. Use the direct `AsyncOmni` input path for raw user speech until an
+audio-dialog request adapter is added.
 
 ### Serve over HTTP and WebSocket
 

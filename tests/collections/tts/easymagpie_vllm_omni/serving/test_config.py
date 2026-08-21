@@ -132,8 +132,20 @@ def test_from_hf_config_validates_text_eos_id():
         EasyMagpieOmniArch.from_hf_config(types.SimpleNamespace(text_vocab_size=10, text_eos_id=10))
 
 
+def test_audio_row_counts_come_from_converted_codec_metadata():
+    arch = EasyMagpieOmniArch(codec_samples_per_frame=640, frame_stacking_factor=2)
+
+    assert arch.codec_input_sample_rate == 16000
+    assert arch.reference_audio_num_rows(32_000) == 27
+    assert arch.user_audio_num_rows(6_400) == 6
+
+
 def test_reference_audio_capability_requires_converted_encoder_artifacts(tmp_path):
     arch = EasyMagpieOmniArch(codec_encoder_bundled=True)
+
+    assert arch.supports_reference_audio is True
+    assert arch.is_multiturn_checkpoint is False
+    assert arch.supports_user_audio_prefill is False
 
     with pytest.raises(FileNotFoundError, match="codec_encoder.json"):
         arch.require_reference_audio(tmp_path)
@@ -151,11 +163,35 @@ def test_reference_audio_capability_keeps_externally_released_artifact_path_avai
         arch.require_reference_audio()
 
 
-def test_codec_row_counts_come_from_checkpoint_metadata():
-    arch = EasyMagpieOmniArch(
-        codec_samples_per_frame=640,
-        frame_stacking_factor=2,
-    )
+def test_user_audio_prefill_capability_uses_authoritative_converted_flags(tmp_path):
+    with pytest.raises(RuntimeError, match="use_multiturn_dataset is false"):
+        EasyMagpieOmniArch().require_user_audio_prefill()
 
-    assert arch.codec_num_frames(32_000) == 50
-    assert arch.reference_audio_num_rows(32_000) == 27
+    multiturn_without_audio = EasyMagpieOmniArch(use_multiturn_dataset=True)
+    with pytest.raises(RuntimeError, match="condition_on_user_speech is false"):
+        multiturn_without_audio.require_user_audio_prefill()
+
+    unbundled_multiturn = EasyMagpieOmniArch(
+        use_multiturn_dataset=True,
+        condition_on_user_speech=True,
+        use_user_speaking_token=True,
+    )
+    assert unbundled_multiturn.is_multiturn_checkpoint is True
+    assert unbundled_multiturn.supports_user_audio_prefill is False
+    with pytest.raises(RuntimeError, match="omits the raw-audio encoder tower"):
+        unbundled_multiturn.require_user_audio_prefill()
+
+    capable = EasyMagpieOmniArch(
+        codec_encoder_bundled=True,
+        use_multiturn_dataset=True,
+        condition_on_user_speech=True,
+        use_user_speaking_token=True,
+    )
+    assert capable.is_multiturn_checkpoint is True
+    assert capable.supports_user_audio_prefill is True
+    with pytest.raises(FileNotFoundError, match="codec_encoder.json"):
+        capable.require_user_audio_prefill(tmp_path)
+
+    (tmp_path / "codec_encoder.json").touch()
+    (tmp_path / "codec_encoder.safetensors").touch()
+    capable.require_user_audio_prefill(tmp_path)

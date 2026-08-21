@@ -27,6 +27,8 @@ SPECIAL_AUDIO_EOS: int = 1
 SPECIAL_AUDIO_CONTEXT_BOS: int = 2
 SPECIAL_AUDIO_CONTEXT_EOS: int = 3
 SPECIAL_AUDIO_MASK: int = 4
+SPECIAL_AUDIO_USER_SPEAKING: int = 5
+SPECIAL_AUDIO_USER_SPEAKING_END: int = 6
 
 
 @dataclass
@@ -49,6 +51,9 @@ class EasyMagpieOmniArch:
     # the actual ID explicitly instead of deriving it from the final table size.
     text_eos_id: int | None = None
     use_multiturn_dataset: bool = False
+    condition_on_user_speech: bool = False
+    use_user_speaking_token: bool = False
+    use_user_speaking_end_token: bool = False
 
     # A valid dummy-backbone token used as the raw-audio placeholder. vLLM's
     # multimodal processor expands one occurrence to the codec encoder's rows.
@@ -93,6 +98,8 @@ class EasyMagpieOmniArch:
     forced_audio_bos_id: int | None = None
     forced_audio_eos_id: int | None = None
     forced_mask_token_id: int | None = None
+    forced_audio_user_speaking_id: int | None = None
+    forced_audio_user_speaking_end_id: int | None = None
 
     extra: dict[str, Any] = field(default_factory=dict)
 
@@ -174,6 +181,20 @@ class EasyMagpieOmniArch:
             "forced_audio_eos_id" if self.forced_audio_eos_id is not None else "audio_eos_id": self.audio_eos_id,
             "forced_mask_token_id" if self.forced_mask_token_id is not None else "mask_token_id": self.mask_token_id,
         }
+        if self.use_user_speaking_token:
+            name = (
+                "forced_audio_user_speaking_id"
+                if self.forced_audio_user_speaking_id is not None
+                else "audio_user_speaking_id"
+            )
+            audio_special_ids[name] = self.audio_user_speaking_id
+        if self.use_user_speaking_end_token:
+            name = (
+                "forced_audio_user_speaking_end_id"
+                if self.forced_audio_user_speaking_end_id is not None
+                else "audio_user_speaking_end_id"
+            )
+            audio_special_ids[name] = self.audio_user_speaking_end_id
         special_start = self.codebook_size
         special_end = self.num_all_tokens_per_codebook
         for name, token_id in audio_special_ids.items():
@@ -195,6 +216,12 @@ class EasyMagpieOmniArch:
                 raise ValueError("reference_speaker_encoder_kernel_size must be odd")
             if self.embedding_dim % self.reference_speaker_encoder_n_heads:
                 raise ValueError("embedding_dim must be divisible by reference_speaker_encoder_n_heads")
+        if self.condition_on_user_speech and not self.use_multiturn_dataset:
+            raise ValueError("condition_on_user_speech requires use_multiturn_dataset=True")
+        if self.condition_on_user_speech and not self.use_user_speaking_token:
+            raise ValueError("condition_on_user_speech requires use_user_speaking_token=True")
+        if self.use_user_speaking_end_token and not self.use_user_speaking_token:
+            raise ValueError("use_user_speaking_end_token requires use_user_speaking_token=True")
         if text_vocab_size is not None:
             if text_vocab_size <= 0:
                 raise ValueError(f"text_vocab_size must be positive, got {text_vocab_size}")
@@ -224,6 +251,11 @@ class EasyMagpieOmniArch:
         """Reference-speaker rows including context BOS and stacked EOS."""
         frames = self.codec_num_frames(num_samples)
         return 1 + (frames + self.frame_stacking_factor) // self.frame_stacking_factor
+
+    def user_audio_num_rows(self, num_samples: int) -> int:
+        """User-history rows including the leading user-speaking profile row."""
+        frames = self.codec_num_frames(num_samples)
+        return 1 + (frames + self.frame_stacking_factor - 1) // self.frame_stacking_factor
 
     @property
     def text_prefill_num(self) -> int:
@@ -282,7 +314,7 @@ class EasyMagpieOmniArch:
         if not self.supports_reference_audio:
             raise RuntimeError(
                 "This EasyMagpie artifact was converted without the optional raw-audio encoder tower. "
-                "Use speaker_id/speaker_embedding, or reconvert with --bundle-codec to enable zero-shot voice cloning."
+                "Use speaker_id/speaker_embedding, or reconvert with --bundle-audio-encoders to enable zero-shot voice cloning."
             )
         if model_path is None:
             return
@@ -296,11 +328,63 @@ class EasyMagpieOmniArch:
             )
 
     @property
+    def is_multiturn_checkpoint(self) -> bool:
+        """Whether the source checkpoint was trained for raw user-speech history."""
+        return self.use_multiturn_dataset and self.condition_on_user_speech
+
+    @property
+    def supports_user_audio_prefill(self) -> bool:
+        """Whether this converted artifact can accept raw user-audio history."""
+        return self.is_multiturn_checkpoint and self.codec_encoder_bundled
+
+    def require_user_audio_prefill(self, model_path: str | Path | None = None) -> None:
+        """Raise unless the converted checkpoint can run multi-turn user-audio prefill."""
+        if not self.use_multiturn_dataset:
+            raise RuntimeError(
+                "This converted EasyMagpie checkpoint is not multi-turn-capable "
+                "(config use_multiturn_dataset is false). Use a multi-turn checkpoint and reconvert it."
+            )
+        if not self.condition_on_user_speech:
+            raise RuntimeError(
+                "This multi-turn EasyMagpie checkpoint does not condition on raw user speech "
+                "(config condition_on_user_speech is false)."
+            )
+        if not self.codec_encoder_bundled:
+            raise RuntimeError(
+                "This checkpoint is multi-turn-capable, but this converted artifact omits the raw-audio encoder tower. "
+                "Reconvert with --bundle-audio-encoders to accept user audio history."
+            )
+        if model_path is None:
+            return
+        model_dir = Path(model_path)
+        required = ("codec_encoder.json", "codec_encoder.safetensors")
+        missing = [name for name in required if not (model_dir / name).is_file()]
+        if missing:
+            raise FileNotFoundError(
+                "This converted EasyMagpie checkpoint declares raw user-audio conditioning, but "
+                f"{', '.join(missing)} is missing from {model_dir}. Re-run convert_to_vllm.py with codec bundling enabled."
+            )
+
+    @property
     def mask_token_id(self) -> int:
         """Embedding-table id of the MaskGit MASK token."""
         if self.forced_mask_token_id is not None:
             return self.forced_mask_token_id
         return self.codebook_size + SPECIAL_AUDIO_MASK
+
+    @property
+    def audio_user_speaking_id(self) -> int:
+        """Embedding-table id used while the user is speaking."""
+        if self.forced_audio_user_speaking_id is not None:
+            return self.forced_audio_user_speaking_id
+        return self.codebook_size + SPECIAL_AUDIO_USER_SPEAKING
+
+    @property
+    def audio_user_speaking_end_id(self) -> int:
+        """Embedding-table id used at the user-to-agent boundary."""
+        if self.forced_audio_user_speaking_end_id is not None:
+            return self.forced_audio_user_speaking_end_id
+        return self.codebook_size + SPECIAL_AUDIO_USER_SPEAKING_END
 
     @property
     def resolved_phoneme_bos_id(self) -> int:
@@ -341,6 +425,9 @@ class EasyMagpieOmniArch:
             "phoneme_vocab_size",
             "text_eos_id",
             "use_multiturn_dataset",
+            "condition_on_user_speech",
+            "use_user_speaking_token",
+            "use_user_speaking_end_token",
             "audio_input_token_id",
             "max_user_audio_seconds",
             "codec_encoder_bundled",
@@ -364,6 +451,8 @@ class EasyMagpieOmniArch:
             "forced_audio_bos_id",
             "forced_audio_eos_id",
             "forced_mask_token_id",
+            "forced_audio_user_speaking_id",
+            "forced_audio_user_speaking_end_id",
         ):
             if hasattr(hf_config, f):
                 kwargs[f] = getattr(hf_config, f)
