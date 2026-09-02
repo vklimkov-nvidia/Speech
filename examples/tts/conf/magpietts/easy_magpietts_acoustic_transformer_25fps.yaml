@@ -1,0 +1,25 @@
+# EasyMagpie latent backbone with four-stage refinement for an 8-codebook, 25 fps codec.
+# Two codec frames are stacked per backbone step, so MaskGIT predicts 16 channels.
+defaults:
+  - easy_magpietts_acoustic_transformer
+  - _self_
+
+model:
+  num_audio_codebooks_train: 0
+  frame_stacking_factor: 2
+  cond_type: embedding
+  audio_embedding_dim: 512
+
+  # Losslessly repack the codec's 40 four-level FSQ scalars from 5x8 into
+  # 8 logical codebooks of five scalars (4^5 = 1024 entries each).
+  vector_quantizer:
+    _target_: nemo.collections.tts.modules.audio_codec_modules.GroupFiniteScalarQuantizer
+    num_groups: 8
+    num_levels_per_group: [4, 4, 4, 4, 4]
+
+  acoustic_decoder_transformer:
+    num_codebooks: 16
+    codebook_size: 1024
+    prediction_schedule: [1, 3, 4, 8]
+    predict_eos: true
+    semantic_layer: null

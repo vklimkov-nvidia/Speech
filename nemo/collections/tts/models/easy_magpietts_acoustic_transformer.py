@@ -17,11 +17,11 @@ import random
 from dataclasses import dataclass
 from typing import Optional, Tuple
 
-from einops import rearrange
 import numpy as np
 import soundfile as sf
 import torch
 import wandb
+from einops import rearrange
 from hydra.utils import instantiate
 from lightning.pytorch import Trainer
 from lightning.pytorch.loggers import TensorBoardLogger, WandbLogger
@@ -119,8 +119,8 @@ class EasyMagpieTTSAcousticTransformerModel(EasyMagpieTTSInferenceModel):
         self.codebook_loss_scale = cfg.get('codebook_loss_scale', 1.0)
         self.phoneme_as_text_prob = cfg.get('phoneme_as_text_prob', 0.0)
 
-        #self.ignore_index = -1
-        #self.cross_entropy_loss = nn.CrossEntropyLoss(reduction='mean', ignore_index=self.ignore_index)
+        # self.ignore_index = -1
+        # self.cross_entropy_loss = nn.CrossEntropyLoss(reduction='mean', ignore_index=self.ignore_index)
         self.cross_entropy_loss = nn.CrossEntropyLoss(reduction='none')
 
         self.infill_min = cfg.get("infill_min", 0.25)
@@ -166,6 +166,31 @@ class EasyMagpieTTSAcousticTransformerModel(EasyMagpieTTSInferenceModel):
             self._utmos_calculator = UTMOSv2Calculator(device='cpu')
             logging.info("UTMOSv2 calculator initialized for validation naturalness scoring")
 
+        self.freeze_backbone = cfg.get('freeze_backbone', False)
+        if self.freeze_backbone:
+            self._freeze_backbone_for_refinement()
+
+    def _freeze_backbone_for_refinement(self):
+        """Freeze input conditioning and the temporal backbone while training prediction heads."""
+        for parameter in self.parameters():
+            parameter.requires_grad = False
+
+        prediction_head_names = (
+            'acoustic_decoder_transformer',
+            'audio_embeddings',
+            'audio_in_projection',
+            'audio_out_projection',
+            'final_proj',
+            'phoneme_final_proj',
+        )
+        for module_name in prediction_head_names:
+            module = getattr(self, module_name, None)
+            if module is not None:
+                module.requires_grad_(True)
+
+        num_trainable = sum(parameter.numel() for parameter in self.parameters() if parameter.requires_grad)
+        logging.info(f"Frozen temporal backbone; training {num_trainable:,} conditioning/prediction-head parameters")
+
     def _get_state_dict_keys_to_exclude(self):
         return super()._get_state_dict_keys_to_exclude() + [
             '_speaker_verification_model',
@@ -194,7 +219,7 @@ class EasyMagpieTTSAcousticTransformerModel(EasyMagpieTTSInferenceModel):
             ei = si + codebook_size
             codebook_logits = logits[:, :, si:ei]  # (B, T', num_tokens_per_codebook)
             codebook_targets = audio_codes[:, codebook]  # (B, T')
-            #codebook_targets = torch.where(loss_mask[:, codebook, :], codebook_targets, self.ignore_index)
+            # codebook_targets = torch.where(loss_mask[:, codebook, :], codebook_targets, self.ignore_index)
             codebook_loss = self.cross_entropy_loss(
                 codebook_logits.permute(0, 2, 1), codebook_targets.long()  # (B, num_tokens_per_codebook, T')
             )  # (B, T')
@@ -216,7 +241,7 @@ class EasyMagpieTTSAcousticTransformerModel(EasyMagpieTTSInferenceModel):
             ei = si + self.phoneme_vocab_size
             phoneme_logits = logits[:, :, si:ei]
             phoneme_targets = phoneme_tokens[:, codebook]
-            #phoneme_targets = torch.where(loss_mask, phoneme_targets, self.ignore_index)
+            # phoneme_targets = torch.where(loss_mask, phoneme_targets, self.ignore_index)
             phoneme_loss = self.cross_entropy_loss(phoneme_logits.permute(0, 2, 1), phoneme_targets)
             phoneme_loss = phoneme_loss * loss_mask
             phoneme_loss = phoneme_loss.sum() / loss_mask.sum()
@@ -249,11 +274,15 @@ class EasyMagpieTTSAcousticTransformerModel(EasyMagpieTTSInferenceModel):
 
         return infill_mask
 
-    def embed_audio_tokens_with_dropout(self, audio_tokens, audio_tokens_lens, num_codebooks, projection, dropout_codes):
+    def embed_audio_tokens_with_dropout(
+        self, audio_tokens, audio_tokens_lens, num_codebooks, projection, dropout_codes
+    ):
         audio_tokens_rearrange = audio_tokens[:, :num_codebooks, :]
         audio_tokens_rearrange = rearrange(audio_tokens_rearrange, 'B C T -> C B T')
         # [B, D, T]
-        audio_codes = self._codec_model.vector_quantizer.decode(indices=audio_tokens_rearrange, input_len=audio_tokens_lens)
+        audio_codes = self._codec_model.vector_quantizer.decode(
+            indices=audio_tokens_rearrange, input_len=audio_tokens_lens
+        )
         audio_codes = rearrange(audio_codes, 'B D T -> B T D')
         audio_embedding = projection(audio_codes)
 
@@ -262,13 +291,21 @@ class EasyMagpieTTSAcousticTransformerModel(EasyMagpieTTSInferenceModel):
             infill_mask = rearrange(infill_mask, 'B T -> B T 1')
             audio_embedding = torch.where(infill_mask, audio_embedding, self.mask_emb)
 
-        audio_embedding = torch.where(torch.any(audio_tokens == self.audio_bos_id, dim=1).unsqueeze(2), self.audio_bos_emb, audio_embedding)
-        audio_embedding = torch.where(torch.any(audio_tokens == self.audio_eos_id, dim=1).unsqueeze(2), self.audio_eos_emb, audio_embedding)
         audio_embedding = torch.where(
-            torch.any(audio_tokens == self.context_audio_bos_id, dim=1).unsqueeze(2), self.context_bos_emb, audio_embedding
+            torch.any(audio_tokens == self.audio_bos_id, dim=1).unsqueeze(2), self.audio_bos_emb, audio_embedding
         )
         audio_embedding = torch.where(
-            torch.any(audio_tokens == self.context_audio_eos_id, dim=1).unsqueeze(2), self.context_eos_emb, audio_embedding
+            torch.any(audio_tokens == self.audio_eos_id, dim=1).unsqueeze(2), self.audio_eos_emb, audio_embedding
+        )
+        audio_embedding = torch.where(
+            torch.any(audio_tokens == self.context_audio_bos_id, dim=1).unsqueeze(2),
+            self.context_bos_emb,
+            audio_embedding,
+        )
+        audio_embedding = torch.where(
+            torch.any(audio_tokens == self.context_audio_eos_id, dim=1).unsqueeze(2),
+            self.context_eos_emb,
+            audio_embedding,
         )
         mask = get_mask_from_lengths(audio_tokens_lens)
         audio_embedding = audio_embedding * mask.unsqueeze(2)
@@ -291,6 +328,7 @@ class EasyMagpieTTSAcousticTransformerModel(EasyMagpieTTSInferenceModel):
         target_audio, target_audio_lens, _ = self._codec_helper.codes_to_audio(
             target_audio_codes,
             audio_codes_lens,
+            codes_are_native=True,
         )
 
         context_audio, context_audio_lens = None, None
@@ -622,12 +660,22 @@ class EasyMagpieTTSAcousticTransformerModel(EasyMagpieTTSInferenceModel):
         audio_codes_target = audio_codes[:, :, 1:]  # (B, C, T'-1)
         audio_codes_input = audio_codes[:, :, :-1]  # (B, C, T'-1)
 
-        # Embed audio tokens
+        # A semantic refiner feeds back only the semantic stream. With no semantic
+        # stream, feed back every acoustic channel generated by the refiner.
+        num_backbone_codebooks = (
+            self.num_audio_codebooks_pred
+            if self.acoustic_decoder_transformer is not None
+            else self.num_audio_codebooks
+        )
         if self.cond_type == "embedding":
-            audio_embedded = self.embed_audio_tokens(audio_codes_input, num_codebooks=self.num_audio_codebooks)  # (B, T'-1, E)
+            audio_embedded = self.embed_audio_tokens(audio_codes_input, num_codebooks=num_backbone_codebooks)
         else:
             audio_embedded = self.embed_audio_tokens_with_dropout(
-                audio_codes_input, audio_codes_lens_target, self.num_audio_codebooks, self.decoder_code_proj, dropout_codes=dropout_codes
+                audio_codes_input,
+                audio_codes_lens_target,
+                num_backbone_codebooks,
+                self.decoder_code_proj,
+                dropout_codes=dropout_codes,
             )
 
         # Create zero tensor for delay padding
@@ -910,14 +958,28 @@ class EasyMagpieTTSAcousticTransformerModel(EasyMagpieTTSInferenceModel):
         pred_embeddings_audio = self.audio_out_projection(pred_embeddings)
         logits = self.final_proj(pred_embeddings_audio)
 
-        semantic_codes = audio_codes[:, :self.num_audio_codebooks_train, :]
-        acoustic_codes_target = audio_codes[:, self.num_audio_codebooks_train:, :]
+        num_backbone_channels = self.num_audio_codebooks_train * self.frame_stacking_factor
+        refinement_codes_target, refinement_codes_lens = remove_eos_token(
+            codes=audio_codes_target,
+            codes_len=audio_codes_lens_target,
+        )
+        semantic_codes = refinement_codes_target[:, :num_backbone_channels, :]
 
-        acoustic_input, _ = remove_embedded_eos_token(embedded=pred_embeddings, embedded_len=audio_codes_lens_target)
+        if self.acoustic_decoder_transformer.predict_eos:
+            acoustic_input = pred_embeddings
+            acoustic_lens = audio_codes_lens_target
+            acoustic_codes_target = audio_codes_target[:, num_backbone_channels:, :]
+        else:
+            acoustic_input, acoustic_lens = remove_embedded_eos_token(
+                embedded=pred_embeddings,
+                embedded_len=audio_codes_lens_target,
+            )
+            acoustic_codes_target = refinement_codes_target[:, num_backbone_channels:, :]
+
         pred_acoustic_codes, _, acoustic_codebook_loss = self.acoustic_decoder_transformer(
             inputs=acoustic_input,
-            audio_lens=audio_codes_lens,
-            semantic_tokens=semantic_codes,
+            audio_lens=acoustic_lens,
+            semantic_tokens=semantic_codes if num_backbone_channels else None,
             vector_quantizer=self._codec_model.vector_quantizer,
             acoustic_tokens=acoustic_codes_target,
         )
@@ -927,19 +989,31 @@ class EasyMagpieTTSAcousticTransformerModel(EasyMagpieTTSInferenceModel):
             codes=pred_semantic_codes,
             codes_len=audio_codes_lens_target,
         )
-        pred_semantic_codes, _ = self._prepare_codes_for_decode(
-            pred_semantic_codes, audio_codes_lens
-        )
+        if self.acoustic_decoder_transformer.predict_eos:
+            pred_acoustic_codes, _ = remove_eos_token(
+                codes=pred_acoustic_codes,
+                codes_len=audio_codes_lens_target,
+            )
         pred_audio_codes = torch.cat([pred_semantic_codes, pred_acoustic_codes], dim=1)
+        if self.frame_stacking_factor > 1:
+            pred_audio_codes, _ = self.unstack_codes(
+                pred_audio_codes,
+                refinement_codes_lens,
+                self.frame_stacking_factor,
+            )
 
-        # Compute codebook loss
-        semantic_codes_target = audio_codes_target[:, :self.num_audio_codebooks_train, :]
-        codebook_loss, _ = self.compute_loss(
-            logits=logits,
-            audio_codes=semantic_codes_target,
-            audio_codes_lens=audio_codes_lens_target,
-            codebook_size=self.num_all_tokens_per_codebook
-        )
+        # Compute the direct backbone-token loss. It is exactly zero when the
+        # temporal backbone delegates every codec token (and EOS) to MaskGIT.
+        semantic_codes_target = audio_codes_target[:, :num_backbone_channels, :]
+        if num_backbone_channels:
+            codebook_loss, _ = self.compute_loss(
+                logits=logits,
+                audio_codes=semantic_codes_target,
+                audio_codes_lens=audio_codes_lens_target,
+                codebook_size=self.num_all_tokens_per_codebook,
+            )
+        else:
+            codebook_loss = logits.new_zeros((), dtype=torch.float32)
         loss = self.codebook_loss_scale * (codebook_loss + acoustic_codebook_loss)
 
         # Compute phoneme loss if applicable
@@ -1365,7 +1439,9 @@ class EasyMagpieTTSAcousticTransformerModel(EasyMagpieTTSInferenceModel):
         return val_output
 
     def on_validation_epoch_end(self):
-        collect = lambda key: torch.stack([x[key] for x in self.validation_step_outputs]).mean()
+        def collect(key):
+            return torch.stack([output[key] for output in self.validation_step_outputs]).mean()
+
         val_loss = collect("val_loss")
         val_codebook_loss = collect("val_codebook_loss")
         val_acoustic_codebook_loss = collect("val_acoustic_codebook_loss")

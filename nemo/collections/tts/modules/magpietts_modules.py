@@ -14,12 +14,13 @@
 
 from __future__ import annotations
 
+import copy
 from enum import Enum
 from typing import Dict, List, Optional
 
-from einops import rearrange
 import numpy as np
 import torch
+from einops import rearrange
 from torch import Tensor
 from torch.utils.data import get_worker_info
 
@@ -396,14 +397,14 @@ class CodecHelper:
             codes, codes_len = self.codec_model.encode(audio=audio, audio_len=audio_len, sample_rate=sample_rate)
             return codes, codes_len
 
-    def codes_to_audio(self, codes, codes_len):
+    def codes_to_audio(self, codes, codes_len, codes_are_native=False):
         """Decode codec codes back into audio waveforms.
 
         ``codes`` must already be unstacked to the shape the codec expects.
         """
         self.codec_model.eval()
         with torch.no_grad(), torch.autocast(device_type=codes.device.type, dtype=torch.float32):
-            if self.codec_converter is not None:
+            if self.codec_converter is not None and not codes_are_native:
                 codes = self.codec_converter.convert_new_to_original(audio_tokens=codes, audio_lens=codes_len)
 
             audio, audio_len = self.codec_model.decode(tokens=codes, tokens_len=codes_len)
@@ -784,8 +785,7 @@ class LocalTransformerHelper:
 
 
 class AcousticDecoder(torch.nn.Module):
-    """
-    """
+    """ """
 
     def __init__(
         self,
@@ -793,10 +793,10 @@ class AcousticDecoder(torch.nn.Module):
         d_model,
         decoder,
         semantic_layer,
-        acoustic_infill_min = 0.25,
-        acoustic_infill_max = 1.0,
-        semantic_mask_min = 0.25,
-        semantic_mask_max = 1.0,
+        acoustic_infill_min=0.25,
+        acoustic_infill_max=1.0,
+        semantic_mask_min=0.25,
+        semantic_mask_max=1.0,
     ):
         super(AcousticDecoder, self).__init__()
 
@@ -811,7 +811,6 @@ class AcousticDecoder(torch.nn.Module):
         self.semantic_mask_max = semantic_mask_max
 
         self.infill_dist = torch.distributions.beta.Beta(concentration1=1.0, concentration0=2.0)
-
 
     def create_infill_mask(self, input_lens, infill_min, infill_max):
         batch_size = input_lens.shape[0]
@@ -835,7 +834,6 @@ class AcousticDecoder(torch.nn.Module):
 
         return infill_mask
 
-
     def forward(self, inputs, audio_lens, semantic_tokens, acoustic_tokens, vector_quantizer):
         audio_mask = get_mask_from_lengths(audio_lens)
 
@@ -849,22 +847,18 @@ class AcousticDecoder(torch.nn.Module):
         else:
             audio_maskin = None
             semantic_mask = None
-            
+
         semantic_tokens_rearrange = rearrange(semantic_tokens, 'B C T -> C B T')
         # [batch_size, code_dim, audio_token_len]
         semantic_codes = vector_quantizer.decode(indices=semantic_tokens_rearrange, input_len=audio_lens)
         semantic_codes = rearrange(semantic_codes, 'B D T -> B T D')
-        
+
         acoustic_tokens_rearrange = rearrange(acoustic_tokens, 'B C T -> C B T')
         # [batch_size, code_dim, audio_token_len]
         acoustic_codes = vector_quantizer.decode(indices=acoustic_tokens_rearrange, input_len=audio_lens)
         acoustic_codes = rearrange(acoustic_codes, 'B D T -> B T D')
 
-        res = self.semantic_layer(
-            semantic_codes=semantic_codes,
-            audio_mask=audio_mask,
-            semantic_mask=semantic_mask
-        )
+        res = self.semantic_layer(semantic_codes=semantic_codes, audio_mask=audio_mask, semantic_mask=semantic_mask)
         dec_inp = self.input_proj(inputs) + res
         dec_inp = dec_inp * audio_mask.unsqueeze(2)
 
@@ -907,8 +901,7 @@ class AcousticDecoder(torch.nn.Module):
 
 
 class AcousticDecoderLinear(torch.nn.Module):
-    """
-    """
+    """ """
 
     def __init__(
         self,
@@ -965,7 +958,16 @@ class AcousticDecoderLinear(torch.nn.Module):
 
 
 class AcousticDecoderTransformer(torch.nn.Module):
-    """Causal acoustic decoder with optional confidence-ordered prediction stages."""
+    """Four-stage causal decoder with confidence-ordered acoustic refinement.
+
+    Every refinement stage has a distinct three-layer transformer and its own
+    temporal KV cache. At every stage it receives the sum of the projected
+    backbone latent, projected semantic code, and acoustic codes selected by
+    earlier stages. Distinct stage parameters make a stage embedding redundant.
+    """
+
+    DEFAULT_PREDICTION_SCHEDULE = (1, 3, 4, 4)
+    STAGE_TRANSFORMER_LAYERS = 3
 
     def __init__(
         self,
@@ -975,106 +977,243 @@ class AcousticDecoderTransformer(torch.nn.Module):
         num_codebooks,
         codebook_size,
         transformer,
-        num_prediction_steps=1,
+        prediction_schedule=None,
+        num_prediction_steps=None,
+        sampling_temperature=0.0,
+        sampling_topk=None,
+        predict_eos=False,
     ):
-        super(AcousticDecoderTransformer, self).__init__()
+        super().__init__()
 
         self.num_codebooks = num_codebooks
+        self.d_model = d_model
         self.codebook_size = codebook_size
-        self.num_logits = self.num_codebooks * self.codebook_size
-        self.num_prediction_steps = num_prediction_steps
+        self.predict_eos = bool(predict_eos)
+        self.eos_token_id = (
+            SpecialAudioToken.get_index(SpecialAudioToken.AUDIO_EOS, self.codebook_size) if self.predict_eos else None
+        )
+        self.num_tokens_per_codebook = (
+            self.codebook_size + len(SpecialAudioToken) if self.predict_eos else self.codebook_size
+        )
+        self.num_logits = self.num_codebooks * self.num_tokens_per_codebook
+        self.prediction_schedule = self._resolve_prediction_schedule(
+            prediction_schedule=prediction_schedule,
+            num_prediction_steps=num_prediction_steps,
+        )
+        self.num_prediction_steps = len(self.prediction_schedule)
+        self.sampling_temperature = sampling_temperature
+        self.sampling_topk = sampling_topk
+
+        if transformer.n_layers != self.STAGE_TRANSFORMER_LAYERS:
+            raise ValueError(
+                f"Each acoustic stage transformer must have exactly {self.STAGE_TRANSFORMER_LAYERS} layers, "
+                f"received {transformer.n_layers}"
+            )
+        if not all(layer.self_attention.is_causal for layer in transformer.layers):
+            raise ValueError("Acoustic stage transformers must be causal")
 
         self.semantic_layer = semantic_layer
-        self.input_proj = torch.nn.Linear(input_dim, d_model)
-        self.transformer = transformer
+        self.backbone_projection = torch.nn.Linear(input_dim, d_model)
+        self.sampled_token_embeddings = torch.nn.ModuleList(
+            torch.nn.Embedding(self.num_tokens_per_codebook, d_model) for _ in range(self.num_codebooks)
+        )
+        self.sampled_token_projection = torch.nn.Linear(d_model, d_model, bias=False)
+        self.transformers = torch.nn.ModuleList(
+            [transformer] + [copy.deepcopy(transformer) for _ in range(self.num_prediction_steps - 1)]
+        )
         self.acoustic_token_layer = torch.nn.Linear(d_model, self.num_logits)
-        if self.transformer.n_layers % self.num_prediction_steps:
-            raise ValueError("Transformer layers must be divisible by num_prediction_steps")
-        if self.num_codebooks % self.num_prediction_steps:
-            raise ValueError("Codebooks must be divisible by num_prediction_steps")
-        self.layers_per_step = self.transformer.n_layers // self.num_prediction_steps
-        self.codebooks_per_step = self.num_codebooks // self.num_prediction_steps
+        self._use_cache = False
+
+    def _resolve_prediction_schedule(self, prediction_schedule, num_prediction_steps):
+        if prediction_schedule is None:
+            if self.num_codebooks == 12 and num_prediction_steps in (None, 4):
+                prediction_schedule = self.DEFAULT_PREDICTION_SCHEDULE
+            elif num_prediction_steps in (None, 1):
+                prediction_schedule = (self.num_codebooks,)
+            elif self.num_codebooks % num_prediction_steps == 0:
+                prediction_schedule = (self.num_codebooks // num_prediction_steps,) * num_prediction_steps
+            else:
+                raise ValueError("num_codebooks must be divisible by the legacy num_prediction_steps setting")
+
+        prediction_schedule = tuple(int(value) for value in prediction_schedule)
+        if not prediction_schedule or any(value <= 0 for value in prediction_schedule):
+            raise ValueError("prediction_schedule must contain positive codebook counts")
+        if sum(prediction_schedule) != self.num_codebooks:
+            raise ValueError(
+                f"prediction_schedule must predict exactly {self.num_codebooks} codebooks, "
+                f"received {prediction_schedule}"
+            )
+        return prediction_schedule
+
+    def reset_cache(self, use_cache=False):
+        """Reset the independent temporal KV cache owned by every stage."""
+        self._use_cache = use_cache
+        for transformer in self.transformers:
+            transformer.reset_cache(use_cache=use_cache)
+
+    def cache_sequence_lengths(self):
+        """Return the temporal cache length of every refinement stage."""
+        if not self._use_cache:
+            return ()
+        return tuple(transformer.cache_sequence_length() for transformer in self.transformers)
 
     @staticmethod
     def select_codebooks(confidence, unresolved, num_to_select):
-        """Select a fixed number of the most confident unresolved codebooks."""
-        scores = confidence.masked_fill(~unresolved, float("-inf"))
+        """Select the most confident unresolved codebooks independently per frame."""
+        if num_to_select <= 0:
+            return torch.zeros_like(unresolved)
+        scores = confidence.masked_fill(~unresolved, float('-inf'))
         indices = torch.topk(scores, k=num_to_select, dim=-1, sorted=False).indices
-        return (
-            torch.zeros_like(unresolved).scatter(-1, indices, torch.ones_like(indices, dtype=torch.bool)) & unresolved
+        selected = torch.zeros_like(unresolved).scatter(-1, indices, True)
+        return selected & unresolved
+
+    def _embed_known_tokens(self, tokens, known):
+        embedding = torch.zeros(
+            *tokens.shape[:2], self.d_model, device=tokens.device, dtype=self.sampled_token_embeddings[0].weight.dtype
         )
+        for codebook, token_embedding in enumerate(self.sampled_token_embeddings):
+            embedding = embedding + token_embedding(tokens[..., codebook]) * known[..., codebook, None]
+        return self.sampled_token_projection(embedding)
 
-    def _embed_selected(self, tokens, selected):
-        """Use codebook-specific output weights as tied teacher-forcing embeddings."""
-        embedding = 0.0
-        for codebook in range(self.num_codebooks):
-            start = codebook * self.codebook_size
-            end = start + self.codebook_size
-            codebook_embedding = torch.nn.functional.embedding(
-                tokens[..., codebook], self.acoustic_token_layer.weight[start:end]
-            )
-            embedding = embedding + codebook_embedding * selected[..., codebook, None]
-        return embedding / self.codebooks_per_step**0.5
+    def _compose_stage_input(self, backbone, semantic, known_tokens, known):
+        acoustic_embedding = self._embed_known_tokens(known_tokens, known)
+        return backbone + semantic + acoustic_embedding
 
-    def _compute_stage_loss(self, logits, targets, unresolved):
+    def _run_transformer_stage(self, stage_input, audio_mask, stage):
+        transformer = self.transformers[stage]
+        position_offset = transformer.cache_sequence_length() if self._use_cache else 0
+        output = transformer(
+            x=stage_input,
+            x_mask=audio_mask,
+            position_offset=position_offset,
+        )['output']
+        if self._use_cache:
+            output = output[:, -stage_input.size(1) :]
+        return output
+
+    @staticmethod
+    def _compute_stage_loss(logits, targets, unresolved):
         """Compute masked cross entropy in FP32 for mixed-precision stability."""
         loss = torch.nn.functional.cross_entropy(
-            logits.float().flatten(0, 2), targets.flatten(), reduction="none"
+            logits.float().flatten(0, 2), targets.flatten(), reduction='none'
         ).view_as(unresolved)
         return (loss * unresolved).sum() / unresolved.sum().clamp_min(1)
 
-    def forward(self, inputs, audio_lens, semantic_tokens, vector_quantizer, acoustic_tokens=None):
+    @staticmethod
+    def _sample_candidates(logits, temperature, topk):
+        if temperature <= 0.0:
+            candidates = logits.argmax(dim=-1)
+            confidence = torch.log_softmax(logits.detach().float(), dim=-1).amax(dim=-1)
+            return candidates, confidence
+
+        sampling_logits = logits.float() / temperature
+        if topk is not None:
+            topk = min(int(topk), sampling_logits.size(-1))
+            if topk <= 0:
+                raise ValueError(f"sampling_topk must be positive, received {topk}")
+            threshold = torch.topk(sampling_logits, k=topk, dim=-1).values[..., -1, None]
+            sampling_logits = sampling_logits.masked_fill(sampling_logits < threshold, float('-inf'))
+        probabilities = torch.softmax(sampling_logits, dim=-1)
+        candidates = torch.multinomial(probabilities.flatten(0, 2), 1).view(logits.shape[:-1])
+        confidence = torch.gather(probabilities, dim=-1, index=candidates.unsqueeze(-1)).squeeze(-1).log()
+        return candidates, confidence
+
+    def forward(
+        self,
+        inputs,
+        audio_lens,
+        semantic_tokens,
+        vector_quantizer,
+        acoustic_tokens=None,
+        sampling_temperature=None,
+        sampling_topk=None,
+    ):
+        if acoustic_tokens is not None and acoustic_tokens.size(1) != self.num_codebooks:
+            raise ValueError(f"Expected {self.num_codebooks} acoustic codebooks, received {acoustic_tokens.size(1)}")
+
         audio_mask = get_mask_from_lengths(audio_lens)
+        if audio_mask.size(1) != inputs.size(1):
+            raise ValueError(
+                f"Input time dimension {inputs.size(1)} does not match maximum audio length {audio_mask.size(1)}"
+            )
         audio_mask_3d = rearrange(audio_mask, 'B T -> B T 1')
+        backbone_embedding = self.backbone_projection(inputs)
 
-        semantic_tokens_rearrange = rearrange(semantic_tokens, 'B C T -> C B T')
-        # [batch_size, code_dim, audio_token_len]
-        semantic_codes = vector_quantizer.decode(indices=semantic_tokens_rearrange, input_len=audio_lens)
-        semantic_codes = rearrange(semantic_codes, 'B D T -> B T D')
+        if self.semantic_layer is None:
+            if semantic_tokens is not None and semantic_tokens.size(1) != 0:
+                raise ValueError("semantic_tokens must be omitted when semantic_layer is not configured")
+            semantic_embedding = torch.zeros_like(backbone_embedding)
+        else:
+            if semantic_tokens is None or semantic_tokens.size(1) != 1:
+                num_received = None if semantic_tokens is None else semantic_tokens.size(1)
+                raise ValueError(f"Expected one semantic codebook, received {num_received}")
+            if vector_quantizer is None:
+                raise ValueError("vector_quantizer is required when semantic_layer is configured")
+            semantic_tokens_rearrange = rearrange(semantic_tokens, 'B C T -> C B T')
+            semantic_codes = vector_quantizer.decode(indices=semantic_tokens_rearrange, input_len=audio_lens)
+            semantic_codes = rearrange(semantic_codes, 'B D T -> B T D')
+            semantic_embedding = self.semantic_layer(audio_codes=semantic_codes, audio_lens=audio_lens)
+        if semantic_embedding.shape != backbone_embedding.shape:
+            raise ValueError(
+                "Semantic projection and backbone projection must have the same shape, received "
+                f"{semantic_embedding.shape} and {backbone_embedding.shape}"
+            )
+        semantic_embedding = semantic_embedding * audio_mask_3d
+        backbone_embedding = backbone_embedding * audio_mask_3d
 
-        res = self.semantic_layer(audio_codes=semantic_codes, audio_lens=audio_lens)
-        dec_inp = (self.input_proj(inputs) + res) * audio_mask_3d
-        if self.transformer.use_learnable_pos_emb:
-            positions = torch.arange(dec_inp.size(1), device=dec_inp.device).unsqueeze(0)
-            dec_inp = dec_inp + self.transformer.position_embeddings(positions)
-        elif self.transformer.use_static_pos_emb:
-            positions = torch.arange(dec_inp.size(1), device=dec_inp.device).to(dtype=dec_inp.dtype)
-            dec_inp = dec_inp + self.transformer.position_embeddings(positions)
-
-        hidden = self.transformer.dropout(dec_inp) * audio_mask_3d
         unresolved = audio_mask[..., None].expand(-1, -1, self.num_codebooks).clone()
-        predicted = torch.zeros_like(unresolved, dtype=torch.long)
+        known = torch.zeros_like(unresolved)
+        known_tokens = torch.zeros_like(unresolved, dtype=torch.long)
+        predicted = torch.zeros_like(known_tokens)
+        selected_logits = torch.zeros(
+            *unresolved.shape,
+            self.num_tokens_per_codebook,
+            dtype=inputs.dtype,
+            device=inputs.device,
+        )
         targets = rearrange(acoustic_tokens, 'B C T -> B T C').long() if acoustic_tokens is not None else None
         total_loss = torch.zeros((), device=inputs.device, dtype=torch.float32) if targets is not None else None
+        temperature = self.sampling_temperature if sampling_temperature is None else sampling_temperature
+        topk = self.sampling_topk if sampling_topk is None else sampling_topk
 
-        for layer_index, layer in enumerate(self.transformer.layers):
-            hidden = layer(hidden, audio_mask)['output']
-            if (layer_index + 1) % self.layers_per_step:
-                continue
-
-            prediction_hidden = self.transformer.dropout_out(self.transformer.norm_out(hidden))
-            logits = self.acoustic_token_layer(prediction_hidden).unflatten(
-                -1, (self.num_codebooks, self.codebook_size)
+        for stage, num_to_select in enumerate(self.prediction_schedule):
+            stage_input = self._compose_stage_input(
+                backbone=backbone_embedding,
+                semantic=semantic_embedding,
+                known_tokens=known_tokens,
+                known=known,
             )
-            candidates = logits.argmax(dim=-1)
+            hidden = self._run_transformer_stage(stage_input, audio_mask, stage)
+            logits = self.acoustic_token_layer(hidden).unflatten(
+                -1, (self.num_codebooks, self.num_tokens_per_codebook)
+            )
 
             if targets is not None:
                 total_loss = total_loss + self._compute_stage_loss(logits, targets, unresolved)
 
-            if layer_index + 1 == self.transformer.n_layers:
-                predicted = torch.where(unresolved, candidates, predicted)
-                break
-
-            confidence = torch.log_softmax(logits.detach().float(), dim=-1).amax(dim=-1)
-            selected = self.select_codebooks(confidence, unresolved, self.codebooks_per_step)
+            sampling_logits = logits
+            if self.predict_eos:
+                sampling_logits = logits.clone()
+                forbidden_tokens = SpecialAudioToken.get_forbidden_tokens(self.codebook_size, forbid_audio_eos=False)
+                sampling_logits[..., forbidden_tokens] = float('-inf')
+            candidates, confidence = self._sample_candidates(sampling_logits, temperature=temperature, topk=topk)
+            selected = self.select_codebooks(confidence, unresolved, num_to_select=num_to_select)
+            selected_logits = torch.where(selected[..., None], logits, selected_logits)
             predicted = torch.where(selected, candidates, predicted)
+
             feedback_tokens = targets if targets is not None else candidates
-            feedback = self._embed_selected(feedback_tokens, selected).to(dtype=hidden.dtype)
-            hidden = hidden + feedback
+            known_tokens = torch.where(selected, feedback_tokens, known_tokens)
+            known = known | selected
             unresolved = unresolved & ~selected
 
+        if unresolved.any():
+            raise RuntimeError("Prediction schedule left valid acoustic codebooks unresolved")
+
         predicted = rearrange(predicted * audio_mask_3d, 'B T C -> B C T')
-        packed_logits = rearrange(logits * audio_mask_3d.unsqueeze(-1), 'B T C W -> B T (C W)')
+        packed_logits = rearrange(
+            selected_logits * audio_mask_3d.unsqueeze(-1),
+            'B T C W -> B T (C W)',
+        )
         if total_loss is not None:
             total_loss = total_loss / self.num_prediction_steps
 

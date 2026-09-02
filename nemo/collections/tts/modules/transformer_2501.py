@@ -667,6 +667,13 @@ class Transformer(torch.nn.Module):
         for layer in self.layers:
             layer.reset_cache(use_cache=use_cache, frames_per_iter=frames_per_iter)
 
+    def cache_sequence_length(self) -> int:
+        """Return the number of cached self-attention positions."""
+        if not self.layers:
+            return 0
+        self_k = self.layers[0].self_attention.cache['self_k']
+        return 0 if self_k is None else self_k.size(1)
+
     @staticmethod
     def _init_weights_gpt2(module):
         if isinstance(module, (torch.nn.Linear, torch.nn.Embedding, torch.nn.Conv1d)):
@@ -713,6 +720,7 @@ class Transformer(torch.nn.Module):
         attn_prior: Optional[Union[torch.Tensor, List[torch.Tensor]]] = None,
         multi_encoder_mapping: Optional[List[Optional[int]]] = None,
         max_layer_idx: Optional[int] = None,
+        position_offset: int = 0,
     ) -> Dict[str, Union[torch.Tensor, List]]:
         """
         Args:
@@ -725,6 +733,8 @@ class Transformer(torch.nn.Module):
                 out or list of such tensors (from different encoders) output <torch tensor> (B, T1, C)
             multi_encoder_mapping <list> <int>: None or Same size as n_layers, value indicates which cond input to use
                 for this layer
+            position_offset <int>: Index of the first position in ``x``. This is needed
+                for incremental decoding when the KV cache already contains earlier positions.
 
         Returns dict with keys:
             output <torch tensor> (B, T1, C): Output tensor
@@ -740,11 +750,11 @@ class Transformer(torch.nn.Module):
             )
 
         if self.use_learnable_pos_emb:
-            positions = torch.arange(x.size(1), device=x.device).unsqueeze(0)
+            positions = torch.arange(position_offset, position_offset + x.size(1), device=x.device).unsqueeze(0)
             x = x + self.position_embeddings(positions)
             x = x * x_mask.unsqueeze(-1)
         elif self.use_static_pos_emb:
-            positions = torch.arange(x.size(1), device=x.device).to(dtype=x.dtype)
+            positions = torch.arange(position_offset, position_offset + x.size(1), device=x.device).to(dtype=x.dtype)
             x = x + self.position_embeddings(positions)
             x = x * x_mask.unsqueeze(-1)
 
