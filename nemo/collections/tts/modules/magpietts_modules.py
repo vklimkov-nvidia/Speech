@@ -1180,6 +1180,15 @@ class AcousticDecoderTransformer(torch.nn.Module):
                 raise ValueError(f"Expected one semantic codebook, received {num_received}")
             if vector_quantizer is None:
                 raise ValueError("vector_quantizer is required when semantic_layer is configured")
+            if semantic_tokens.size(-1) < audio_mask.size(1):
+                raise ValueError(
+                    "Semantic token time dimension must cover the acoustic input, received "
+                    f"{semantic_tokens.size(-1)} and {audio_mask.size(1)}"
+                )
+            # Multi-turn preparation may retain the terminal semantic frame after
+            # the acoustic EOS latent has been removed. Align the conditioning to
+            # the exact time axis consumed by this refinement stage.
+            semantic_tokens = semantic_tokens[..., : audio_mask.size(1)]
             semantic_tokens_rearrange = rearrange(semantic_tokens, 'B C T -> C B T')
             semantic_codes = vector_quantizer.decode(indices=semantic_tokens_rearrange, input_len=audio_lens)
             semantic_codes = rearrange(semantic_codes, 'B D T -> B T D')

@@ -152,6 +152,23 @@ def test_uses_four_distinct_three_layer_stage_transformers():
     assert not hasattr(decoder, 'maskgit_step_projection')
 
 
+def test_semantic_conditioning_trims_terminal_frame_to_acoustic_input():
+    torch.manual_seed(0)
+    decoder = _make_decoder()
+    inputs = torch.randn(2, 3, 16)
+    audio_lens = torch.tensor([3, 2])
+    semantic_tokens = torch.randint(0, 8, (2, 1, 4))
+    acoustic_tokens = torch.randint(0, 8, (2, 12, 3))
+
+    predicted, logits, loss = decoder(
+        inputs, audio_lens, semantic_tokens, _VectorQuantizer(), acoustic_tokens=acoustic_tokens
+    )
+
+    assert predicted.shape == acoustic_tokens.shape
+    assert logits.shape == (2, 3, 12 * 8)
+    assert torch.isfinite(loss)
+
+
 def test_four_stage_loss_is_finite_and_backpropagates():
     torch.manual_seed(0)
     decoder = _make_decoder()
