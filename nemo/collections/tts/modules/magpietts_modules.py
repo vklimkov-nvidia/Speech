@@ -790,6 +790,22 @@ class LocalTransformerHelper:
         return codes
 
 
+def create_infill_mask(input_lens, infill_min, infill_max, infill_dist):
+    batch_size = input_lens.shape[0]
+    len_mask = get_mask_from_lengths(input_lens)
+    max_len = len_mask.shape[1]
+
+    infill_percent = infill_dist.sample(sample_shape=torch.Size([batch_size])).to(input_lens.device)
+    infill_percent = infill_min + (infill_max - infill_min) * infill_percent
+    infill_len = infill_percent * input_lens.float()
+    infill_rank = torch.clamp_min(infill_len - 1, 0).long().unsqueeze(1)
+
+    infill_vals = torch.rand(size=len_mask.shape, device=input_lens.device) * len_mask
+    infill_topk = torch.topk(infill_vals, k=max_len, dim=1, sorted=True).values
+    infill_min_val = torch.gather(infill_topk, index=infill_rank, dim=1)
+    return (infill_vals >= infill_min_val) * len_mask
+
+
 class AcousticDecoder(torch.nn.Module):
     """ """
 
@@ -1133,11 +1149,20 @@ class AcousticDecoderTransformer(torch.nn.Module):
         acoustic_tokens=None,
         sampling_temperature=None,
         sampling_topk=None,
+        loss_mask=None,
     ):
         if acoustic_tokens is not None and acoustic_tokens.size(1) != self.num_codebooks:
             raise ValueError(f"Expected {self.num_codebooks} acoustic codebooks, received {acoustic_tokens.size(1)}")
 
         audio_mask = get_mask_from_lengths(audio_lens)
+        if loss_mask is None:
+            training_mask = audio_mask
+        else:
+            if loss_mask.shape != audio_mask.shape:
+                raise ValueError(
+                    f"loss_mask shape {loss_mask.shape} does not match audio mask shape {audio_mask.shape}"
+                )
+            training_mask = loss_mask.to(device=audio_mask.device, dtype=torch.bool) & audio_mask
         if audio_mask.size(1) != inputs.size(1):
             raise ValueError(
                 f"Input time dimension {inputs.size(1)} does not match maximum audio length {audio_mask.size(1)}"
@@ -1177,7 +1202,8 @@ class AcousticDecoderTransformer(torch.nn.Module):
             dtype=inputs.dtype,
             device=inputs.device,
         )
-        targets = rearrange(acoustic_tokens, 'B C T -> B T C').long() if acoustic_tokens is not None else None
+        targets = rearrange(acoustic_tokens, "B C T -> B T C").long() if acoustic_tokens is not None else None
+        safe_targets = targets.masked_fill(~training_mask[..., None], 0) if targets is not None else None
         total_loss = torch.zeros((), device=inputs.device, dtype=torch.float32) if targets is not None else None
         temperature = self.sampling_temperature if sampling_temperature is None else sampling_temperature
         topk = self.sampling_topk if sampling_topk is None else sampling_topk
@@ -1195,7 +1221,8 @@ class AcousticDecoderTransformer(torch.nn.Module):
             )
 
             if targets is not None:
-                total_loss = total_loss + self._compute_stage_loss(logits, targets, unresolved)
+                supervised = unresolved & training_mask[..., None]
+                total_loss = total_loss + self._compute_stage_loss(logits, safe_targets, supervised)
 
             sampling_logits = logits
             if self.predict_eos:
@@ -1207,7 +1234,7 @@ class AcousticDecoderTransformer(torch.nn.Module):
             selected_logits = torch.where(selected[..., None], logits, selected_logits)
             predicted = torch.where(selected, candidates, predicted)
 
-            feedback_tokens = targets if targets is not None else candidates
+            feedback_tokens = safe_targets if targets is not None else candidates
             known_tokens = torch.where(selected, feedback_tokens, known_tokens)
             known = known | selected
             unresolved = unresolved & ~selected

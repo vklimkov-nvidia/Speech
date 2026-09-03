@@ -31,10 +31,7 @@ from transformers import AutoConfig, AutoModelForCausalLM
 
 from nemo.collections.audio.parts.utils.transforms import resample
 from nemo.collections.speechlm2.parts.pretrained import set_model_dict_for_partial_init
-from nemo.collections.tts.data.text_to_speech_dataset_lhotse import (
-    check_text_embedding_matches_tokenizer,
-    setup_tokenizers,
-)
+from nemo.collections.tts.data.text_to_speech_dataset_lhotse import setup_tokenizers
 from nemo.collections.tts.models import AcousticModelWithContext, AudioCodecModel, MossAudioCodecModel
 from nemo.collections.tts.modules import transformer_2501
 from nemo.collections.tts.modules.audio_codec_modules import VectorQuantizerIndexConverter
@@ -510,6 +507,15 @@ class EasyMagpieTTSInferenceModel(ModelPT):
         else:
             raise ValueError(f"Unknown conditioning type {self.cond_type}")
 
+        if self.cond_type in ("projection", "projection_semantic"):
+            self.audio_infill_min = cfg.get("audio_infill_min", 0.25)
+            self.audio_infill_max = cfg.get("audio_infill_max", 1.0)
+            audio_infill_beta = cfg.get("audio_infill_beta", 2.0)
+            self.audio_infill_dist = torch.distributions.beta.Beta(
+                concentration1=1.0, concentration0=audio_infill_beta
+            )
+            self.audio_mask_emb = torch.nn.Parameter(torch.zeros([1, 1, cfg.hidden_dim]))
+
         if self.acoustic_decoder_transformer is not None:
             has_semantic_conditioning = self.acoustic_decoder_transformer.semantic_layer is not None
             if num_backbone_channels not in (0, 1):
@@ -976,12 +982,6 @@ class EasyMagpieTTSInferenceModel(ModelPT):
         return state_dict
 
     def load_state_dict(self, state_dict, strict=True):
-        check_text_embedding_matches_tokenizer(
-            state_dict,
-            text_embedding=getattr(self, "text_embedding", None),
-            tokenizer=self.tokenizer,
-            model_cfg=self.cfg,
-        )
         if not strict:
             return super().load_state_dict(state_dict, strict=False)
         modules_to_skip = self._get_state_dict_keys_to_exclude()
@@ -1036,7 +1036,9 @@ class EasyMagpieTTSInferenceModel(ModelPT):
             codes = codes[:, :, : codes_len.max()]
         return codes, codes_len
 
-    def embed_audio_tokens(self, audio_tokens, num_codebooks):
+    def embed_audio_tokens(self, audio_tokens, num_codebooks=None):
+        if num_codebooks is None:
+            num_codebooks = audio_tokens.size(1) // self.frame_stacking_factor
         # audio_tokens: (B, C, T')
         # Add and average the embeddings of the audio tokens across the codebooks
         """Embed and average audio-code tokens across codebook channels.
@@ -1059,7 +1061,9 @@ class EasyMagpieTTSInferenceModel(ModelPT):
         audio_embedding = self.audio_in_projection(audio_embedding)
         return audio_embedding
 
-    def embed_audio_tokens_with_projection(self, audio_tokens, audio_tokens_lens, num_codebooks, projection):
+    def embed_audio_tokens_with_projection(
+        self, audio_tokens, audio_tokens_lens, num_codebooks, projection, dropout_codes=False
+    ):
         audio_tokens_rearrange = audio_tokens[:, :num_codebooks, :]
         audio_tokens_rearrange = rearrange(audio_tokens_rearrange, 'B C T -> C B T')
         # [B, D, T]
@@ -1068,6 +1072,16 @@ class EasyMagpieTTSInferenceModel(ModelPT):
         )
         audio_codes = rearrange(audio_codes, 'B D T -> B T D')
         audio_codes = projection(audio_codes)
+
+        if dropout_codes:
+            infill_mask = create_infill_mask(
+                input_lens=audio_tokens_lens,
+                infill_min=self.audio_infill_min,
+                infill_max=self.audio_infill_max,
+                infill_dist=self.audio_infill_dist,
+            )
+            infill_mask = rearrange(infill_mask, "B T -> B T 1")
+            audio_codes = torch.where(infill_mask, audio_codes, self.audio_mask_emb)
 
         audio_codes = torch.where(
             torch.any(audio_tokens == self.audio_bos_id, dim=1).unsqueeze(2), self.audio_bos_emb, audio_codes

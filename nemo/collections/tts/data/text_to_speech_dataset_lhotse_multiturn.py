@@ -11,6 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from contextlib import contextmanager
+
 import random
 import re
 from typing import Dict, List, Union
@@ -26,7 +28,6 @@ from lhotse.utils import ifnone
 from omegaconf import DictConfig
 
 from nemo.collections.common.tokenizers.text_to_speech.tts_tokenizers import IPABPETokenizer
-from nemo.collections.speechlm2.parts.precision import fp32_precision
 from nemo.collections.tts.data.text_to_speech_dataset_lhotse import setup_tokenizers
 from nemo.collections.tts.parts.utils.tts_dataset_utils import (
     beta_binomial_prior_distribution,
@@ -35,6 +36,22 @@ from nemo.collections.tts.parts.utils.tts_dataset_utils import (
 )
 from nemo.core.classes.common import safe_instantiate
 from nemo.utils import logging
+
+
+
+@contextmanager
+def fp32_precision():
+    """Temporarily restore FP32 defaults without importing the SpeechLM2 package."""
+    default_dtype = torch.get_default_dtype()
+    torch.set_default_dtype(torch.float32)
+    try:
+        with torch.amp.autocast(
+            device_type="cuda" if torch.cuda.is_available() else "cpu",
+            dtype=torch.float32,
+        ):
+            yield
+    finally:
+        torch.set_default_dtype(default_dtype)
 
 
 def check_speaker_format(item: str):

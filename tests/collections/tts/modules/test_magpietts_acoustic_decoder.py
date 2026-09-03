@@ -202,6 +202,31 @@ def test_no_semantic_decoder_predicts_all_stacked_acoustic_channels_and_eos():
     assert all(parameter.grad is None or torch.isfinite(parameter.grad).all() for parameter in decoder.parameters())
 
 
+def test_loss_mask_excludes_multiturn_user_special_tokens():
+    torch.manual_seed(0)
+    decoder = _make_decoder()
+    inputs = torch.randn(2, 4, 16)
+    audio_lens = torch.tensor([4, 3])
+    semantic_tokens = torch.randint(0, 8, (2, 1, 4))
+    acoustic_tokens = torch.randint(0, 8, (2, 12, 4))
+    acoustic_tokens[:, :, 0] = 15  # Special user token outside this decoder vocab.
+    loss_mask = torch.ones(2, 4, dtype=torch.bool)
+    loss_mask[:, 0] = False
+
+    _, _, loss = decoder(
+        inputs=inputs,
+        audio_lens=audio_lens,
+        semantic_tokens=semantic_tokens,
+        vector_quantizer=_VectorQuantizer(),
+        acoustic_tokens=acoustic_tokens,
+        loss_mask=loss_mask,
+    )
+    loss.backward()
+
+    assert torch.isfinite(loss)
+    assert all(parameter.grad is None or torch.isfinite(parameter.grad).all() for parameter in decoder.parameters())
+
+
 def test_stage_specific_caches_match_full_sequence_inference():
     torch.manual_seed(0)
     full_decoder = _make_decoder().eval()
