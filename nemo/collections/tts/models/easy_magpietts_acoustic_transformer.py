@@ -1531,11 +1531,14 @@ class EasyMagpieTTSAcousticTransformerModel(EasyMagpieTTSInferenceModel):
             if self.cond_type == "embedding":
                 user_audio_embedded = self.embed_audio_tokens(user_audio_codes)  # (B, T'-1, E)
             else:
+                user_audio_projection = (
+                    self.context_code_proj if self.cond_type == "projection_semantic" else self.decoder_code_proj
+                )
                 user_audio_embedded = self.embed_audio_tokens_with_projection(
                     user_audio_codes,
                     user_audio_codes_lens,
                     self.num_audio_codebooks,
-                    self.decoder_code_proj,
+                    user_audio_projection,
                 )
 
             B = batch["text"].shape[0]
