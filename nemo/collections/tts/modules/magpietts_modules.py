@@ -1212,7 +1212,16 @@ class AcousticDecoderTransformer(torch.nn.Module):
             device=inputs.device,
         )
         targets = rearrange(acoustic_tokens, "B C T -> B T C").long() if acoustic_tokens is not None else None
-        safe_targets = targets.masked_fill(~training_mask[..., None], 0) if targets is not None else None
+        if targets is not None:
+            target_in_vocab = (targets >= 0) & (targets < self.num_tokens_per_codebook)
+            supervised_targets = training_mask[..., None] & target_in_vocab
+            # Multi-turn streams can contain semantic/backbone-only special tokens
+            # at otherwise valid frames. Acoustic heads that do not predict those
+            # tokens must neither pass them to cross entropy nor embed them as
+            # teacher-forced feedback for later refinement stages.
+            safe_targets = targets.masked_fill(~supervised_targets, 0)
+        else:
+            supervised_targets = None
         total_loss = torch.zeros((), device=inputs.device, dtype=torch.float32) if targets is not None else None
         temperature = self.sampling_temperature if sampling_temperature is None else sampling_temperature
         topk = self.sampling_topk if sampling_topk is None else sampling_topk
@@ -1230,7 +1239,7 @@ class AcousticDecoderTransformer(torch.nn.Module):
             )
 
             if targets is not None:
-                supervised = unresolved & training_mask[..., None]
+                supervised = unresolved & supervised_targets
                 total_loss = total_loss + self._compute_stage_loss(logits, safe_targets, supervised)
 
             sampling_logits = logits

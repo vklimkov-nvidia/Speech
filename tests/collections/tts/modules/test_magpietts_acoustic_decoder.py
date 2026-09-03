@@ -244,6 +244,40 @@ def test_loss_mask_excludes_multiturn_user_special_tokens():
     assert all(parameter.grad is None or torch.isfinite(parameter.grad).all() for parameter in decoder.parameters())
 
 
+def test_non_predictable_special_tokens_are_excluded_from_loss_and_feedback():
+    torch.manual_seed(0)
+    decoder = _make_decoder()
+    inputs = torch.randn(2, 4, 16)
+    audio_lens = torch.tensor([4, 3])
+    semantic_tokens = torch.randint(0, 8, (2, 1, 4))
+    acoustic_tokens = torch.randint(0, 8, (2, 12, 4))
+    acoustic_tokens[:, :, 0] = 15  # Semantic/backbone special token outside the acoustic vocabulary.
+
+    _, _, loss_with_special = decoder(
+        inputs=inputs,
+        audio_lens=audio_lens,
+        semantic_tokens=semantic_tokens,
+        vector_quantizer=_VectorQuantizer(),
+        acoustic_tokens=acoustic_tokens,
+    )
+
+    explicit_loss_mask = torch.ones(2, 4, dtype=torch.bool)
+    explicit_loss_mask[:, 0] = False
+    _, _, loss_with_mask = decoder(
+        inputs=inputs,
+        audio_lens=audio_lens,
+        semantic_tokens=semantic_tokens,
+        vector_quantizer=_VectorQuantizer(),
+        acoustic_tokens=acoustic_tokens,
+        loss_mask=explicit_loss_mask,
+    )
+    loss_with_special.backward()
+
+    assert torch.isfinite(loss_with_special)
+    assert torch.allclose(loss_with_special, loss_with_mask)
+    assert all(parameter.grad is None or torch.isfinite(parameter.grad).all() for parameter in decoder.parameters())
+
+
 def test_stage_specific_caches_match_full_sequence_inference():
     torch.manual_seed(0)
     full_decoder = _make_decoder().eval()
