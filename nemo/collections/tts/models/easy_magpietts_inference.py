@@ -1151,6 +1151,14 @@ class EasyMagpieTTSInferenceModel(ModelPT):
         Returns:
             Phoneme embeddings shaped ``(B, T, E)``.
         """
+        if self.num_audio_codebooks_train == 0 and phoneme_tokens.size(1) == 0:
+            # No-semantic-codebook inference does not autoregressively feed back a
+            # phoneme stream. Keep the input shape valid without changing the
+            # non-empty phoneme embeddings used during training.
+            return self.phoneme_embeddings[0].weight.new_zeros(
+                phoneme_tokens.size(0), phoneme_tokens.size(2), self.phoneme_embeddings[0].embedding_dim
+            )
+
         phoneme_embedding = None
         for c in range(phoneme_tokens.size(1)):
             embedding = self.phoneme_embeddings[c](phoneme_tokens[:, c, :])
@@ -2130,7 +2138,7 @@ class EasyMagpieTTSInferenceModel(ModelPT):
                         last_phoneme_emb = self.embed_phoneme_tokens(last_phoneme_tokens.unsqueeze(2))  # (B, 1, E)
 
                         # Match training: PAD phoneme inputs contribute zero embedding.
-                        if self.cfg.get("use_multiturn_dataset", False):
+                        if self.cfg.get("use_multiturn_dataset", False) and last_phoneme_tokens.size(1) > 0:
                             phoneme_pad_id = getattr(self.phoneme_tokenizer, "pad", None)
                             if phoneme_pad_id is not None:
                                 # Same convention as training: check first stacked phoneme channel.

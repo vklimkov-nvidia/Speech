@@ -130,6 +130,23 @@ def test_predict_audio_codes_supports_zero_semantic_stacked_refinement():
     assert model.acoustic_decoder_transformer.semantic_tokens is None
 
 
+def test_embed_phoneme_tokens_supports_zero_channels_without_changing_training_embeddings():
+    model = EasyMagpieTTSInferenceModel.__new__(EasyMagpieTTSInferenceModel)
+    torch.nn.Module.__init__(model)
+    model.num_audio_codebooks_train = 0
+    model.phoneme_embeddings = torch.nn.ModuleList([torch.nn.Embedding(8, 4)])
+
+    empty_tokens = torch.empty(2, 0, 3, dtype=torch.long)
+    empty_embedding = EasyMagpieTTSInferenceModel.embed_phoneme_tokens(model, empty_tokens)
+    assert empty_embedding.shape == (2, 3, 4)
+    assert torch.count_nonzero(empty_embedding) == 0
+
+    populated_tokens = torch.tensor([[[1, 2, 3]], [[4, 5, 6]]])
+    populated_embedding = EasyMagpieTTSInferenceModel.embed_phoneme_tokens(model, populated_tokens)
+    expected_embedding = model.phoneme_embeddings[0](populated_tokens[:, 0, :])
+    assert torch.equal(populated_embedding, expected_embedding)
+
+
 def test_process_predictions_keeps_appended_acoustic_codebooks():
     model = MagicMock(spec=EasyMagpieTTSInferenceModel)
     model.frame_stacking_factor = 1
