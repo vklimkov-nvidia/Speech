@@ -16,7 +16,7 @@
 from __future__ import annotations
 
 from enum import Enum
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 import torch
@@ -40,6 +40,19 @@ class LocalTransformerType(PrettyStrEnum):
     NO_LT = "none"
     AR = "autoregressive"
     MASKGIT = "maskgit"
+    PARALLEL = "parallel"
+
+
+class AcousticRefinerOrder(PrettyStrEnum):
+    """
+    Enum for the order in which the AcousticRefiner commits codebooks.
+    These strings are the values allowed in the YAML config file.
+    """
+
+    # commit the codebooks the current refinement step is most confident about
+    CONFIDENCE = "confidence"
+    # commit codebooks in codebook order, following the coarse-to-fine hierarchy of the codec
+    CODEBOOK = "codebook"
 
 
 class EOSDetectionMethod(PrettyStrEnum):
@@ -785,3 +798,314 @@ class LocalTransformerHelper:
         if use_cfg:
             codes = codes[:actual_batch_size]
         return codes
+
+
+# target value ignored by cross entropy, matching its default
+_IGNORE_INDEX = -100
+
+
+class AcousticRefiner(torch.nn.Module):
+    """
+    Refines acoustic codes predicted in parallel.
+    Defines N transformers, that take as input hidden state, currently predicted
+    acoustic codes and predict missing codes.
+    Input embeddings and output projections are shared between all transformers.
+    """
+
+    # this represents how many transformers there are,
+    # and how many codebooks we commit after each of them.
+    PREDICTION_SCHEDULE = (1, 3, 4, 4)
+
+    def __init__(
+        self,
+        # params applied to each transformer
+        n_layers,
+        d_model,
+        d_ffn,
+        sa_n_heads,
+        # defines overall refinement process
+        audio_embeddings,  # shared with backbone
+        num_audio_codebooks,
+        audio_eos_id,
+        mask_token_id,
+        codebook_size,
+        max_length_causal_mask,
+        prediction_schedule=PREDICTION_SCHEDULE,
+        commit_order=AcousticRefinerOrder.CODEBOOK,
+    ):
+        super().__init__()
+
+        # the backbone predicts the leading codebook(s) on its own, the schedule covers the rest
+        num_backbone_codebooks = num_audio_codebooks - sum(prediction_schedule)
+        if num_backbone_codebooks < 1:
+            raise ValueError(
+                f"prediction_schedule {prediction_schedule} commits {sum(prediction_schedule)} of "
+                f"{num_audio_codebooks} codebooks, leaving none for the backbone to predict"
+            )
+
+        # separate transformer for every refinement step
+        self.transformers = torch.nn.ModuleList(
+            [
+                transformer_2501.Transformer(
+                    n_layers=n_layers,
+                    d_model=d_model,
+                    d_ffn=d_ffn,
+                    sa_n_heads=sa_n_heads,
+                    kernel_size=1,
+                    is_causal=True,
+                    max_length_causal_mask=max_length_causal_mask,
+                    # backbone hidden states already carry its positional encoding
+                    use_learnable_pos_emb=False,
+                    # steps are chained, so normalize to keep the scale seen by `out_proj` consistent
+                    apply_norm_out=True,
+                )
+                for _ in range(len(prediction_schedule))
+            ]
+        )
+
+        # reference to audio embeddings
+        self.audio_embeddings = audio_embeddings
+
+        # no need for self.local_transformer_audio_out_projection
+        assert (
+            self.audio_embeddings[0].weight.shape[1] == d_model
+        ), "We expect local transformer to have same dimension as audio embeddings"
+
+        # one projection layer for all codebooks, covering codec tokens only (no special tokens)
+        self.out_proj = torch.nn.Linear(d_model, num_audio_codebooks * codebook_size)
+
+        # codebook range every step commits when committing in codebook order
+        self.codebook_order_ranges = []
+        next_codebook = num_backbone_codebooks
+        for num_to_commit in prediction_schedule:
+            self.codebook_order_ranges.append((next_codebook, next_codebook + num_to_commit))
+            next_codebook += num_to_commit
+
+        # access
+        self.prediction_schedule = prediction_schedule
+        self.commit_order = AcousticRefinerOrder(commit_order)
+        self.num_backbone_codebooks = num_backbone_codebooks
+        self.num_audio_codebooks = num_audio_codebooks
+        self.audio_eos_id = audio_eos_id
+        self.mask_token_id = mask_token_id
+        self.codebook_size = codebook_size
+        self.use_cache = False
+        self.frames_cached = 0
+
+    def compute_loss(self, hidden_states, target_codes, lengths) -> torch.Tensor:
+        """
+        computes loss for the refiner.
+        for that iteratively predicts codes with each `self.transformers`
+
+        Codebooks a step has not committed yet are hidden behind the mask token, and every step is
+        supervised on all of them. Committed codebooks are teacher forced with the target codes,
+        while which codebooks get committed follows the confidence of the step that predicted them,
+        matching the order used at inference time.
+
+        hidden_states  (batch x time x d_model)
+        target_codes  (batch x time x num_audio_codebooks)
+        lengths  (batch)
+
+        loss: cross entropy averaged over every codebook prediction made by any step
+        """
+        target_codes = target_codes.long()
+        time_mask = get_mask_from_lengths(lengths, x=target_codes[:, :, 0])
+
+        # `out_proj` only covers codec tokens, so frames holding a special token (the trailing EOS
+        # frame) have no valid target and are left out of the loss.
+        has_target = time_mask.unsqueeze(-1) & (target_codes < self.codebook_size)
+        ignored = torch.full_like(target_codes, _IGNORE_INDEX)
+
+        committed = torch.zeros_like(target_codes, dtype=torch.bool)
+        committed[:, :, : self.num_backbone_codebooks] = True
+
+        loss_sum = hidden_states.new_zeros(())
+        num_predictions = torch.zeros((), dtype=torch.long, device=target_codes.device)
+        last_step = len(self.prediction_schedule) - 1
+        for step, num_to_commit in enumerate(self.prediction_schedule):
+            input_codes = torch.where(committed, target_codes, self.mask_token_id)
+            x = hidden_states + self._embed_codes(input_codes)
+            hidden_states = self.transformers[step](x, time_mask)['output']
+            logits = self.out_proj(hidden_states).reshape(target_codes.shape + (self.codebook_size,))
+
+            if self.commit_order == AcousticRefinerOrder.CODEBOOK:
+                selected = self._select_next_codebooks(step, committed)
+            elif step < last_step:
+                selected = self._select_most_confident(logits, committed, num_to_commit)
+            else:
+                # the last step commits whatever confidence based selection has left over
+                selected = ~committed
+
+            # a step is supervised only on the codebooks it commits, so every codebook contributes
+            # exactly one prediction to the loss and none of them is weighted more than the others
+            step_targets = torch.where(has_target & selected, target_codes, ignored)
+            step_count = (step_targets != _IGNORE_INDEX).sum()
+            step_sum = torch.nn.functional.cross_entropy(
+                logits.reshape(-1, self.codebook_size),
+                step_targets.reshape(-1),
+                ignore_index=_IGNORE_INDEX,
+                reduction='sum',
+            )
+            loss_sum = loss_sum + step_sum
+            num_predictions = num_predictions + step_count
+            committed = committed | selected
+
+        return loss_sum / num_predictions.clamp(min=1)
+
+    def reset_cache(self, use_cache: bool = False):
+        """
+        Resets the KV cache of every refinement step. Call this once before generating an utterance,
+        not once per frame: each step keeps one cache entry per frame it has seen.
+        """
+        self.use_cache = use_cache
+        self.frames_cached = 0
+        for transformer in self.transformers:
+            transformer.reset_cache(use_cache=use_cache)
+
+    @torch.no_grad()
+    def refine_codes(
+        self,
+        hidden_states: torch.Tensor,  # (batch x frames x d_model)
+        pred_codes: torch.Tensor,  # (batch x frames x num_audio_codebooks)
+        temperature: float = 1.0,
+        topk: int = 80,
+        use_cfg: bool = False,
+        cfg_scale: float = 1.0,
+        sanitize_logits: bool = False,
+    ) -> torch.Tensor:
+        """
+        Samples the acoustic codes of the given frames, one refinement step at a time.
+
+        Mirrors `compute_loss`, with the sampled codes taking the place of the teacher forced ones:
+        the leading codebooks come from the backbone through `pred_codes` and the rest start masked,
+        then every step samples the codebooks it commits and hands them to the next step.
+
+        Pass only the frames the backbone has just produced. This transformer stack reads its left
+        context from its input and the KV cache only spares it the attention projections, so the
+        frames the cache already holds are padded back in here rather than by the caller: nothing
+        those positions hold ever reaches a key or a value, only their count matters. Once the cache
+        holds a frame, one frame per call is the only option. Without the cache the whole sequence is
+        refined coherently, which is what training does.
+
+        Under CFG the batch holds the conditional stream followed by the unconditional one. Both
+        streams have to carry the same codes, so every decision is taken once on the guided
+        distribution and mirrored, and only the conditional half is returned.
+
+        returns the refined codes of the given frames  (batch x frames x num_audio_codebooks)
+        """
+        num_streams = pred_codes.size(0) // 2 if use_cfg else pred_codes.size(0)
+        new_frames = pred_codes.size(1)
+        if self.frames_cached > 0 and new_frames != 1:
+            raise ValueError(
+                "Once the cache holds a frame this stack can only step one frame at a time, "
+                f"but {new_frames} frames were passed"
+            )
+
+        committed = torch.zeros_like(pred_codes, dtype=torch.bool)
+        committed[:, :, : self.num_backbone_codebooks] = True
+        codes = torch.where(committed, pred_codes, self.mask_token_id)
+
+        # placeholders standing in for the frames the cache serves, see the note above
+        hidden_states = _pad_frames_left(hidden_states, self.frames_cached)
+        codes = _pad_frames_left(codes, self.frames_cached)
+        frame_mask = torch.ones(codes.shape[:2], device=codes.device)
+
+        last_step = len(self.prediction_schedule) - 1
+        for step, num_to_commit in enumerate[Any](self.prediction_schedule):
+            x = hidden_states + self._embed_codes(codes)
+            hidden_states = self.transformers[step](x, frame_mask)['output']
+            logits = self.out_proj(hidden_states[:, -new_frames:])
+            logits = logits.reshape(logits.shape[:2] + (self.num_audio_codebooks, self.codebook_size))
+
+            if use_cfg:
+                logits = cfg_scale * logits[:num_streams] + (1.0 - cfg_scale) * logits[num_streams:]
+            if sanitize_logits:
+                logits = torch.nan_to_num(logits, nan=0.0, posinf=100.0, neginf=-100.0)
+                logits = logits.clamp(min=-100.0, max=100.0)
+
+            if self.commit_order == AcousticRefinerOrder.CODEBOOK:
+                selected = self._select_next_codebooks(step, committed[:num_streams])
+            elif step < last_step:
+                selected = self._select_most_confident(logits, committed[:num_streams], num_to_commit)
+            else:
+                # the last step commits whatever confidence based selection has left over
+                selected = ~committed[:num_streams]
+
+            sampled = self._sample_codes(logits, temperature, topk)
+            if use_cfg:
+                selected = selected.repeat(2, 1, 1)
+                sampled = sampled.repeat(2, 1, 1)
+            committed = committed | selected
+            codes[:, -new_frames:] = torch.where(selected, sampled, codes[:, -new_frames:])
+
+        if self.use_cache:
+            self.frames_cached += new_frames
+
+        return codes[:num_streams, -new_frames:]
+
+    def _embed_codes(self, codes):
+        """
+        Embeds codes the way the backbone does: sum of the per-codebook embeddings, averaged.
+
+        codes  (batch x time x num_audio_codebooks)
+        """
+        embedded = self.audio_embeddings[0](codes[:, :, 0])
+        for codebook in range(1, codes.size(-1)):
+            embedded = embedded + self.audio_embeddings[codebook](codes[:, :, codebook])
+        return embedded / codes.size(-1)
+
+    def _sample_codes(self, logits, temperature, topk):
+        """
+        Samples one token per codebook, keeping only the `topk` most likely tokens of each codebook.
+
+        logits  (batch x time x num_audio_codebooks x codebook_size)
+
+        returns sampled codes  (batch x time x num_audio_codebooks)
+        """
+        cutoff = logits.topk(min(topk, self.codebook_size), dim=-1).values[..., -1:]
+        logits = logits.masked_fill(logits < cutoff, float('-inf'))
+        if temperature <= 0.0:
+            return logits.argmax(dim=-1)
+        probs = torch.softmax(logits / temperature, dim=-1)
+        return torch.multinomial(probs.reshape(-1, self.codebook_size), num_samples=1).reshape(probs.shape[:-1])
+
+    def _select_next_codebooks(self, step, committed):
+        """
+        Selects the codebooks `step` commits when going in codebook order, which follows the
+        coarse-to-fine hierarchy of the codec rather than what the model happens to be sure about.
+
+        committed  (batch x time x num_audio_codebooks)
+
+        returns the mask of newly selected codebooks  (batch x time x num_audio_codebooks)
+        """
+        first_codebook, last_codebook = self.codebook_order_ranges[step]
+        selected = torch.zeros_like(committed)
+        selected[:, :, first_codebook:last_codebook] = True
+        return selected
+
+    @torch.no_grad()
+    def _select_most_confident(self, logits, committed, num_to_commit):
+        """
+        Picks `num_to_commit` of the not yet committed codebooks per timestamp, taking the ones the
+        current step is most confident about. Selection is discrete, so it stays out of the graph.
+
+        logits  (batch x time x num_audio_codebooks x codebook_size)
+        committed  (batch x time x num_audio_codebooks)
+
+        returns the mask of newly selected codebooks  (batch x time x num_audio_codebooks)
+        """
+        # Confidence of a codebook is the probability of its most likely token. Raw logits are not
+        # comparable across codebooks, since every codebook has its own output head with its own
+        # scale, so normalizing per codebook is what makes the top-k across codebooks meaningful.
+        confidence = logits.softmax(dim=-1).amax(dim=-1)
+        # confidence is in [0, 1], so -1 keeps already committed codebooks out of the selection
+        confidence = confidence.masked_fill(committed, -1.0)
+        selected = confidence.topk(num_to_commit, dim=-1).indices
+        return torch.zeros_like(committed).scatter(dim=-1, index=selected, value=True)
+
+
+def _pad_frames_left(x: Tensor, frames: int) -> Tensor:
+    """Prepends `frames` zeroed positions along time to a (batch x time x channels) tensor."""
+    if frames == 0:
+        return x
+    return torch.nn.functional.pad(x, (0, 0, frames, 0))

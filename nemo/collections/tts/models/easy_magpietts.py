@@ -1210,8 +1210,7 @@ class EasyMagpieTTSModel(EasyMagpieTTSInferenceModel):
         # Compute local transformer loss if applicable
         local_transformer_loss = None
         local_transformer_logits = None
-        if self.local_transformer_type != LocalTransformerType.NO_LT:
-            assert self.local_transformer_type == LocalTransformerType.AR, "Unexpected local transformer type"
+        if self.local_transformer_type == LocalTransformerType.AR:
             local_transformer_logits = self._lt_helper.compute_logits(
                 pred_embeddings, audio_codes_target, targets_offset_by_one=False
             )
@@ -1221,8 +1220,15 @@ class EasyMagpieTTSModel(EasyMagpieTTSInferenceModel):
                 audio_codes_lens_target,
                 agent_mask_target=agent_mask if self.cfg.get("mask_user_on_loss", False) else None,
             )
-
-            loss = loss + self.local_transformer_loss_scale * local_transformer_loss
+        elif self.local_transformer_type == LocalTransformerType.PARALLEL:
+            local_transformer_loss = self._lt_helper.compute_loss(
+                hidden_states=pred_embeddings,
+                target_codes=audio_codes_target,
+                lengths=audio_codes_lens_target,
+            )
+        else:
+            raise ValueError(f"Unexpected local transformer type for easy magpietts: {self.local_transformer_type}")
+        loss = loss + self.local_transformer_loss_scale * local_transformer_loss
 
         # Compute phoneme loss if applicable
         phoneme_loss = None

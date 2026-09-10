@@ -44,6 +44,7 @@ from nemo.collections.tts.modules.magpietts_modules import (
     LocalTransformerType,
     SpecialAudioToken,
     add_special_tokens,
+    AcousticRefiner,
 )
 from nemo.collections.tts.parts.utils.helpers import get_mask_from_lengths
 from nemo.collections.tts.parts.utils.tts_dataset_utils import tokenize_text_with_phoneme_spans
@@ -606,7 +607,7 @@ class EasyMagpieTTSInferenceModel(ModelPT):
 
         self.local_transformer_type = LocalTransformerType(cfg.get('local_transformer_type', 'none').lower())
         logging.info(f"Local transformer type: {self.local_transformer_type}")
-        if self.local_transformer_type != LocalTransformerType.NO_LT:
+        if self.local_transformer_type == LocalTransformerType.AR or self.local_transformer_type == LocalTransformerType.MASKGIT:
             local_transformer_hidden_dim = cfg.get('local_transformer_hidden_dim', 256)
             if local_transformer_hidden_dim != cfg.hidden_dim:
                 self.local_transformer_in_projection = nn.Linear(cfg.hidden_dim, local_transformer_hidden_dim)
@@ -619,8 +620,8 @@ class EasyMagpieTTSInferenceModel(ModelPT):
                 sa_n_heads=self.cfg.get('local_transformer_n_heads', 1),
                 kernel_size=1,
                 is_causal=self.local_transformer_type == LocalTransformerType.AR,
-                max_length_causal_mask=self.num_audio_codebooks * self.frame_stacking_factor + 2,
                 use_learnable_pos_emb=True,
+                max_length_causal_mask=self.num_audio_codebooks * self.frame_stacking_factor + 2,
             )
             # Projection from local_transformer_hidden_dim to audio_embedding_dim (Identity if same)
             if self.audio_embedding_dim != local_transformer_hidden_dim:
@@ -650,6 +651,19 @@ class EasyMagpieTTSInferenceModel(ModelPT):
                 local_transformer_out_projections=self.local_transformer_out_projections,
                 num_audio_codebooks=self.num_audio_codebooks * self.frame_stacking_factor,
                 frame_stacking_factor=1,
+                audio_eos_id=self.audio_eos_id,
+                mask_token_id=self.mask_token_id,
+                codebook_size=self.codebook_size,
+            )
+        elif self.local_transformer_type == LocalTransformerType.PARALLEL:
+            assert self.frame_stacking_factor == 1, "Parallel local transformer only supports frame_stacking_factor=1"
+            self._lt_helper = AcousticRefiner(
+                n_layers=self.cfg.get('local_transformer_n_layers', 2),
+                d_model=self.audio_embedding_dim,
+                d_ffn=self.audio_embedding_dim * 4,
+                sa_n_heads=self.cfg.get('local_transformer_n_heads', 1),
+                audio_embeddings=self.audio_embeddings,
+                num_audio_codebooks=self.num_audio_codebooks * self.frame_stacking_factor,
                 audio_eos_id=self.audio_eos_id,
                 mask_token_id=self.mask_token_id,
                 codebook_size=self.codebook_size,
@@ -1488,6 +1502,17 @@ class EasyMagpieTTSInferenceModel(ModelPT):
                 # Base class returns (B, C, S); flatten to (B, C*S) for downstream code
                 audio_codes_next = audio_codes_next.permute(0, 2, 1)
                 audio_codes_next = audio_codes_next.reshape(audio_codes_next.size(0), -1)
+            elif self.local_transformer_type == LocalTransformerType.PARALLEL:
+                # sample codes from logits predicted in parallel and pass to refiner
+                audio_codes_next = self._lt_helper.refine_codes(
+                    hidden_states=last_hidden[:, -1:, :],
+                    pred_codes=all_code_logits_t[:, -1:, :],
+                    temperature=temperature,
+                    topk=topk,
+                    use_cfg=use_cfg,
+                    cfg_scale=cfg_scale,
+                    sanitize_logits=True,
+                )
             else:
                 raise ValueError(
                     f"Local transformer inference requested but local transformer type is {self.local_transformer_type}"
