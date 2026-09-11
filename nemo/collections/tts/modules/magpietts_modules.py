@@ -445,6 +445,9 @@ class LocalTransformerHelper:
         local_transformer: The local transformer module.
         audio_embeddings: List/ModuleList of per-codebook embedding layers.
         audio_in_projection: Linear projection applied after per-codebook embedding.
+        embed_single_codebook: Optional callable ``(codebook_index, codes) -> embeddings`` that
+            replaces the embedding table lookup, for backbones that embed codes some other way.
+            ``audio_embeddings`` and ``audio_in_projection`` are unused when it is given.
         local_transformer_in_projection: Projection into the local transformer input space.
         local_transformer_audio_out_projection: Projection applied to local transformer output
             before the per-codebook output heads.
@@ -469,10 +472,12 @@ class LocalTransformerHelper:
         audio_eos_id: int,
         mask_token_id: int,
         codebook_size: int,
+        embed_single_codebook=None,
     ):
         self.local_transformer = local_transformer
         self.audio_embeddings = audio_embeddings
         self.audio_in_projection = audio_in_projection
+        self.embed_single_codebook = embed_single_codebook
         self.local_transformer_in_projection = local_transformer_in_projection
         self.local_transformer_audio_out_projection = local_transformer_audio_out_projection
         self.local_transformer_out_projections = local_transformer_out_projections
@@ -481,6 +486,12 @@ class LocalTransformerHelper:
         self.audio_eos_id = audio_eos_id
         self.mask_token_id = mask_token_id
         self.codebook_size = codebook_size
+
+    def embed_codebook(self, codebook_index, codes):
+        """Embed one codebook's codes into the space the local transformer input is projected from."""
+        if self.embed_single_codebook is not None:
+            return self.embed_single_codebook(codebook_index, codes)
+        return self.audio_in_projection(self.audio_embeddings[codebook_index](codes))
 
     def create_random_mask(self, codes):
         """Creates a mask where True indicates positions that should be replaced with MASK_TOKEN."""
@@ -534,8 +545,7 @@ class LocalTransformerHelper:
             for codebook_num in range(C):
                 codes = audio_codes_target[:, codebook_num, fs_index :: self.frame_stacking_factor]
                 codes = codes.reshape(-1)
-                codebook_embedding = self.audio_embeddings[codebook_num + fs_index * C](codes)
-                codebook_embedding = self.audio_in_projection(codebook_embedding)
+                codebook_embedding = self.embed_codebook(codebook_num + fs_index * C, codes)
                 local_transformer_input.append(codebook_embedding)
 
         local_transformer_input = torch.stack(local_transformer_input, dim=1)
@@ -645,8 +655,7 @@ class LocalTransformerHelper:
                 codebook_preds[actual_batch_size:] = codebook_preds[:actual_batch_size]
             all_preds.append(codebook_preds)
 
-            next_local_transformer_input = self.audio_embeddings[codebook_num](codebook_preds.squeeze(-1)).unsqueeze(1)
-            next_local_transformer_input = self.audio_in_projection(next_local_transformer_input)
+            next_local_transformer_input = self.embed_codebook(codebook_num, codebook_preds.squeeze(-1)).unsqueeze(1)
             next_local_transformer_input = self.local_transformer_in_projection(next_local_transformer_input)
             local_transformer_input = torch.cat([local_transformer_input, next_local_transformer_input], dim=1)
 
@@ -734,8 +743,12 @@ class LocalTransformerHelper:
 
             local_transformer_input = local_transformer_input_init
             for codebook_num in range(codebook_seq_len):
-                next_local_transformer_input = self.audio_embeddings[codebook_num](codes[:, codebook_num]).unsqueeze(1)
-                next_local_transformer_input = self.local_transformer_in_projection(next_local_transformer_input)
+                if self.embed_single_codebook is not None:
+                    embedded = self.embed_single_codebook(codebook_num, codes[:, codebook_num])
+                else:
+                    # Unlike the AR path, this one has never applied `audio_in_projection`.
+                    embedded = self.audio_embeddings[codebook_num](codes[:, codebook_num])
+                next_local_transformer_input = self.local_transformer_in_projection(embedded.unsqueeze(1))
                 local_transformer_input = torch.cat([local_transformer_input, next_local_transformer_input], dim=1)
 
             _mask = torch.ones(B, codebook_seq_len + 1, device=device)

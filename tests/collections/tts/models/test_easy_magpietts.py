@@ -29,7 +29,7 @@ from torch import nn
 from nemo.collections.tts.models import AudioCodecModel
 from nemo.collections.tts.models.easy_magpietts import EasyMagpieTTSModel
 from nemo.collections.tts.models.easy_magpietts_inference import EasyModelInferenceParameters, TrainingMode
-from nemo.collections.tts.modules.magpietts_modules import AcousticRefiner
+from nemo.collections.tts.modules.magpietts_modules import AcousticRefiner, SpecialAudioToken
 from tests.collections.tts.models.test_audio_codec import create_codec_config
 
 
@@ -287,6 +287,110 @@ def test_audio_and_text_embedding_shapes(model):
     assert text_embedded.shape == (2, text_tokens.size(1), model.cfg.embedding_dim)
     assert text_embedded.dtype == torch.float32
     assert torch.isfinite(text_embedded).all()
+
+
+def _codec_latent_cfg(overrides=None):
+    cfg = {"use_codec_latent_audio_embedding": True}
+    cfg.update(overrides or {})
+    return tiny_easy_magpie_cfg(cfg)
+
+
+def test_codec_latent_embedding_replaces_the_embedding_tables():
+    model = _make_easy_magpie_model(_codec_latent_cfg())
+
+    num_channels = model.num_audio_codebooks * model.frame_stacking_factor
+    assert model.audio_embeddings is None
+    assert model.audio_in_projection is None
+    # the tiny codec quantizes 5 dimensions per codebook, which is all the projection has to read
+    assert model.codec_latent_dim == 5
+    assert model.audio_code_projection.in_features == num_channels * 5
+    assert model.audio_code_projection.out_features == model.cfg.embedding_dim
+    # special tokens are no codec tokens, so they keep a table, of one row per channel and token
+    assert model.audio_special_embeddings.num_embeddings == num_channels * len(SpecialAudioToken)
+    assert model.audio_special_embeddings.embedding_dim == model.cfg.embedding_dim
+
+    state = model.state_dict()
+    assert not any(key.startswith("audio_embeddings.") for key in state)
+    assert any(key.startswith("audio_code_projection.") for key in state)
+    assert any(key.startswith("audio_special_embeddings.") for key in state)
+
+    # the whole point of the flag: the input side no longer scales with the codebook size
+    table_model = _make_easy_magpie_model()
+    table_params = sum(p.numel() for p in table_model.audio_embeddings.parameters())
+    latent_params = model.audio_code_projection.weight.numel() + model.audio_special_embeddings.weight.numel()
+    assert latent_params < table_params / 10
+
+
+def test_codec_latent_embedding_separates_codec_and_special_tokens():
+    model = _make_easy_magpie_model(_codec_latent_cfg())
+    codes = _toy_codes(model, batch_size=2, num_frames=3)
+    codes[0, :, -1] = model.audio_eos_id
+
+    embedded = model.embed_audio_tokens(codes)
+
+    assert embedded.shape == (2, 3, model.cfg.embedding_dim)
+    assert embedded.dtype == torch.float32
+    assert torch.isfinite(embedded).all()
+
+    # a frame of special tokens has to land somewhere no frame of codec tokens can reach
+    eos_frame = torch.full((1, model.num_audio_codebooks, 1), model.audio_eos_id, dtype=torch.long)
+    bos_frame = torch.full_like(eos_frame, model.audio_bos_id)
+    assert not torch.allclose(model.embed_audio_tokens(eos_frame), model.embed_audio_tokens(bos_frame))
+    for codec_code in (0, model.codebook_size - 1):
+        codec_frame = torch.full_like(eos_frame, codec_code)
+        assert not torch.allclose(model.embed_audio_tokens(codec_frame), model.embed_audio_tokens(eos_frame))
+
+
+@pytest.mark.parametrize("frame_stacking_factor", [1, 2], ids=["no_stacking", "stacking"])
+def test_codec_latent_embedding_per_channel_matches_the_whole_frame(frame_stacking_factor):
+    """Channel-by-channel embedding is what the local transformer uses, and has to agree."""
+    model = _make_easy_magpie_model(_codec_latent_cfg({"frame_stacking_factor": frame_stacking_factor}))
+    num_channels = model.num_audio_codebooks * frame_stacking_factor
+    codes = _toy_codes(model, batch_size=2, num_frames=num_channels)[:, :, :frame_stacking_factor]
+    codes = codes.reshape(2, num_channels, 1)
+    codes[1, -1, 0] = model.mask_token_id
+
+    whole_frame = model.embed_audio_tokens(codes)
+    per_channel = sum(model.embed_audio_codebook(channel, codes[:, channel, :]) for channel in range(num_channels))
+    # every channel carries the projection bias, which the whole frame only carries once
+    per_channel = per_channel - (num_channels - 1) * model.audio_code_projection.bias
+
+    torch.testing.assert_close(per_channel, whole_frame)
+
+
+def test_process_batch_with_codec_latent_embedding_and_local_transformer():
+    _seed_everything()
+    model = _make_easy_magpie_model(
+        _codec_latent_cfg(
+            {
+                "local_transformer_type": "autoregressive",
+                "local_transformer_hidden_dim": 32,
+                "local_transformer_n_layers": 1,
+                "local_transformer_n_heads": 4,
+            }
+        )
+    )
+    batch = _toy_batch(model)
+
+    output = model.process_batch(
+        text=batch["text"],
+        text_lens=batch["text_lens"],
+        context_text_tokens=batch["context_text_tokens"],
+        context_text_tokens_lens=batch["context_text_tokens_lens"],
+        audio_codes=batch["audio_codes"],
+        audio_codes_lens=batch["audio_codes_lens"],
+        context_audio_codes=batch["context_audio_codes"],
+        context_audio_codes_lens=batch["context_audio_codes_lens"],
+        mode="val",
+        training_mode=model.training_modes[0],
+        agent_mask=batch["agent_mask"],
+    )
+
+    assert torch.isfinite(output.loss)
+    assert torch.isfinite(output.local_transformer_loss)
+    output.loss.backward()
+    assert model.audio_code_projection.weight.grad is not None
+    assert torch.isfinite(model.audio_code_projection.weight.grad).all()
 
 
 def test_stack_codes_round_trip_expected_shape(model):
