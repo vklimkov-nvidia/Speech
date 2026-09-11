@@ -38,13 +38,14 @@ from nemo.collections.tts.models import AudioCodecModel
 from nemo.collections.tts.modules import transformer_2501
 from nemo.collections.tts.modules.audio_codec_modules import VectorQuantizerIndexConverter
 from nemo.collections.tts.modules.magpietts_modules import (
+    AcousticRefiner,
+    AcousticRefinerOrder,
     CharAwareSubwordEncoder,
     CodecHelper,
     LocalTransformerHelper,
     LocalTransformerType,
     SpecialAudioToken,
     add_special_tokens,
-    AcousticRefiner,
 )
 from nemo.collections.tts.parts.utils.helpers import get_mask_from_lengths
 from nemo.collections.tts.parts.utils.tts_dataset_utils import tokenize_text_with_phoneme_spans
@@ -160,6 +161,10 @@ class StreamingState:
     gt_phoneme_lens: Optional[torch.Tensor] = None  # (B,) lengths after stacking
     gt_audio_embeddings: Optional[torch.Tensor] = None  # (B, T', E) pre-computed GT audio embeddings
     gt_audio_lens: Optional[torch.Tensor] = None  # (B,) lengths after stacking
+
+    # One key value cache per refinement step of the acoustic refiner, covering the decoder
+    # positions it has been given so far. None when no refiner is in use.
+    refiner_cache: Optional[List] = None
 
 
 @dataclass
@@ -607,7 +612,7 @@ class EasyMagpieTTSInferenceModel(ModelPT):
 
         self.local_transformer_type = LocalTransformerType(cfg.get('local_transformer_type', 'none').lower())
         logging.info(f"Local transformer type: {self.local_transformer_type}")
-        if self.local_transformer_type == LocalTransformerType.AR or self.local_transformer_type == LocalTransformerType.MASKGIT:
+        if self.local_transformer_type in (LocalTransformerType.AR, LocalTransformerType.MASKGIT):
             local_transformer_hidden_dim = cfg.get('local_transformer_hidden_dim', 256)
             if local_transformer_hidden_dim != cfg.hidden_dim:
                 self.local_transformer_in_projection = nn.Linear(cfg.hidden_dim, local_transformer_hidden_dim)
@@ -657,16 +662,28 @@ class EasyMagpieTTSInferenceModel(ModelPT):
             )
         elif self.local_transformer_type == LocalTransformerType.PARALLEL:
             assert self.frame_stacking_factor == 1, "Parallel local transformer only supports frame_stacking_factor=1"
+            # The refiner reads decoder hidden states and embedded codes in the same space and adds
+            # no projection of its own, so the two spaces the backbone keeps apart have to agree.
+            if cfg.embedding_dim != cfg.hidden_dim:
+                raise ValueError(
+                    f"The acoustic refiner adds decoder hidden states ({cfg.hidden_dim}) to embedded "
+                    f"audio codes ({cfg.embedding_dim}), so embedding_dim has to equal hidden_dim"
+                )
             self._lt_helper = AcousticRefiner(
                 n_layers=self.cfg.get('local_transformer_n_layers', 2),
-                d_model=self.audio_embedding_dim,
-                d_ffn=self.audio_embedding_dim * 4,
+                d_model=self.cfg.get('local_transformer_hidden_dim', cfg.hidden_dim),
+                d_ffn=self.cfg.get('local_transformer_hidden_dim', cfg.hidden_dim) * 4,
                 sa_n_heads=self.cfg.get('local_transformer_n_heads', 1),
-                audio_embeddings=self.audio_embeddings,
+                embed_codes=self.embed_audio_tokens,
+                backbone_dim=cfg.hidden_dim,
                 num_audio_codebooks=self.num_audio_codebooks * self.frame_stacking_factor,
                 audio_eos_id=self.audio_eos_id,
                 mask_token_id=self.mask_token_id,
                 codebook_size=self.codebook_size,
+                prediction_schedule=tuple(
+                    cfg.get('acoustic_refiner_prediction_schedule', AcousticRefiner.PREDICTION_SCHEDULE)
+                ),
+                commit_order=cfg.get('acoustic_refiner_commit_order', AcousticRefinerOrder.CODEBOOK),
             )
 
     @property
@@ -845,6 +862,7 @@ class EasyMagpieTTSInferenceModel(ModelPT):
             state.past_key_values = out.past_key_values
             state.cache_seq_len += T
             state.last_hidden = out.last_hidden_state
+            self._advance_acoustic_refiner(state, frames=T)
 
             # Advance logical streams consumed by this profile prefill.
             state.text_tokens_seen += T
@@ -1480,9 +1498,21 @@ class EasyMagpieTTSInferenceModel(ModelPT):
         use_local_transformer_for_inference: bool,
         use_cfg: bool,
         cfg_scale: float,
+        needs_audio: Optional[torch.Tensor] = None,
+        refiner_cache: Optional[List] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Sample audio codes from logits using either local transformer or parallel sampling.
+
+        Args:
+            last_hidden: Decoder hidden states (B, T, hidden_dim), still doubled under CFG.
+            all_code_logits_t: Backbone audio logits for the current frame, already reduced to the
+                conditional stream under CFG (B, C * num_all_tokens_per_codebook).
+            needs_audio: (B,) bool mask of items with a frame at this position, which the acoustic
+                refiner needs to tell them from the ones still reading context or waiting out the
+                speech delay. None means every item has one.
+            refiner_cache: The acoustic refiner's key value cache for this utterance, holding the
+                decoder positions it has already been given.
 
         Returns:
             audio_codes_next: Sampled codes with temperature/topk (B, num_codebooks)
@@ -1503,16 +1533,30 @@ class EasyMagpieTTSInferenceModel(ModelPT):
                 audio_codes_next = audio_codes_next.permute(0, 2, 1)
                 audio_codes_next = audio_codes_next.reshape(audio_codes_next.size(0), -1)
             elif self.local_transformer_type == LocalTransformerType.PARALLEL:
-                # sample codes from logits predicted in parallel and pass to refiner
+                # The backbone only predicts the leading codebooks; sample those the same way the
+                # non-local-transformer path does, then let the refiner fill in the rest.
+                pred_codes = self.sample_codes_from_logits(all_code_logits_t, temperature=temperature, topk=topk)
+                # The refiner takes the batch as one, so items with no frame here still take a cache
+                # entry. Leave them out of the refinement so that entry holds the mask token, which
+                # is what training puts at a position without audio, rather than codes the backbone
+                # sampled off a position that has none.
                 audio_codes_next = self._lt_helper.refine_codes(
                     hidden_states=last_hidden[:, -1:, :],
-                    pred_codes=all_code_logits_t[:, -1:, :],
+                    pred_codes=pred_codes.unsqueeze(1),
+                    cache=refiner_cache,
                     temperature=temperature,
                     topk=topk,
                     use_cfg=use_cfg,
                     cfg_scale=cfg_scale,
                     sanitize_logits=True,
+                    refine=needs_audio,
                 )
+                # (B, 1 frame, C) -> (B, C*S), the flat layout downstream code expects (S is 1 here)
+                audio_codes_next = audio_codes_next.squeeze(1)
+                if needs_audio is not None:
+                    # those rows come back masked, so hand back what the backbone sampled for them,
+                    # which is what the caller would get with no refiner in the way
+                    audio_codes_next = torch.where(needs_audio.unsqueeze(-1), audio_codes_next, pred_codes)
             else:
                 raise ValueError(
                     f"Local transformer inference requested but local transformer type is {self.local_transformer_type}"
@@ -1730,6 +1774,15 @@ class EasyMagpieTTSInferenceModel(ModelPT):
                 gt_audio_lens=gt_audio_lens_state,
             )
 
+            # The refiner caches one entry per position it has seen, so its cache belongs to this
+            # utterance and to this batch layout, and lives on the state rather than on the module.
+            # The backbone has just taken the context, so the refiner takes it too.
+            if use_local_transformer and self.local_transformer_type == LocalTransformerType.PARALLEL:
+                state.refiner_cache = self._lt_helper.make_cache(
+                    batch_size=last_hidden.size(0), device=device, dtype=last_hidden.dtype
+                )
+                self._advance_acoustic_refiner(state, frames=last_hidden.size(1))
+
             return state
 
     def streaming_step(
@@ -1805,6 +1858,8 @@ class EasyMagpieTTSInferenceModel(ModelPT):
             state.cache_seq_len += 1
 
             if prefill_like_step:
+                self._advance_acoustic_refiner(state)
+
                 # Advance logical streams, keep audio silent, but predict phonemes if enabled.
                 state.context_position += needs_context.long()
                 state.text_tokens_seen += (~needs_context).long()
@@ -2154,7 +2209,7 @@ class EasyMagpieTTSInferenceModel(ModelPT):
                     state.audio_prediction_start_idx,
                 )
 
-            audio_codes_next_stacked, all_codes_next_argmax = self._predict_audio_codes(state)  # (B, C*S)
+            audio_codes_next_stacked, all_codes_next_argmax = self._predict_audio_codes(state, needs_audio)  # (B, C*S)
 
             S = self.frame_stacking_factor
             C = self.num_audio_codebooks
@@ -2193,6 +2248,9 @@ class EasyMagpieTTSInferenceModel(ModelPT):
 
             state.all_predictions.append(audio_codes_unstacked)
             audio_codes_next = audio_codes_unstacked
+        else:
+            # the backbone took this position, so the refiner has to take it too
+            self._advance_acoustic_refiner(state)
 
         # Force-finish items when GT audio is exhausted (teacher forcing)
         if state.gt_audio_embeddings is not None and state.gt_audio_lens is not None:
@@ -2240,7 +2298,26 @@ class EasyMagpieTTSInferenceModel(ModelPT):
         # (B, phoneme_stacking_factor)
         return pred_phoneme_tokens
 
-    def _predict_audio_codes(self, state: StreamingState) -> Tuple[torch.Tensor, torch.Tensor]:
+    def _advance_acoustic_refiner(self, state: StreamingState, frames: int = 1) -> None:
+        """
+        Take the acoustic refiner through positions no item has a frame at, so that its cache keeps
+        up with the backbone's.
+
+        Training gives the refiner every position the backbone took, so the steps that predict no
+        audio have to reach it too. Nothing is refined here and nothing comes back: the codes are
+        the mask token, which is what training holds at a position without audio.
+
+        Args:
+            state: Current StreamingState, with last_hidden set from the forward pass.
+            frames: How many of the trailing positions of last_hidden to take.
+        """
+        if state.refiner_cache is None:
+            return
+        self._lt_helper.advance(state.last_hidden[:, -frames:, :], cache=state.refiner_cache)
+
+    def _predict_audio_codes(
+        self, state: StreamingState, needs_audio: Optional[torch.Tensor] = None
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Predict audio codes from the last hidden state."""
         actual_batch_size = state.config.batch_size
         last_hidden = state.last_hidden
@@ -2266,6 +2343,8 @@ class EasyMagpieTTSInferenceModel(ModelPT):
             use_local_transformer_for_inference=state.config.use_local_transformer,
             use_cfg=state.config.use_cfg,
             cfg_scale=state.config.cfg_scale,
+            needs_audio=needs_audio,
+            refiner_cache=state.refiner_cache,
         )
 
         return audio_codes_next, all_codes_next_argmax
@@ -2289,6 +2368,9 @@ class EasyMagpieTTSInferenceModel(ModelPT):
         """
         batch_size = state.config.batch_size
         device = state.config.device
+
+        # Release the per-utterance refiner cache set up in streaming_init
+        state.refiner_cache = None
 
         # Extract and decode phoneme predictions
         phoneme_tokens_list: List[List[int]] = []
@@ -2671,9 +2753,12 @@ class EasyMagpieTTSInferenceModel(ModelPT):
         transcript = transcript.strip()
         context_text = (context_text or "[NO TEXT CONTEXT]").strip()
         if use_local_transformer is None:
-            # EasyMagpie uses the local transformer only for AR; MASKGIT/NO_LT decode via
-            # parallel sampling (_sample_audio_codes raises if asked to use a non-AR local transformer).
-            use_local_transformer = self.local_transformer_type == LocalTransformerType.AR
+            # EasyMagpie decodes through the local transformer for AR and PARALLEL; MASKGIT/NO_LT
+            # decode via parallel sampling (_sample_audio_codes raises for any other type).
+            use_local_transformer = self.local_transformer_type in (
+                LocalTransformerType.AR,
+                LocalTransformerType.PARALLEL,
+            )
 
         if main_tokenizer_name is None:
             # Match model init behavior: default to first configured tokenizer.

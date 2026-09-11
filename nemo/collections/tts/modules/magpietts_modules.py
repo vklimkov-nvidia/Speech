@@ -15,8 +15,9 @@
 
 from __future__ import annotations
 
+import math
 from enum import Enum
-from typing import Any, Dict, List, Optional
+from typing import Dict, List, Optional
 
 import numpy as np
 import torch
@@ -24,6 +25,12 @@ from torch import Tensor
 from torch.utils.data import get_worker_info
 
 from nemo.collections.tts.modules import transformer_2501
+from nemo.collections.tts.modules.nemotron_h_decoder import (
+    HybridMambaAttentionDynamicCache,
+    NemotronHBlock,
+    NemotronHConfig,
+    NemotronHRMSNorm,
+)
 from nemo.collections.tts.parts.utils.helpers import get_mask_from_lengths
 from nemo.core.classes.common import safe_instantiate
 from nemo.core.classes.module import NeuralModule
@@ -804,12 +811,120 @@ class LocalTransformerHelper:
 _IGNORE_INDEX = -100
 
 
+class CausalTransformerStack(torch.nn.Module):
+    """
+    `n_layers` attention and feed forward blocks, run causally over time.
+
+    Built from the same NemotronH blocks the decoder backbone is made of, so a stack taken to
+    another runtime reuses the kernels and the weight layout that runtime already has for the
+    backbone. The blocks carry no positional encoding of their own, which is what a stack that
+    reads backbone hidden states wants, and they attend through `scaled_dot_product_attention`,
+    so the attention matrix is never materialized.
+
+    Positions come in through `forward`, which takes any number of them at a time. A cache from
+    `make_cache` holds the ones already seen, and only key and value tensors go into it, so the
+    positions themselves never have to be passed again.
+
+    No padding mask is taken. Attention is causal and batches are right padded, so a real position
+    never reaches a padded key; positions past the end hold values that nothing reads.
+    """
+
+    def __init__(self, n_layers: int, d_model: int, d_ffn: int, n_heads: int, n_kv_heads: Optional[int] = None):
+        super().__init__()
+        # one attention block followed by one feed forward block is how the backbone's pattern
+        # string spells what is elsewhere called a single transformer layer
+        self.config = NemotronHConfig(
+            hidden_size=d_model,
+            num_hidden_layers=2 * n_layers,
+            hybrid_override_pattern="*-" * n_layers,
+            num_attention_heads=n_heads,
+            num_key_value_heads=n_kv_heads or n_heads,
+            intermediate_size=d_ffn,
+            # a handful of layers deep, so the residual stays in the activation dtype
+            residual_in_fp32=False,
+        )
+        self.blocks = torch.nn.ModuleList(
+            [NemotronHBlock(self.config, layer_idx=idx) for idx in range(self.config.num_hidden_layers)]
+        )
+        self.norm_out = NemotronHRMSNorm(d_model, eps=self.config.layer_norm_epsilon)
+        self._init_weights()
+
+    def make_cache(self, batch_size: int, device, dtype) -> HybridMambaAttentionDynamicCache:
+        """
+        A key value cache covering one sequence of this stack.
+
+        Hand it back on every later call; dropping it is all that ends the sequence.
+        """
+        return HybridMambaAttentionDynamicCache(self.config, batch_size=batch_size, dtype=dtype, device=device)
+
+    def forward(
+        self, hidden_states: torch.Tensor, cache: Optional[HybridMambaAttentionDynamicCache] = None
+    ) -> torch.Tensor:
+        """
+        hidden_states  (batch x frames x d_model), the positions following whatever `cache` holds
+        cache  filled in place when given, absent during training
+
+        returns  (batch x frames x d_model)
+        """
+        attention_mask = self._offset_causal_mask(hidden_states, cache)
+        for block in self.blocks:
+            hidden_states = block(hidden_states, cache_params=cache, attention_mask=attention_mask)
+        return self.norm_out(hidden_states)
+
+    @staticmethod
+    def _offset_causal_mask(
+        hidden_states: torch.Tensor, cache: Optional[HybridMambaAttentionDynamicCache]
+    ) -> Optional[torch.Tensor]:
+        """
+        The additive mask for queries that follow a warm cache, or None when the blocks work it out.
+
+        `scaled_dot_product_attention` lines its own causal mask up with the top left corner, which
+        is only where the triangle belongs when the queries are the whole sequence. Behind a warm
+        cache it sits further right and has to be spelled out. A single query needs no mask either
+        way, every key it can reach being in its past.
+        """
+        frames = hidden_states.size(1)
+        cached = cache.get_seq_length() if cache is not None else 0
+        if cached == 0 or frames == 1:
+            return None
+        device = hidden_states.device
+        query_positions = torch.arange(cached, cached + frames, device=device).unsqueeze(1)
+        blocked = torch.arange(cached + frames, device=device) > query_positions
+        mask = torch.zeros(blocked.shape, dtype=hidden_states.dtype, device=device)
+        return mask.masked_fill(blocked, torch.finfo(hidden_states.dtype).min)[None, None]
+
+    def _init_weights(self):
+        """Applies the backbone's initialization, which the blocks expect but do not apply."""
+        for module in self.modules():
+            if isinstance(module, torch.nn.Linear):
+                torch.nn.init.normal_(module.weight, mean=0.0, std=self.config.initializer_range)
+                if module.bias is not None:
+                    torch.nn.init.zeros_(module.bias)
+
+        if self.config.rescale_prenorm_residual:
+            for name, parameter in self.named_parameters():
+                if name.endswith(("o_proj.weight", "down_proj.weight")):
+                    with torch.no_grad():
+                        parameter /= math.sqrt(self.config.num_hidden_layers)
+
+
 class AcousticRefiner(torch.nn.Module):
     """
     Refines acoustic codes predicted in parallel.
     Defines N transformers, that take as input hidden state, currently predicted
     acoustic codes and predict missing codes.
     Input embeddings and output projections are shared between all transformers.
+
+    Codes are embedded by `embed_codes`, provided by the backbone: it maps
+    (batch x time x num_audio_codebooks) codes to (batch x time x d_model) embeddings and has to
+    accept the mask token, which is not a codec token.
+
+    The stack works directly in the backbone's audio space, so `d_model` has to match
+    `backbone_dim` and no input or output projection is needed on either side.
+
+    It spans the backbone's timeline rather than just the frames it refines, so the positions the
+    backbone takes without predicting audio go through `advance` first. Those positions carry no
+    codes, only the mask token, which is also what `compute_loss` reads for them during training.
     """
 
     # this represents how many transformers there are,
@@ -824,16 +939,24 @@ class AcousticRefiner(torch.nn.Module):
         d_ffn,
         sa_n_heads,
         # defines overall refinement process
-        audio_embeddings,  # shared with backbone
+        embed_codes,  # backbone callable, embeds (batch x num_audio_codebooks x time) codes into d_model
+        backbone_dim,  # dimension of the backbone hidden states and code embeddings fed to this stack
         num_audio_codebooks,
         audio_eos_id,
         mask_token_id,
         codebook_size,
-        max_length_causal_mask,
         prediction_schedule=PREDICTION_SCHEDULE,
         commit_order=AcousticRefinerOrder.CODEBOOK,
     ):
         super().__init__()
+
+        # hidden states and code embeddings are added together and read back by `out_proj`, so the
+        # stack has to live in the backbone's audio space; requiring a match keeps it projection free
+        if d_model != backbone_dim:
+            raise ValueError(
+                f"AcousticRefiner runs in the backbone's audio space and adds no projection, so its "
+                f"d_model ({d_model}) has to match the backbone dimension ({backbone_dim})"
+            )
 
         # the backbone predicts the leading codebook(s) on its own, the schedule covers the rest
         num_backbone_codebooks = num_audio_codebooks - sum(prediction_schedule)
@@ -846,30 +969,14 @@ class AcousticRefiner(torch.nn.Module):
         # separate transformer for every refinement step
         self.transformers = torch.nn.ModuleList(
             [
-                transformer_2501.Transformer(
-                    n_layers=n_layers,
-                    d_model=d_model,
-                    d_ffn=d_ffn,
-                    sa_n_heads=sa_n_heads,
-                    kernel_size=1,
-                    is_causal=True,
-                    max_length_causal_mask=max_length_causal_mask,
-                    # backbone hidden states already carry its positional encoding
-                    use_learnable_pos_emb=False,
-                    # steps are chained, so normalize to keep the scale seen by `out_proj` consistent
-                    apply_norm_out=True,
-                )
+                CausalTransformerStack(n_layers=n_layers, d_model=d_model, d_ffn=d_ffn, n_heads=sa_n_heads)
                 for _ in range(len(prediction_schedule))
             ]
         )
 
-        # reference to audio embeddings
-        self.audio_embeddings = audio_embeddings
-
-        # no need for self.local_transformer_audio_out_projection
-        assert (
-            self.audio_embeddings[0].weight.shape[1] == d_model
-        ), "We expect local transformer to have same dimension as audio embeddings"
+        # codes are embedded the way the backbone does it, so the embedding tables stay owned by the
+        # backbone: holding them here would register the very same parameters a second time
+        self.embed_codes = embed_codes
 
         # one projection layer for all codebooks, covering codec tokens only (no special tokens)
         self.out_proj = torch.nn.Linear(d_model, num_audio_codebooks * codebook_size)
@@ -889,18 +996,34 @@ class AcousticRefiner(torch.nn.Module):
         self.audio_eos_id = audio_eos_id
         self.mask_token_id = mask_token_id
         self.codebook_size = codebook_size
-        self.use_cache = False
-        self.frames_cached = 0
+
+    def make_cache(self, batch_size: int, device, dtype) -> List[HybridMambaAttentionDynamicCache]:
+        """
+        A key value cache per refinement step, covering one utterance and one batch layout.
+
+        Keep it in the caller's state and hand it to every `advance` and `refine_codes` call.
+        """
+        return [stack.make_cache(batch_size, device=device, dtype=dtype) for stack in self.transformers]
+
+    @staticmethod
+    def cached_frames(cache: List[HybridMambaAttentionDynamicCache]) -> int:
+        """How many positions the cache holds. Every refinement step holds the same count."""
+        return cache[0].get_seq_length()
 
     def compute_loss(self, hidden_states, target_codes, lengths) -> torch.Tensor:
         """
         computes loss for the refiner.
         for that iteratively predicts codes with each `self.transformers`
 
-        Codebooks a step has not committed yet are hidden behind the mask token, and every step is
-        supervised on all of them. Committed codebooks are teacher forced with the target codes,
-        while which codebooks get committed follows the confidence of the step that predicted them,
-        matching the order used at inference time.
+        Codebooks a step has not committed yet are hidden behind the mask token, while committed
+        ones are teacher forced with the target codes. Which codebooks a step commits follows the
+        same rule as at inference time, so the stack is trained on the inputs it will see there.
+
+        Runs over the backbone's whole timeline, so `hidden_states` and `target_codes` cover the
+        same positions. The target codes decide what a position is: the ones the backbone takes
+        without predicting audio hold the mask token, which is what `advance` feeds them at
+        inference and which is not a codec token, so they condition the frames that follow without
+        entering the loss.
 
         hidden_states  (batch x time x d_model)
         target_codes  (batch x time x num_audio_codebooks)
@@ -909,10 +1032,12 @@ class AcousticRefiner(torch.nn.Module):
         loss: cross entropy averaged over every codebook prediction made by any step
         """
         target_codes = target_codes.long()
+        # right padding needs no attention mask, the stack being causal, so lengths only keep the
+        # padded positions out of the loss
         time_mask = get_mask_from_lengths(lengths, x=target_codes[:, :, 0])
 
-        # `out_proj` only covers codec tokens, so frames holding a special token (the trailing EOS
-        # frame) have no valid target and are left out of the loss.
+        # `out_proj` only covers codec tokens, so frames holding a special token (the mask token of
+        # a position without audio, the trailing EOS frame) have no valid target and stay out of the loss.
         has_target = time_mask.unsqueeze(-1) & (target_codes < self.codebook_size)
         ignored = torch.full_like(target_codes, _IGNORE_INDEX)
 
@@ -924,8 +1049,7 @@ class AcousticRefiner(torch.nn.Module):
         last_step = len(self.prediction_schedule) - 1
         for step, num_to_commit in enumerate(self.prediction_schedule):
             input_codes = torch.where(committed, target_codes, self.mask_token_id)
-            x = hidden_states + self._embed_codes(input_codes)
-            hidden_states = self.transformers[step](x, time_mask)['output']
+            hidden_states = self.transformers[step](hidden_states + self._embed(input_codes))
             logits = self.out_proj(hidden_states).reshape(target_codes.shape + (self.codebook_size,))
 
             if self.commit_order == AcousticRefinerOrder.CODEBOOK:
@@ -952,26 +1076,42 @@ class AcousticRefiner(torch.nn.Module):
 
         return loss_sum / num_predictions.clamp(min=1)
 
-    def reset_cache(self, use_cache: bool = False):
+    @torch.no_grad()
+    def advance(self, hidden_states: torch.Tensor, cache: List[HybridMambaAttentionDynamicCache]) -> None:
         """
-        Resets the KV cache of every refinement step. Call this once before generating an utterance,
-        not once per frame: each step keeps one cache entry per frame it has seen.
+        Takes positions that carry no audio, so that the cache covers them and the frames refined
+        later read them as left context.
+
+        The backbone's prefill and every later step that predicts no audio come through here. They
+        go in as the mask token, which is what `compute_loss` teacher forces at a position without
+        audio. Nothing is sampled and nothing is returned; the pass is only there for the cache.
+        Any number of positions can go in at once, warm cache or not.
+
+        hidden_states  (batch [doubled under CFG] x frames x d_model)
         """
-        self.use_cache = use_cache
-        self.frames_cached = 0
-        for transformer in self.transformers:
-            transformer.reset_cache(use_cache=use_cache)
+        codes = torch.full(
+            (hidden_states.size(0), hidden_states.size(1), self.num_audio_codebooks),
+            self.mask_token_id,
+            dtype=torch.long,
+            device=hidden_states.device,
+        )
+        # no code is ever committed here, so one embedding serves every step
+        embedded = self._embed(codes)
+        for step, stack in enumerate(self.transformers):
+            hidden_states = stack(hidden_states + embedded, cache=cache[step])
 
     @torch.no_grad()
     def refine_codes(
         self,
-        hidden_states: torch.Tensor,  # (batch x frames x d_model)
+        hidden_states: torch.Tensor,  # (batch [doubled under CFG] x frames x d_model)
         pred_codes: torch.Tensor,  # (batch x frames x num_audio_codebooks)
+        cache: Optional[List[HybridMambaAttentionDynamicCache]] = None,
         temperature: float = 1.0,
         topk: int = 80,
         use_cfg: bool = False,
         cfg_scale: float = 1.0,
         sanitize_logits: bool = False,
+        refine: Optional[torch.Tensor] = None,  # (batch)
     ) -> torch.Tensor:
         """
         Samples the acoustic codes of the given frames, one refinement step at a time.
@@ -980,41 +1120,50 @@ class AcousticRefiner(torch.nn.Module):
         the leading codebooks come from the backbone through `pred_codes` and the rest start masked,
         then every step samples the codebooks it commits and hands them to the next step.
 
-        Pass only the frames the backbone has just produced. This transformer stack reads its left
-        context from its input and the KV cache only spares it the attention projections, so the
-        frames the cache already holds are padded back in here rather than by the caller: nothing
-        those positions hold ever reaches a key or a value, only their count matters. Once the cache
-        holds a frame, one frame per call is the only option. Without the cache the whole sequence is
-        refined coherently, which is what training does.
+        Pass only the frames the backbone has just produced; the positions before them are the ones
+        `cache` holds, having gone through `advance` or an earlier call here. Without a cache the
+        whole sequence is refined at once, which is what training does.
 
-        Under CFG the batch holds the conditional stream followed by the unconditional one. Both
-        streams have to carry the same codes, so every decision is taken once on the guided
-        distribution and mirrored, and only the conditional half is returned.
+        The stack takes the batch as one, so every row gets a cache entry whether or not it has a
+        frame here. `refine` marks the rows that do; the rest keep the mask token through every
+        step and commit nothing, which is what a position without audio holds during training. Its
+        default of every row is what a caller handing over nothing but real frames wants.
 
-        returns the refined codes of the given frames  (batch x frames x num_audio_codebooks)
+        Under CFG `hidden_states` holds the conditional stream followed by the unconditional one,
+        while `pred_codes` holds the conditional stream alone, the backbone having already sampled
+        it from guided logits. Guidance is applied once per step, to this stack's own logits, and
+        the codes committed from them are shared by both streams.
+
+        returns the refined codes of the given frames, the mask token on the rows left alone
+            (batch x frames x num_audio_codebooks)
         """
-        num_streams = pred_codes.size(0) // 2 if use_cfg else pred_codes.size(0)
-        new_frames = pred_codes.size(1)
-        if self.frames_cached > 0 and new_frames != 1:
+        num_streams = hidden_states.size(0) // 2 if use_cfg else hidden_states.size(0)
+        if pred_codes.size(0) != num_streams:
             raise ValueError(
-                "Once the cache holds a frame this stack can only step one frame at a time, "
-                f"but {new_frames} frames were passed"
+                f"expected {num_streams} rows of predicted codes to go with {hidden_states.size(0)} "
+                f"rows of hidden states, but got {pred_codes.size(0)}"
             )
 
+        if refine is None:
+            refine = torch.ones(num_streams, dtype=torch.bool, device=hidden_states.device)
+        elif refine.shape != (num_streams,):
+            raise ValueError(f"expected which rows to refine as ({num_streams},), but got {tuple(refine.shape)}")
+        refined_row = refine.view(-1, 1, 1)
+
         committed = torch.zeros_like(pred_codes, dtype=torch.bool)
-        committed[:, :, : self.num_backbone_codebooks] = True
+        committed[:, :, : self.num_backbone_codebooks] = refined_row
         codes = torch.where(committed, pred_codes, self.mask_token_id)
 
-        # placeholders standing in for the frames the cache serves, see the note above
-        hidden_states = _pad_frames_left(hidden_states, self.frames_cached)
-        codes = _pad_frames_left(codes, self.frames_cached)
-        frame_mask = torch.ones(codes.shape[:2], device=codes.device)
-
         last_step = len(self.prediction_schedule) - 1
-        for step, num_to_commit in enumerate[Any](self.prediction_schedule):
-            x = hidden_states + self._embed_codes(codes)
-            hidden_states = self.transformers[step](x, frame_mask)['output']
-            logits = self.out_proj(hidden_states[:, -new_frames:])
+        for step, num_to_commit in enumerate(self.prediction_schedule):
+            # both streams are refined from the same codes, only their hidden states differ
+            embedded = self._embed(codes)
+            if use_cfg:
+                embedded = embedded.repeat(2, 1, 1)
+            hidden_states = self.transformers[step](
+                hidden_states + embedded, cache=None if cache is None else cache[step]
+            )
+            logits = self.out_proj(hidden_states)
             logits = logits.reshape(logits.shape[:2] + (self.num_audio_codebooks, self.codebook_size))
 
             if use_cfg:
@@ -1024,35 +1173,34 @@ class AcousticRefiner(torch.nn.Module):
                 logits = logits.clamp(min=-100.0, max=100.0)
 
             if self.commit_order == AcousticRefinerOrder.CODEBOOK:
-                selected = self._select_next_codebooks(step, committed[:num_streams])
+                selected = self._select_next_codebooks(step, committed)
             elif step < last_step:
-                selected = self._select_most_confident(logits, committed[:num_streams], num_to_commit)
+                selected = self._select_most_confident(logits, committed, num_to_commit)
             else:
                 # the last step commits whatever confidence based selection has left over
-                selected = ~committed[:num_streams]
+                selected = ~committed
+            # the rows without a frame here hold still, so they cache nothing but the mask token
+            selected = selected & refined_row
 
             sampled = self._sample_codes(logits, temperature, topk)
-            if use_cfg:
-                selected = selected.repeat(2, 1, 1)
-                sampled = sampled.repeat(2, 1, 1)
             committed = committed | selected
-            codes[:, -new_frames:] = torch.where(selected, sampled, codes[:, -new_frames:])
+            codes = torch.where(selected, sampled, codes)
 
-        if self.use_cache:
-            self.frames_cached += new_frames
+        return codes
 
-        return codes[:num_streams, -new_frames:]
-
-    def _embed_codes(self, codes):
+    def _embed(self, codes):
         """
-        Embeds codes the way the backbone does: sum of the per-codebook embeddings, averaged.
+        Embeds codes through the backbone, which indexes them one codebook at a time.
+
+        This stack holds its codes frame major, the layout `out_proj` writes its logits in, so the
+        one tensor that has to be realigned is the smallest one: the transpose below is a view over
+        the codes, where realigning the logits instead would copy them.
 
         codes  (batch x time x num_audio_codebooks)
+
+        returns code embeddings  (batch x time x d_model)
         """
-        embedded = self.audio_embeddings[0](codes[:, :, 0])
-        for codebook in range(1, codes.size(-1)):
-            embedded = embedded + self.audio_embeddings[codebook](codes[:, :, codebook])
-        return embedded / codes.size(-1)
+        return self.embed_codes(codes.transpose(1, 2))
 
     def _sample_codes(self, logits, temperature, topk):
         """
@@ -1102,10 +1250,3 @@ class AcousticRefiner(torch.nn.Module):
         confidence = confidence.masked_fill(committed, -1.0)
         selected = confidence.topk(num_to_commit, dim=-1).indices
         return torch.zeros_like(committed).scatter(dim=-1, index=selected, value=True)
-
-
-def _pad_frames_left(x: Tensor, frames: int) -> Tensor:
-    """Prepends `frames` zeroed positions along time to a (batch x time x channels) tensor."""
-    if frames == 0:
-        return x
-    return torch.nn.functional.pad(x, (0, 0, frames, 0))

@@ -862,6 +862,49 @@ class EasyMagpieTTSModel(EasyMagpieTTSInferenceModel):
         sliced = torch.gather(sequence_embeddings, dim=1, index=gather_indices_exp)
         return sliced
 
+    def _acoustic_refiner_targets(
+        self,
+        num_positions: int,
+        audio_codes_target: torch.Tensor,
+        audio_codes_lens_target: torch.Tensor,
+        audio_delay: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Place the target audio codes on the decoder timeline for the acoustic refiner.
+
+        The refiner runs on the same positions the backbone did, so it takes one target per
+        position. Positions outside the audio target hold the mask token, which is what the refiner
+        is fed there at inference and which is not a codec token, so `compute_loss` conditions on
+        them without supervising them.
+
+        Args:
+            num_positions: Length of the decoder timeline, matching the backbone hidden states.
+            audio_codes_target: Target audio codes (B, C, T_target).
+            audio_codes_lens_target: Valid length of the target audio codes (B,).
+            audio_delay: First decoder position of the target frames (B,).
+
+        Returns:
+            Target codes on the decoder timeline (B, num_positions, C).
+        """
+        codes_target = audio_codes_target.transpose(1, 2).long()  # (B, T_target, C)
+        batch_size, num_frames, num_codebooks = codes_target.shape
+        device = codes_target.device
+
+        codes = torch.full(
+            (batch_size, num_positions, num_codebooks),
+            self._lt_helper.mask_token_id,
+            dtype=torch.long,
+            device=device,
+        )
+        within_target = torch.arange(num_frames, device=device).unsqueeze(0)  # (1, T_target)
+        positions = audio_delay.unsqueeze(1) + within_target  # (B, T_target)
+        # the target can run past the timeline once its own padding is counted in
+        valid = (within_target < audio_codes_lens_target.unsqueeze(1)) & (positions < num_positions)
+
+        rows = torch.arange(batch_size, device=device).unsqueeze(1).expand_as(valid)
+        codes[rows[valid], positions[valid]] = codes_target[valid]
+        return codes
+
     def process_batch(
         self,
         text: torch.Tensor,
@@ -1221,14 +1264,22 @@ class EasyMagpieTTSModel(EasyMagpieTTSInferenceModel):
                 agent_mask_target=agent_mask if self.cfg.get("mask_user_on_loss", False) else None,
             )
         elif self.local_transformer_type == LocalTransformerType.PARALLEL:
+            # The refiner caches along the decoder timeline, so it runs on the whole sequence the
+            # backbone ran on rather than the sliced target frames.
             local_transformer_loss = self._lt_helper.compute_loss(
-                hidden_states=pred_embeddings,
-                target_codes=audio_codes_target,
-                lengths=audio_codes_lens_target,
+                hidden_states=transformer_hidden_states,
+                target_codes=self._acoustic_refiner_targets(
+                    num_positions=transformer_hidden_states.size(1),
+                    audio_codes_target=audio_codes_target,
+                    audio_codes_lens_target=audio_codes_lens_target,
+                    audio_delay=audio_delay,
+                ),
+                lengths=combined_channel_lens,
             )
-        else:
+        elif self.local_transformer_type != LocalTransformerType.NO_LT:
             raise ValueError(f"Unexpected local transformer type for easy magpietts: {self.local_transformer_type}")
-        loss = loss + self.local_transformer_loss_scale * local_transformer_loss
+        if local_transformer_loss is not None:
+            loss = loss + self.local_transformer_loss_scale * local_transformer_loss
 
         # Compute phoneme loss if applicable
         phoneme_loss = None
@@ -1650,7 +1701,8 @@ class EasyMagpieTTSModel(EasyMagpieTTSInferenceModel):
                 max_decoder_steps=330,
                 temperature=0.7,
                 topk=80,
-                use_local_transformer_for_inference=self.local_transformer_type == LocalTransformerType.AR,
+                use_local_transformer_for_inference=self.local_transformer_type
+                in (LocalTransformerType.AR, LocalTransformerType.PARALLEL),
                 use_cfg=self.cfg.get('inference_use_cfg_in_val', True),
                 cfg_scale=2.5,
             )

@@ -29,6 +29,7 @@ from torch import nn
 from nemo.collections.tts.models import AudioCodecModel
 from nemo.collections.tts.models.easy_magpietts import EasyMagpieTTSModel
 from nemo.collections.tts.models.easy_magpietts_inference import EasyModelInferenceParameters, TrainingMode
+from nemo.collections.tts.modules.magpietts_modules import AcousticRefiner
 from tests.collections.tts.models.test_audio_codec import create_codec_config
 
 
@@ -499,6 +500,148 @@ def test_process_batch_with_autoregressive_local_transformer():
     assert torch.isfinite(output.local_transformer_loss)
     assert output.local_transformer_logits is not None
     assert output.local_transformer_logits.shape == output.logits.shape
+
+
+def _parallel_local_transformer_cfg(overrides=None):
+    # audio_embedding_dim is 16 while hidden_dim is 32, so this also pins down that the refiner
+    # runs in the decoder's hidden space rather than the narrower audio embedding space
+    cfg = {
+        "local_transformer_type": "parallel",
+        "local_transformer_hidden_dim": 32,
+        "local_transformer_n_layers": 1,
+        "local_transformer_n_heads": 4,
+        "local_transformer_loss_scale": 0.5,
+        # the tiny codec has 8 codebooks, so leave one for the backbone to predict
+        "acoustic_refiner_prediction_schedule": [3, 4],
+    }
+    cfg.update(overrides or {})
+    return tiny_easy_magpie_cfg(cfg)
+
+
+def test_process_batch_with_parallel_local_transformer():
+    _seed_everything()
+    model = _make_easy_magpie_model(_parallel_local_transformer_cfg())
+    batch = _toy_batch(model)
+
+    output = model.process_batch(
+        text=batch["text"],
+        text_lens=batch["text_lens"],
+        context_text_tokens=batch["context_text_tokens"],
+        context_text_tokens_lens=batch["context_text_tokens_lens"],
+        audio_codes=batch["audio_codes"],
+        audio_codes_lens=batch["audio_codes_lens"],
+        context_audio_codes=batch["context_audio_codes"],
+        context_audio_codes_lens=batch["context_audio_codes_lens"],
+        mode="val",
+        training_mode=model.training_modes[0],
+        agent_mask=batch["agent_mask"],
+    )
+
+    assert torch.isfinite(output.loss)
+    assert torch.isfinite(output.codebook_loss)
+    assert torch.isfinite(output.local_transformer_loss)
+    # the refiner has no per-codebook heads over special tokens, so it reports no comparable logits
+    assert output.local_transformer_logits is None
+
+
+def test_acoustic_refiner_requires_backbone_hidden_dim():
+    _seed_everything()
+    with pytest.raises(ValueError, match="has to match the backbone dimension"):
+        _make_easy_magpie_model(_parallel_local_transformer_cfg({"local_transformer_hidden_dim": 16}))
+
+
+def test_acoustic_refiner_requires_matching_embedding_and_hidden_dim():
+    _seed_everything()
+    with pytest.raises(ValueError, match="embedding_dim has to equal hidden_dim"):
+        _make_easy_magpie_model(
+            _parallel_local_transformer_cfg({"embedding_dim": 16, "nemotron_h_config": {"hidden_size": 16}})
+        )
+
+
+def test_acoustic_refiner_samples_codes_for_the_frame():
+    _seed_everything()
+    model = _make_easy_magpie_model(_parallel_local_transformer_cfg())
+    batch_size, num_codebooks = 2, model.num_audio_codebooks
+    last_hidden = torch.randn(batch_size, 3, model.cfg.hidden_dim)
+    all_code_logits_t = model.final_proj(model.audio_out_projection(last_hidden[:, -1, :]))
+
+    cache = model._lt_helper.make_cache(batch_size, device=last_hidden.device, dtype=last_hidden.dtype)
+    audio_codes_next, argmax_codes = model._sample_audio_codes(
+        last_hidden=last_hidden,
+        all_code_logits_t=all_code_logits_t,
+        temperature=0.7,
+        topk=8,
+        use_local_transformer_for_inference=True,
+        use_cfg=False,
+        cfg_scale=1.0,
+        refiner_cache=cache,
+    )
+
+    # flat (B, C*S) layout, the same shape the autoregressive local transformer returns
+    assert audio_codes_next.shape == (batch_size, num_codebooks * model.frame_stacking_factor)
+    assert audio_codes_next.dtype == torch.long
+    assert (audio_codes_next != model.mask_token_id).all()
+    assert argmax_codes.shape == audio_codes_next.shape
+    assert AcousticRefiner.cached_frames(cache) == 1
+    # the caller reshapes to (B, C, S) and masks with a per-item flag
+    assert audio_codes_next.view(batch_size, num_codebooks, model.frame_stacking_factor).shape[1] == num_codebooks
+
+
+def test_acoustic_refiner_samples_codes_under_cfg():
+    _seed_everything()
+    model = _make_easy_magpie_model(_parallel_local_transformer_cfg())
+    batch_size = 2
+    # under CFG the hidden states stay doubled while the backbone logits are already guided
+    last_hidden = torch.randn(2 * batch_size, 3, model.cfg.hidden_dim)
+    all_code_logits_t = model.final_proj(model.audio_out_projection(last_hidden[:batch_size, -1, :]))
+
+    cache = model._lt_helper.make_cache(batch_size, device=last_hidden.device, dtype=last_hidden.dtype)
+    for _ in range(3):
+        audio_codes_next, _ = model._sample_audio_codes(
+            last_hidden=last_hidden,
+            all_code_logits_t=all_code_logits_t,
+            temperature=0.7,
+            topk=8,
+            use_local_transformer_for_inference=True,
+            use_cfg=True,
+            cfg_scale=2.5,
+            refiner_cache=cache,
+        )
+
+    assert audio_codes_next.shape == (batch_size, model.num_audio_codebooks * model.frame_stacking_factor)
+    assert AcousticRefiner.cached_frames(cache) == 3
+
+
+@pytest.mark.parametrize("use_cfg", [False, True], ids=["no_cfg", "cfg"])
+def test_acoustic_refiner_cache_keeps_up_with_the_backbone(use_cfg):
+    """Training feeds the refiner every decoder position, so streaming has to cache every one."""
+    _seed_everything()
+    model = _make_easy_magpie_model(_parallel_local_transformer_cfg())
+    model.eval()
+    batch = _toy_batch(model)
+
+    state = model.streaming_init(
+        context_audio_codes=batch["context_audio_codes"],
+        context_audio_codes_lens=batch["context_audio_codes_lens"],
+        context_text_tokens=batch["context_text_tokens"],
+        context_text_tokens_lens=batch["context_text_tokens_lens"],
+        use_cfg=use_cfg,
+        cfg_scale=2.5 if use_cfg else 1.0,
+        use_local_transformer=True,
+    )
+
+    # the context prefill goes in as one pass, so the refiner is level with the backbone right away
+    assert state.cache_seq_len > 1
+    assert AcousticRefiner.cached_frames(state.refiner_cache) == state.cache_seq_len
+
+    # the steps before speech starts predict no audio, and still have to reach the refiner
+    for step in range(8):
+        state, _, _ = model.streaming_step(state, text_tokens=batch["text"][:, min(step, batch["text"].size(1) - 1)])
+        cached = AcousticRefiner.cached_frames(state.refiner_cache)
+        assert cached == state.cache_seq_len, f"drifted apart on step {step}"
+
+    model.streaming_finalize(state)
+    assert state.refiner_cache is None, "the per-utterance cache is released"
 
 
 def test_training_step_smoke(model, toy_batch):
