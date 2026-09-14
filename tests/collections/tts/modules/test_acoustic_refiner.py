@@ -92,6 +92,15 @@ def test_rejects_schedule_that_leaves_nothing_for_the_backbone():
         _make_refiner(prediction_schedule=(4, 4))
 
 
+def test_rejects_backbone_codebooks_the_schedule_disagrees_with():
+    # SCHEDULE leaves exactly one codebook to the backbone
+    with pytest.raises(ValueError, match="leaves 1 of 8 codebooks to the backbone"):
+        _make_refiner(num_backbone_codebooks=2)
+
+    refiner = _make_refiner(num_backbone_codebooks=1)
+    assert refiner.num_backbone_codebooks == 1
+
+
 @pytest.mark.parametrize("commit_order", [AcousticRefinerOrder.CODEBOOK, AcousticRefinerOrder.CONFIDENCE])
 def test_compute_loss_is_finite_and_differentiable(commit_order):
     refiner = _make_refiner(commit_order=commit_order)

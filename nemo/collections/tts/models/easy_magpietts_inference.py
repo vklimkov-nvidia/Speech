@@ -50,6 +50,7 @@ from nemo.collections.tts.modules.magpietts_modules import (
     LocalTransformerType,
     SpecialAudioToken,
     add_special_tokens,
+    clear_forbidden_logits,
 )
 from nemo.collections.tts.parts.utils.helpers import get_mask_from_lengths
 from nemo.collections.tts.parts.utils.tts_dataset_utils import tokenize_text_with_phoneme_spans
@@ -629,6 +630,12 @@ class EasyMagpieTTSInferenceModel(ModelPT):
             self.num_audio_codebooks * self.num_all_tokens_per_codebook * self.frame_stacking_factor,
         )
 
+        # Leading codebooks the backbone predicts on its own, the local transformer predicting the
+        # rest on top of them: the real codes during training, the backbone's own at inference. With
+        # a codec whose leading codebook is semantic, 1 keeps the semantic token with the backbone.
+        # The acoustic refiner reads it off its own schedule when it is not configured here.
+        self.num_backbone_codebooks = cfg.get('num_backbone_codebooks', 0)
+
         self.local_transformer_type = LocalTransformerType(cfg.get('local_transformer_type', 'none').lower())
         logging.info(f"Local transformer type: {self.local_transformer_type}")
         if self.local_transformer_type in (LocalTransformerType.AR, LocalTransformerType.MASKGIT):
@@ -679,6 +686,9 @@ class EasyMagpieTTSInferenceModel(ModelPT):
                 audio_eos_id=self.audio_eos_id,
                 mask_token_id=self.mask_token_id,
                 codebook_size=self.codebook_size,
+                # stack_codes writes channel `codebook * S + frame`, so the backbone's codebooks are
+                # the leading `num_backbone_codebooks * S` channels of the stacked layout
+                num_backbone_codebooks=self.num_backbone_codebooks * self.frame_stacking_factor,
             )
         elif self.local_transformer_type == LocalTransformerType.PARALLEL:
             assert self.frame_stacking_factor == 1, "Parallel local transformer only supports frame_stacking_factor=1"
@@ -689,6 +699,12 @@ class EasyMagpieTTSInferenceModel(ModelPT):
                     f"The acoustic refiner adds decoder hidden states ({cfg.hidden_dim}) to embedded "
                     f"audio codes ({cfg.embedding_dim}), so embedding_dim has to equal hidden_dim"
                 )
+            prediction_schedule = tuple(
+                cfg.get('acoustic_refiner_prediction_schedule', AcousticRefiner.PREDICTION_SCHEDULE)
+            )
+            if 'num_backbone_codebooks' not in cfg:
+                # the schedule already says how many codebooks are left to the backbone
+                self.num_backbone_codebooks = self.num_audio_codebooks - sum(prediction_schedule)
             self._lt_helper = AcousticRefiner(
                 n_layers=self.cfg.get('local_transformer_n_layers', 2),
                 d_model=self.cfg.get('local_transformer_hidden_dim', cfg.hidden_dim),
@@ -700,9 +716,8 @@ class EasyMagpieTTSInferenceModel(ModelPT):
                 audio_eos_id=self.audio_eos_id,
                 mask_token_id=self.mask_token_id,
                 codebook_size=self.codebook_size,
-                prediction_schedule=tuple(
-                    cfg.get('acoustic_refiner_prediction_schedule', AcousticRefiner.PREDICTION_SCHEDULE)
-                ),
+                num_backbone_codebooks=self.num_backbone_codebooks,
+                prediction_schedule=prediction_schedule,
                 commit_order=cfg.get('acoustic_refiner_commit_order', AcousticRefinerOrder.CODEBOOK),
                 mask_codes=cfg.get('acoustic_refiner_mask_codes', False),
                 mask_min=cfg.get('acoustic_refiner_mask_min', 0.0),
@@ -1302,7 +1317,13 @@ class EasyMagpieTTSInferenceModel(ModelPT):
         return all_preds
 
     def sample_codes_from_logits(
-        self, all_code_logits_t, temperature=0.7, topk=80, unfinished_items={}, finished_items={}
+        self,
+        all_code_logits_t,
+        temperature=0.7,
+        topk=80,
+        unfinished_items={},
+        finished_items={},
+        forbid_special_tokens=False,
     ):
         # all_code_logits_t: (B, num_codebooks * num_tokens_per_codebook), logits at a given timestep
         """Sample one token per audio-code channel from filtered logits.
@@ -1313,6 +1334,10 @@ class EasyMagpieTTSInferenceModel(ModelPT):
             topk: Number of highest-logit candidates retained per channel.
             unfinished_items: Batch indices for which EOS must be suppressed.
             finished_items: Batch indices forced to emit EOS.
+            forbid_special_tokens: Whether to keep every special token but audio EOS out of the
+                sample, the way the local transformer's own sampling does. Codes the local
+                transformer conditions on want it: a special token there is not a codec token, and
+                the mask token in particular reads as a code that was never committed.
 
         Returns:
             Sampled stacked audio-code tokens shaped ``(B, C)``.
@@ -1330,6 +1355,8 @@ class EasyMagpieTTSInferenceModel(ModelPT):
             for item_idx in finished_items:
                 codebook_logits[item_idx, :] = float('-inf')
                 codebook_logits[item_idx, self.audio_eos_id] = 0.0
+            if forbid_special_tokens:
+                codebook_logits = clear_forbidden_logits(codebook_logits.unsqueeze(1), self.codebook_size).squeeze(1)
             codebook_logits_topk = torch.topk(codebook_logits, topk, dim=-1)[0]  # (B, topk)
             indices_to_remove = codebook_logits < codebook_logits_topk[:, -1].unsqueeze(
                 -1
@@ -1701,10 +1728,21 @@ class EasyMagpieTTSInferenceModel(ModelPT):
             audio_codes_next: Sampled codes with temperature/topk (B, num_codebooks)
             all_codes_next_argmax: Argmax sampled codes for EOS detection (B, num_codebooks)
         """
+        num_backbone_channels = self.num_backbone_codebooks * self.frame_stacking_factor
         if use_local_transformer_for_inference:
+            # The codebooks the backbone owns are sampled from its logits, the same way the
+            # non-local-transformer path does it, and the local transformer decodes the rest on top
+            # of them. Special tokens are kept out: the local transformer conditions on these codes.
+            pred_codes = None
+            if num_backbone_channels > 0:
+                pred_codes = self.sample_codes_from_logits(
+                    all_code_logits_t, temperature=temperature, topk=topk, forbid_special_tokens=True
+                )
+
             if self.local_transformer_type == LocalTransformerType.AR:
                 audio_codes_next = self._lt_helper.sample_autoregressive(
                     dec_output=last_hidden[:, -1, :],
+                    pred_codes=pred_codes,
                     temperature=temperature,
                     topk=topk,
                     use_cfg=use_cfg,
@@ -1716,9 +1754,6 @@ class EasyMagpieTTSInferenceModel(ModelPT):
                 audio_codes_next = audio_codes_next.permute(0, 2, 1)
                 audio_codes_next = audio_codes_next.reshape(audio_codes_next.size(0), -1)
             elif self.local_transformer_type == LocalTransformerType.PARALLEL:
-                # The backbone only predicts the leading codebooks; sample those the same way the
-                # non-local-transformer path does, then let the refiner fill in the rest.
-                pred_codes = self.sample_codes_from_logits(all_code_logits_t, temperature=temperature, topk=topk)
                 # The refiner takes the batch as one, so items with no frame here still take a cache
                 # entry. Leave them out of the refinement so that entry holds the mask token, which
                 # is what training puts at a position without audio, rather than codes the backbone
@@ -1744,8 +1779,15 @@ class EasyMagpieTTSInferenceModel(ModelPT):
                 raise ValueError(
                     f"Local transformer inference requested but local transformer type is {self.local_transformer_type}"
                 )
-            # TODO @rfejgin: should we add argmax sampling for EOS here too?
+            # TODO @rfejgin: should the codebooks the local transformer decoded get an argmax read too?
             all_codes_next_argmax = audio_codes_next
+            if num_backbone_channels > 0 and temperature > 0.0:
+                # EOS rides on the codebooks the backbone owns, and its logits are the ones at hand
+                # here, so the detector gets an argmax read of those channels while the ones the
+                # local transformer decoded keep what was sampled.
+                backbone_argmax = self.sample_codes_from_logits(all_code_logits_t, temperature=0.01)
+                all_codes_next_argmax = audio_codes_next.clone()
+                all_codes_next_argmax[:, :num_backbone_channels] = backbone_argmax[:, :num_backbone_channels]
         else:
             # Parallel sampling from all codebook logits
             audio_codes_next = self.sample_codes_from_logits(all_code_logits_t, temperature=temperature, topk=topk)

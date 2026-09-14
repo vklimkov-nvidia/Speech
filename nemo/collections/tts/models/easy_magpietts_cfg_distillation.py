@@ -263,6 +263,13 @@ def _lt_sample_autoregressive(
         `(batch_size, num_audio_codebooks, frame_stacking_factor)` and the
         corresponding CFG logits for the conditional batch.
     """
+    if model.num_backbone_codebooks > 0:
+        # this samples every codebook with the local transformer, which is not what a model whose
+        # backbone predicts the leading codebooks does at inference
+        raise NotImplementedError(
+            f"CFG distillation does not support num_backbone_codebooks={model.num_backbone_codebooks}"
+        )
+
     model.local_transformer.reset_cache(use_cache=use_kv_cache)
     dec_output = dec_output.unsqueeze(1)
     local_transformer_input = model.local_transformer_in_projection(dec_output)

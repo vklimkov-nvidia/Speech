@@ -498,6 +498,9 @@ class LocalTransformerHelper:
         audio_eos_id: Token id for audio EOS.
         mask_token_id: Token id used for MaskGit masking.
         codebook_size: Base codebook size (excluding special tokens).
+        num_backbone_codebooks: How many of the leading codebooks the decoder backbone predicts on
+            its own. ``sample_autoregressive`` takes those codes rather than sampling them, and
+            decodes the rest on top of them. Counted in the channel order the sampling loop walks.
     """
 
     def __init__(
@@ -514,7 +517,15 @@ class LocalTransformerHelper:
         mask_token_id: int,
         codebook_size: int,
         embed_single_codebook=None,
+        num_backbone_codebooks: int = 0,
     ):
+        num_channels = num_audio_codebooks * frame_stacking_factor
+        if not 0 <= num_backbone_codebooks < num_channels:
+            raise ValueError(
+                f"num_backbone_codebooks ({num_backbone_codebooks}) has to leave at least one of the "
+                f"{num_channels} codebook channels to the local transformer"
+            )
+
         self.local_transformer = local_transformer
         self.audio_embeddings = audio_embeddings
         self.audio_in_projection = audio_in_projection
@@ -527,6 +538,7 @@ class LocalTransformerHelper:
         self.audio_eos_id = audio_eos_id
         self.mask_token_id = mask_token_id
         self.codebook_size = codebook_size
+        self.num_backbone_codebooks = num_backbone_codebooks
 
     def embed_codebook(self, codebook_index, codes):
         """Embed one codebook's codes into the space the local transformer input is projected from."""
@@ -620,6 +632,7 @@ class LocalTransformerHelper:
     def sample_autoregressive(
         self,
         dec_output: torch.Tensor,
+        pred_codes: Optional[torch.Tensor] = None,
         temperature: float = 0.7,
         topk: int = 80,
         unfinished_items: Dict[int, bool] = {},
@@ -632,8 +645,16 @@ class LocalTransformerHelper:
     ) -> torch.Tensor:
         """Sample audio codes autoregressively across codebooks using the local transformer.
 
+        The leading ``num_backbone_codebooks`` codes come from the backbone through ``pred_codes``
+        instead of being sampled here. They go in as context the same way the sampled ones do and
+        come back out unchanged, which is what `compute_logits` teacher forces during training.
+
         Args:
             dec_output: Decoder output tensor (B, E).
+            pred_codes: Codes the backbone predicted for the current frame (B, C * S), of which the
+                leading ``num_backbone_codebooks`` channels are read. Under CFG the backbone has
+                already sampled them from guided logits, so they come in as a single stream and
+                both streams read them. Only needed when the backbone owns any codebook.
             temperature: Sampling temperature. When <= 0, uses argmax.
             topk: Number of top-probability tokens to consider.
             unfinished_items: Batch indices that have not completed generation (EOS forbidden).
@@ -647,11 +668,31 @@ class LocalTransformerHelper:
         Returns:
             Sampled audio codes (B, num_codebooks, frame_stacking_factor).
         """
+        num_streams = dec_output.size(0) // 2 if use_cfg else dec_output.size(0)
+        if self.num_backbone_codebooks > 0:
+            if pred_codes is None:
+                raise ValueError(
+                    f"the backbone predicts the leading {self.num_backbone_codebooks} codebook channel(s), "
+                    f"so its codes have to be passed in"
+                )
+            if pred_codes.size(0) != num_streams or pred_codes.size(1) < self.num_backbone_codebooks:
+                raise ValueError(
+                    f"expected at least {self.num_backbone_codebooks} backbone codes for {num_streams} rows, "
+                    f"but got {tuple(pred_codes.shape)}"
+                )
+
         self.local_transformer.reset_cache(use_cache=use_kv_cache)
         dec_output = dec_output.unsqueeze(1)  # (B, 1, E)
         local_transformer_input = self.local_transformer_in_projection(dec_output)
         all_preds = []
-        for codebook_num in range(self.num_audio_codebooks * self.frame_stacking_factor):
+        for codebook_num in range(self.num_backbone_codebooks):
+            codebook_preds = pred_codes[:, codebook_num : codebook_num + 1]
+            if use_cfg:
+                codebook_preds = codebook_preds.repeat(2, 1)
+            all_preds.append(codebook_preds)
+            local_transformer_input = self._append_code(local_transformer_input, codebook_num, codebook_preds)
+
+        for codebook_num in range(self.num_backbone_codebooks, self.num_audio_codebooks * self.frame_stacking_factor):
             _mask = torch.ones(
                 local_transformer_input.size(0), local_transformer_input.size(1), device=local_transformer_input.device
             )
@@ -661,11 +702,10 @@ class LocalTransformerHelper:
             codebook_logits = self.local_transformer_out_projections[codebook_num](lt_out_for_proj)
 
             if use_cfg:
-                actual_batch_size = codebook_logits.size(0) // 2
-                conditional_logits = codebook_logits[:actual_batch_size]
-                unconditional_logits = codebook_logits[actual_batch_size:]
+                conditional_logits = codebook_logits[:num_streams]
+                unconditional_logits = codebook_logits[num_streams:]
                 cfg_logits = cfg_scale * conditional_logits + (1.0 - cfg_scale) * unconditional_logits
-                codebook_logits[:actual_batch_size] = cfg_logits
+                codebook_logits[:num_streams] = cfg_logits
 
             if sanitize_logits:
                 codebook_logits = torch.nan_to_num(codebook_logits, nan=0.0, posinf=100.0, neginf=-100.0)
@@ -693,17 +733,15 @@ class LocalTransformerHelper:
                 codebook_preds = torch.multinomial(codebook_probs, 1)
 
             if use_cfg:
-                codebook_preds[actual_batch_size:] = codebook_preds[:actual_batch_size]
+                codebook_preds[num_streams:] = codebook_preds[:num_streams]
             all_preds.append(codebook_preds)
 
-            next_local_transformer_input = self.embed_codebook(codebook_num, codebook_preds.squeeze(-1)).unsqueeze(1)
-            next_local_transformer_input = self.local_transformer_in_projection(next_local_transformer_input)
-            local_transformer_input = torch.cat([local_transformer_input, next_local_transformer_input], dim=1)
+            local_transformer_input = self._append_code(local_transformer_input, codebook_num, codebook_preds)
 
         all_preds = torch.cat(all_preds, dim=1)  # (B, num_codebooks * frame_stacking_factor)
         all_preds = all_preds.reshape(-1, self.frame_stacking_factor, self.num_audio_codebooks).permute(0, 2, 1)
         if use_cfg:
-            all_preds = all_preds[:actual_batch_size]
+            all_preds = all_preds[:num_streams]
 
         return all_preds
 
@@ -860,6 +898,19 @@ class LocalTransformerHelper:
             codes = codes[:actual_batch_size]
         return codes
 
+    def _append_code(self, local_transformer_input, codebook_index, codes):
+        """
+        Appends one codebook's codes to what the local transformer reads, as its next position.
+
+        local_transformer_input  (batch x positions x d_model)
+        codes  (batch x 1)
+
+        returns  (batch x positions + 1 x d_model)
+        """
+        embedded = self.embed_codebook(codebook_index, codes.squeeze(-1)).unsqueeze(1)
+        embedded = self.local_transformer_in_projection(embedded)
+        return torch.cat([local_transformer_input, embedded], dim=1)
+
 
 # target value ignored by cross entropy, matching its default
 _IGNORE_INDEX = -100
@@ -999,6 +1050,8 @@ class AcousticRefiner(torch.nn.Module):
         audio_eos_id,
         mask_token_id,
         codebook_size,
+        # how many leading codebooks the backbone predicts, checked against the schedule when given
+        num_backbone_codebooks=None,
         prediction_schedule=PREDICTION_SCHEDULE,
         commit_order=AcousticRefinerOrder.CODEBOOK,
         mask_codes=False,
@@ -1016,12 +1069,19 @@ class AcousticRefiner(torch.nn.Module):
             )
 
         # the backbone predicts the leading codebook(s) on its own, the schedule covers the rest
-        num_backbone_codebooks = num_audio_codebooks - sum(prediction_schedule)
-        if num_backbone_codebooks < 1:
+        num_left_to_backbone = num_audio_codebooks - sum(prediction_schedule)
+        if num_left_to_backbone < 1:
             raise ValueError(
                 f"prediction_schedule {prediction_schedule} commits {sum(prediction_schedule)} of "
                 f"{num_audio_codebooks} codebooks, leaving none for the backbone to predict"
             )
+        if num_backbone_codebooks is not None and num_backbone_codebooks != num_left_to_backbone:
+            raise ValueError(
+                f"num_backbone_codebooks is {num_backbone_codebooks}, but prediction_schedule "
+                f"{prediction_schedule} leaves {num_left_to_backbone} of {num_audio_codebooks} "
+                f"codebooks to the backbone"
+            )
+        num_backbone_codebooks = num_left_to_backbone
 
         # separate transformer for every refinement step
         self.transformers = torch.nn.ModuleList(

@@ -619,19 +619,21 @@ def test_process_batch_with_multiturn_dataset_enabled():
     assert output.local_transformer_loss is None
 
 
+def _autoregressive_local_transformer_cfg(overrides=None):
+    cfg = {
+        "local_transformer_type": "autoregressive",
+        "local_transformer_hidden_dim": 32,
+        "local_transformer_n_layers": 1,
+        "local_transformer_n_heads": 4,
+        "local_transformer_loss_scale": 0.5,
+    }
+    cfg.update(overrides or {})
+    return tiny_easy_magpie_cfg(cfg)
+
+
 def test_process_batch_with_autoregressive_local_transformer():
     _seed_everything()
-    model = _make_easy_magpie_model(
-        tiny_easy_magpie_cfg(
-            {
-                "local_transformer_type": "autoregressive",
-                "local_transformer_hidden_dim": 32,
-                "local_transformer_n_layers": 1,
-                "local_transformer_n_heads": 4,
-                "local_transformer_loss_scale": 0.5,
-            }
-        )
-    )
+    model = _make_easy_magpie_model(_autoregressive_local_transformer_cfg())
     batch = _toy_batch(model)
 
     output = model.process_batch(
@@ -653,6 +655,100 @@ def test_process_batch_with_autoregressive_local_transformer():
     assert torch.isfinite(output.local_transformer_loss)
     assert output.local_transformer_logits is not None
     assert output.local_transformer_logits.shape == output.logits.shape
+
+
+@pytest.mark.parametrize("frame_stacking_factor", [1, 2])
+def test_autoregressive_local_transformer_decodes_on_the_backbone_codes(frame_stacking_factor):
+    """The backbone owns the leading codebook, so the sampled frame has to carry its code."""
+    _seed_everything()
+    model = _make_easy_magpie_model(
+        _autoregressive_local_transformer_cfg(
+            {"num_backbone_codebooks": 1, "frame_stacking_factor": frame_stacking_factor}
+        )
+    )
+    batch_size = 2
+    last_hidden = torch.randn(batch_size, 3, model.cfg.hidden_dim)
+    all_code_logits_t = model.final_proj(model.audio_out_projection(last_hidden[:, -1, :]))
+
+    audio_codes_next, argmax_codes = model._sample_audio_codes(
+        last_hidden=last_hidden,
+        all_code_logits_t=all_code_logits_t,
+        temperature=0.0,  # argmax, so the backbone's own codes are reproducible below
+        topk=8,
+        use_local_transformer_for_inference=True,
+        use_cfg=False,
+        cfg_scale=1.0,
+    )
+    backbone_codes = model.sample_codes_from_logits(
+        all_code_logits_t, temperature=0.0, topk=8, forbid_special_tokens=True
+    )
+
+    assert audio_codes_next.shape == (batch_size, model.num_audio_codebooks * frame_stacking_factor)
+    # stack_codes writes channel `codebook * S + frame`, so codebook 0 owns the leading S channels
+    backbone_channels = slice(None, frame_stacking_factor)
+    assert torch.equal(audio_codes_next[:, backbone_channels], backbone_codes[:, backbone_channels])
+    assert torch.equal(argmax_codes, audio_codes_next), "argmax sampling already returns the codes it sampled"
+
+
+def test_autoregressive_local_transformer_decodes_on_the_backbone_codes_under_cfg():
+    _seed_everything()
+    model = _make_easy_magpie_model(_autoregressive_local_transformer_cfg({"num_backbone_codebooks": 1}))
+    batch_size = 2
+    # under CFG the hidden states stay doubled while the backbone logits are already guided
+    last_hidden = torch.randn(2 * batch_size, 3, model.cfg.hidden_dim)
+    all_code_logits_t = model.final_proj(model.audio_out_projection(last_hidden[:batch_size, -1, :]))
+
+    audio_codes_next, _ = model._sample_audio_codes(
+        last_hidden=last_hidden,
+        all_code_logits_t=all_code_logits_t,
+        temperature=0.0,
+        topk=8,
+        use_local_transformer_for_inference=True,
+        use_cfg=True,
+        cfg_scale=2.5,
+    )
+    backbone_codes = model.sample_codes_from_logits(
+        all_code_logits_t, temperature=0.0, topk=8, forbid_special_tokens=True
+    )
+
+    assert audio_codes_next.shape == (batch_size, model.num_audio_codebooks)
+    assert torch.equal(audio_codes_next[:, :1], backbone_codes[:, :1])
+
+
+def test_autoregressive_local_transformer_streams_on_the_backbone_codes():
+    """The backbone's codes have to reach the local transformer through the streaming loop too."""
+    _seed_everything()
+    model = _make_easy_magpie_model(_autoregressive_local_transformer_cfg({"num_backbone_codebooks": 1}))
+    batch = _toy_batch(model)
+
+    state = model.streaming_init(
+        context_audio_codes=batch["context_audio_codes"],
+        context_audio_codes_lens=batch["context_audio_codes_lens"],
+        context_text_tokens=batch["context_text_tokens"],
+        context_text_tokens_lens=batch["context_text_tokens_lens"],
+        use_local_transformer=True,
+        temperature=0.7,
+        topk=8,
+    )
+    for step in range(8):
+        state, _, _ = model.streaming_step(state, text_tokens=batch["text"][:, min(step, batch["text"].size(1) - 1)])
+
+    output = model.streaming_finalize(state)
+    assert output.audio_codes.size(1) == model.num_audio_codebooks
+
+
+def test_autoregressive_local_transformer_requires_the_backbone_codes():
+    _seed_everything()
+    model = _make_easy_magpie_model(_autoregressive_local_transformer_cfg({"num_backbone_codebooks": 1}))
+
+    with pytest.raises(ValueError, match="codes have to be passed in"):
+        model._lt_helper.sample_autoregressive(dec_output=torch.randn(2, model.cfg.hidden_dim))
+
+
+def test_autoregressive_local_transformer_needs_a_codebook_of_its_own():
+    _seed_everything()
+    with pytest.raises(ValueError, match="at least one of the 8 codebook channels"):
+        _make_easy_magpie_model(_autoregressive_local_transformer_cfg({"num_backbone_codebooks": 8}))
 
 
 def _parallel_local_transformer_cfg(overrides=None):
@@ -695,6 +791,22 @@ def test_process_batch_with_parallel_local_transformer():
     assert torch.isfinite(output.local_transformer_loss)
     # the refiner has no per-codebook heads over special tokens, so it reports no comparable logits
     assert output.local_transformer_logits is None
+
+
+def test_acoustic_refiner_requires_backbone_codebooks_to_match_its_schedule():
+    _seed_everything()
+    # the tiny codec has 8 codebooks and the schedule commits 7, leaving 1 to the backbone
+    with pytest.raises(ValueError, match="leaves 1 of 8 codebooks to the backbone"):
+        _make_easy_magpie_model(_parallel_local_transformer_cfg({"num_backbone_codebooks": 2}))
+
+    model = _make_easy_magpie_model(_parallel_local_transformer_cfg({"num_backbone_codebooks": 1}))
+    assert model.num_backbone_codebooks == 1
+
+
+def test_acoustic_refiner_reads_backbone_codebooks_off_its_schedule():
+    _seed_everything()
+    model = _make_easy_magpie_model(_parallel_local_transformer_cfg())
+    assert model.num_backbone_codebooks == 1
 
 
 def test_acoustic_refiner_requires_backbone_hidden_dim():
