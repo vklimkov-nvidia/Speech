@@ -70,11 +70,18 @@ class EasyMagpieOmniArch:
 
     # How each backbone hidden state is expanded into the stacked audio
     # codebooks. ``autoregressive`` uses the intra-frame local transformer;
-    # ``parallel`` projects the backbone state to every codebook at once.
+    # ``parallel`` projects the backbone state to every codebook at once;
+    # ``backbone`` assigns one trailing backbone block to each codebook.
     codebook_prediction_mode: str = "autoregressive"
     local_transformer_n_layers: int = 3
     local_transformer_n_heads: int = 12
     local_transformer_hidden_dim: int = 1536
+
+    # ``backbone`` mode keeps this many ordinary temporal layers before the
+    # per-codebook tail. Each tail entry is one logical backbone block, with the
+    # selected internal mixer composition.
+    backbone_codebook_start_layer: int = 16
+    backbone_codebook_layer_type: str = "attention_ffn"
 
     # Optional checkpoint-specific special-token ids.
     forced_audio_bos_id: int | None = None
@@ -86,11 +93,22 @@ class EasyMagpieOmniArch:
     def validate(self, *, text_vocab_size: int | None = None) -> None:
         """Reject architecture variants the current vLLM implementation cannot serve."""
 
-        if self.codebook_prediction_mode not in {"autoregressive", "parallel"}:
+        if self.codebook_prediction_mode not in {"autoregressive", "parallel", "backbone"}:
             raise ValueError(
-                "codebook_prediction_mode must be 'autoregressive' or 'parallel', got "
+                "codebook_prediction_mode must be 'autoregressive', 'parallel', or 'backbone', got "
                 f"{self.codebook_prediction_mode!r}"
             )
+        if self.uses_backbone_codebook_layers:
+            if self.backbone_codebook_start_layer <= 0:
+                raise ValueError(
+                    "backbone_codebook_start_layer must be positive in backbone mode, got "
+                    f"{self.backbone_codebook_start_layer}"
+                )
+            if self.backbone_codebook_layer_type not in {"attention_ffn", "mamba_ffn", "attention"}:
+                raise ValueError(
+                    "backbone_codebook_layer_type must be 'attention_ffn', 'mamba_ffn', or 'attention', got "
+                    f"{self.backbone_codebook_layer_type!r}"
+                )
 
         positive_fields = (
             "hidden_dim",
@@ -193,6 +211,34 @@ class EasyMagpieOmniArch:
         return self.codebook_prediction_mode == "autoregressive"
 
     @property
+    def uses_backbone_codebook_layers(self) -> bool:
+        """Whether trailing backbone blocks predict codebooks sequentially."""
+        return self.codebook_prediction_mode == "backbone"
+
+    def validate_backbone_codebook_layout(self, hf_config: Any) -> None:
+        """Validate the logical layer count and cache topology for backbone mode."""
+        if not self.uses_backbone_codebook_layers:
+            return
+
+        expected_layers = self.backbone_codebook_start_layer + self.num_stacked_codebooks
+        num_hidden_layers = int(getattr(hf_config, "num_hidden_layers", 0) or 0)
+        pattern = str(getattr(hf_config, "hybrid_override_pattern", "") or "")
+        if num_hidden_layers != expected_layers or len(pattern) != expected_layers:
+            raise ValueError(
+                "backbone codebook prediction requires one logical tail block per stacked codebook: "
+                f"expected num_hidden_layers=len(hybrid_override_pattern)={expected_layers}, got "
+                f"{num_hidden_layers} and {len(pattern)}"
+            )
+
+        expected_tail_symbol = "M" if self.backbone_codebook_layer_type == "mamba_ffn" else "*"
+        tail = pattern[self.backbone_codebook_start_layer :]
+        if tail != expected_tail_symbol * self.num_stacked_codebooks:
+            raise ValueError(
+                f"backbone_codebook_layer_type={self.backbone_codebook_layer_type!r} requires a tail of "
+                f"{self.num_stacked_codebooks} {expected_tail_symbol!r} symbols, got {tail!r}"
+            )
+
+    @property
     def text_prefill_num(self) -> int:
         """Text-led decode positions that can be folded into causal prefill.
 
@@ -286,6 +332,8 @@ class EasyMagpieOmniArch:
             "local_transformer_n_layers",
             "local_transformer_n_heads",
             "local_transformer_hidden_dim",
+            "backbone_codebook_start_layer",
+            "backbone_codebook_layer_type",
             "forced_audio_bos_id",
             "forced_audio_eos_id",
             "forced_mask_token_id",
@@ -300,6 +348,7 @@ class EasyMagpieOmniArch:
         merged.pop("extra", None)
         arch = cls(**merged)
         arch.validate(text_vocab_size=getattr(hf_config, "text_vocab_size", None))
+        arch.validate_backbone_codebook_layout(hf_config)
         return arch
 
 
