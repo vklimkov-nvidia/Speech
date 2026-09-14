@@ -113,6 +113,7 @@ async def test_http_adapter_folds_four_text_positions_into_prefill():
         input="hello",
         voice="eng",
         extra_params=None,
+        max_new_tokens=None,
     )
 
     prepared = await adapter.build(
@@ -127,6 +128,33 @@ async def test_http_adapter_folds_four_text_positions_into_prefill():
     assert info["text_tokens"] == [10, 11, 12, 13, 14, 99]
     assert info["prefill_text_tokens"] == [10, 11, 12, 13]
     assert info["text_prefill_num"] == 4
+
+
+@pytest.mark.asyncio
+async def test_http_adapter_applies_decode_budget_and_disables_dummy_weight_eos():
+    stage = SimpleNamespace(engine_args=SimpleNamespace(model_stage="easymagpie", load_format="dummy"))
+    adapter = _build_adapter_cls()(SimpleNamespace(engine_client=SimpleNamespace(stage_configs=[stage])))
+    adapter._prompt_len = lambda _speaker_id: 2
+    adapter._text_stream_metadata = lambda: (99, 4)
+    adapter._model_tokenizer = lambda: SimpleNamespace(encode=lambda *_args, **_kwargs: [10, 11, 12, 13])
+    request = SimpleNamespace(
+        input="hello",
+        voice="eng",
+        extra_params=None,
+        max_new_tokens=128,
+    )
+    original = SamplingParams(max_tokens=2048, ignore_eos=False, stop_token_ids=[1])
+    sampling_params_list = [original]
+
+    await adapter.build(request, sampling_params_list, has_inline_ref_audio=False)
+
+    assert sampling_params_list[0] is not original
+    assert sampling_params_list[0].max_tokens == 128
+    assert sampling_params_list[0].ignore_eos is True
+    assert sampling_params_list[0].stop_token_ids == []
+    assert original.max_tokens == 2048
+    assert original.ignore_eos is False
+    assert original.stop_token_ids == [1]
 
 
 def test_adapter_treats_null_text_eos_as_legacy_vocab_offset():

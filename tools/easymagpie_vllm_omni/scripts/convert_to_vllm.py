@@ -130,7 +130,11 @@ def parse_args():
         description="Convert an EasyMagpieTTS .nemo checkpoint to a vLLM-Omni model directory."
     )
     parser.add_argument("--nemo_file", required=True, help="Path to the EasyMagpieTTS .nemo checkpoint.")
-    parser.add_argument("--codec_model_path", required=True, help="Path to the audio codec .nemo checkpoint.")
+    parser.add_argument(
+        "--codec_model_path",
+        required=True,
+        help="Path to the audio codec .nemo or Lightning .ckpt checkpoint.",
+    )
     parser.add_argument("--outdir", required=True, help="Output directory for the vLLM model.")
     parser.add_argument(
         "--phoneme_tokenizer_path",

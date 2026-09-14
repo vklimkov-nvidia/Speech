@@ -12,35 +12,46 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Convert an EasyMagpie spectral codec ``.nemo`` to a native vLLM bundle."""
+"""Convert an EasyMagpie spectral codec checkpoint to a native vLLM bundle."""
 
 from __future__ import annotations
 
 import argparse
+import builtins
+import collections
 import shutil
 import tarfile
 import tempfile
+import typing
 from pathlib import Path
 
 import torch
 import yaml
 from easymagpie_vllm_omni.codec.config import EasyMagpieCodecConfig
 from easymagpie_vllm_omni.codec.weight_conversion import convert_decoder_state_dict
+from omegaconf import DictConfig, ListConfig, OmegaConf
+from omegaconf.base import ContainerMetadata, Metadata
+from omegaconf.nodes import AnyNode
 from safetensors.torch import save_file
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("codec", type=Path, help="Input 25-fps spectral codec .nemo")
+    parser.add_argument("codec", type=Path, help="Input 25-fps spectral codec .nemo or Lightning .ckpt")
     parser.add_argument("output", type=Path, help="Output Hugging Face/vLLM model directory")
-    parser.add_argument("--num-codebooks", type=int, default=8, help="EasyMagpie-side FSQ group count")
+    parser.add_argument(
+        "--num-codebooks",
+        type=int,
+        default=None,
+        help="EasyMagpie-side FSQ group count (default: infer from checkpoint, else 8)",
+    )
     parser.add_argument("--frame-stacking-factor", type=int, default=2)
     parser.add_argument(
         "--num-levels-per-group",
         type=int,
         nargs="+",
-        default=[4, 4, 4, 4, 4],
-        help="EasyMagpie-side FSQ levels; their product is the codebook size",
+        default=None,
+        help="EasyMagpie-side FSQ levels (default: infer from checkpoint, else 4 4 4 4 4)",
     )
     return parser.parse_args()
 
@@ -59,6 +70,56 @@ def _read_nemo(codec_path: Path) -> tuple[dict, dict[str, torch.Tensor]]:
             temporary.flush()
             state = torch.load(temporary.name, map_location="cpu", weights_only=True)
     return config, state
+
+
+def _read_lightning_checkpoint(codec_path: Path) -> tuple[dict, dict[str, torch.Tensor]]:
+    """Read a NeMo Lightning checkpoint without executing arbitrary pickle globals."""
+    safe_globals = [
+        AnyNode,
+        DictConfig,
+        ListConfig,
+        collections.defaultdict,
+        builtins.dict,
+        Metadata,
+        typing.Any,
+        ContainerMetadata,
+        builtins.int,
+        builtins.list,
+    ]
+    with torch.serialization.safe_globals(safe_globals):
+        checkpoint = torch.load(codec_path, map_location="cpu", mmap=True, weights_only=True)
+
+    hyper_parameters = checkpoint.get("hyper_parameters", {})
+    config = hyper_parameters.get("cfg", hyper_parameters)
+    if OmegaConf.is_config(config):
+        config = OmegaConf.to_container(config, resolve=True)
+    if not isinstance(config, dict):
+        raise RuntimeError(f"invalid Lightning config in {codec_path}: {type(config).__name__}")
+
+    state = checkpoint.get("state_dict")
+    if not isinstance(state, dict):
+        raise RuntimeError(f"missing state_dict in Lightning checkpoint: {codec_path}")
+    return config, state
+
+
+def _read_codec(codec_path: Path) -> tuple[dict, dict[str, torch.Tensor]]:
+    if tarfile.is_tarfile(codec_path):
+        return _read_nemo(codec_path)
+    return _read_lightning_checkpoint(codec_path)
+
+
+def resolve_quantizer_config(
+    nemo_config: dict,
+    num_codebooks: int | None,
+    num_levels_per_group: list[int] | None,
+) -> tuple[int, list[int]]:
+    """Resolve FSQ geometry from CLI overrides, checkpoint metadata, or legacy defaults."""
+    quantizer_config = nemo_config.get("vector_quantizer", {})
+    resolved_codebooks = int(num_codebooks or quantizer_config.get("num_groups", 8))
+    resolved_levels = list(
+        num_levels_per_group or quantizer_config.get("num_levels_per_group", [4, 4, 4, 4, 4])
+    )
+    return resolved_codebooks, resolved_levels
 
 
 def validate_decoder_config(decoder_config: dict) -> None:
@@ -94,11 +155,15 @@ def restore_speech_decoder(decoder_config: dict, state: dict[str, torch.Tensor])
 
 def main() -> None:
     args = parse_args()
-    nemo_config, state = _read_nemo(args.codec)
+    nemo_config, state = _read_codec(args.codec)
     decoder_config = nemo_config["audio_decoder"]
     validate_decoder_config(decoder_config)
 
-    levels = list(args.num_levels_per_group)
+    num_codebooks, levels = resolve_quantizer_config(
+        nemo_config,
+        args.num_codebooks,
+        args.num_levels_per_group,
+    )
     codebook_size = 1
     for level in levels:
         codebook_size *= level
@@ -114,12 +179,18 @@ def main() -> None:
         kernel_size=int(decoder_config.get("kernel_size", 3)),
         resblock_kernel_size=int(decoder_config.get("resblock_up_sample_kernel_size", 7)),
         activation=str(decoder_config.get("activation", "half_snake")),
-        num_codebooks=args.num_codebooks,
+        num_codebooks=num_codebooks,
         codebook_size=codebook_size,
         num_levels_per_group=levels,
         frame_stacking_factor=args.frame_stacking_factor,
         output_sample_rate=int(nemo_config.get("output_sample_rate", nemo_config["sample_rate"])),
     )
+    expected_samples = nemo_config.get("samples_per_frame")
+    if expected_samples is not None and config.samples_per_codec_frame != int(expected_samples):
+        raise ValueError(
+            "decoder upsampling product does not match samples_per_frame: "
+            f"{config.samples_per_codec_frame} != {expected_samples}"
+        )
 
     decoder = restore_speech_decoder(decoder_config, state)
     converted = convert_decoder_state_dict(state)

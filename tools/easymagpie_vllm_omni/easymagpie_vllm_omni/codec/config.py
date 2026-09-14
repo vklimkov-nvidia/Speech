@@ -148,3 +148,33 @@ class EasyMagpieCodecConfig(PretrainedConfig):
     @property
     def samples_per_frame(self) -> int:
         return self.frame_stacking_factor * self.samples_per_codec_frame
+
+    @property
+    def state_elements(self) -> int:
+        """Uniform state-page length required by the largest causal layer."""
+        candidates = [(self.kernel_size - 1) * self.input_dim]
+        channels = self.input_filters
+        for filters in self.pre_upsample_filters:
+            # The residual skip convolution consumes twice the block channels;
+            # the transposed convolution retains one input row.
+            candidates.extend(((self.kernel_size - 1) * 2 * channels, channels))
+            channels = filters
+
+        if self.num_hidden_layers:
+            candidates.extend(
+                (
+                    (self.kernel_size - 1) * channels,
+                    (self.kernel_size - 1) * self.hidden_filters,
+                )
+            )
+
+        for filters in self.resblock_upsample_filters:
+            candidates.extend(
+                (
+                    channels,
+                    (self.resblock_kernel_size - 1) * 2 * filters,
+                )
+            )
+            channels = filters
+        candidates.append((self.resblock_kernel_size - 1) * channels)
+        return max(candidates)

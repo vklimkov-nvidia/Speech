@@ -124,6 +124,15 @@ def _build_adapter_cls() -> type:
                 self._arch_cache = EasyMagpieOmniArch.from_hf_config(SimpleNamespace(**self._model_config()))
             return self._arch_cache
 
+        def _uses_dummy_weights(self) -> bool:
+            engine_client = getattr(self.ctx, "engine_client", None)
+            for stage in getattr(engine_client, "stage_configs", None) or []:
+                engine_args = getattr(stage, "engine_args", None)
+                if getattr(engine_args, "model_stage", None) != _TALKER_STAGE:
+                    continue
+                return str(getattr(engine_args, "load_format", "auto")).lower() == "dummy"
+            return False
+
         def _text_stream_metadata(self) -> tuple[int, int]:
             config = self._model_config()
             text_vocab_size = int(config.get("text_vocab_size", config.get("vocab_size", 0)))
@@ -151,7 +160,23 @@ def _build_adapter_cls() -> type:
             sampling_params_list: list,
             has_inline_ref_audio: bool,
         ) -> "PreparedRequest":
-            del sampling_params_list, has_inline_ref_audio  # EasyMagpie needs neither.
+            del has_inline_ref_audio
+            max_new_tokens = getattr(request, "max_new_tokens", None)
+            use_dummy_weights = self._uses_dummy_weights()
+            if sampling_params_list and (max_new_tokens is not None or use_dummy_weights):
+                import copy
+
+                stage0_params = copy.deepcopy(sampling_params_list[0])
+                if max_new_tokens is not None:
+                    stage0_params.max_tokens = int(max_new_tokens)
+                if use_dummy_weights:
+                    # Random acoustic heads can emit the synthetic audio-EOS signal.
+                    # Dummy-weight performance runs must consume the full requested
+                    # decode budget instead of stopping at that meaningless sample.
+                    stage0_params.ignore_eos = True
+                    stage0_params.stop_token_ids = []
+                sampling_params_list[0] = stage0_params
+
             speaker_id = (request.voice or _DEFAULT_SPEAKER).strip()
             extra = request.extra_params or {}
             text_eos_id, text_prefill_num = self._text_stream_metadata()

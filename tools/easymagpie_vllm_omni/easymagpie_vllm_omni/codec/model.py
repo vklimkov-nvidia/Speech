@@ -43,9 +43,10 @@ class EasyMagpieCodecForConditionalGeneration(nn.Module):
 
     @classmethod
     def get_mamba_state_shape_from_config(cls, vllm_config: VllmConfig) -> tuple[tuple[int]]:
-        from easymagpie_vllm_omni.codec.packed import CODEC_STATE_ELEMENTS
-
-        return ((CODEC_STATE_ELEMENTS,),)
+        config = vllm_config.model_config.hf_config
+        if not isinstance(config, EasyMagpieCodecConfig):
+            config = EasyMagpieCodecConfig(**config.to_dict())
+        return ((config.state_elements,),)
 
     @classmethod
     def get_mamba_state_dtype_from_config(cls, vllm_config: VllmConfig) -> tuple[torch.dtype]:

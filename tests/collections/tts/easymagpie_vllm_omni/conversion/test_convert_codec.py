@@ -14,6 +14,8 @@
 
 import convert_codec as converter
 import pytest
+import torch
+from omegaconf import OmegaConf
 
 
 def _valid_decoder_config() -> dict:
@@ -38,3 +40,33 @@ def test_validate_decoder_config_rejects_unsupported_codec(field, value, message
 
     with pytest.raises(ValueError, match=message):
         converter.validate_decoder_config(config)
+
+
+def test_read_lightning_checkpoint(tmp_path):
+    path = tmp_path / "codec.ckpt"
+    config = {"sample_rate": 32000, "audio_decoder": _valid_decoder_config()}
+    state = {"audio_decoder.weight": torch.arange(3)}
+    torch.save(
+        {
+            "hyper_parameters": OmegaConf.create({"cfg": config}),
+            "state_dict": state,
+        },
+        path,
+    )
+
+    actual_config, actual_state = converter._read_lightning_checkpoint(path)
+
+    assert actual_config == config
+    assert torch.equal(actual_state["audio_decoder.weight"], state["audio_decoder.weight"])
+
+
+def test_resolve_quantizer_config_infers_checkpoint_geometry():
+    config = {
+        "vector_quantizer": {
+            "num_groups": 8,
+            "num_levels_per_group": [4, 4, 4, 4, 4, 4],
+        }
+    }
+
+    assert converter.resolve_quantizer_config(config, None, None) == (8, [4, 4, 4, 4, 4, 4])
+    assert converter.resolve_quantizer_config(config, 4, [3, 3]) == (4, [3, 3])
