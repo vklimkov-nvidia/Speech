@@ -16,7 +16,7 @@ Model definition and pipeline registration live in
 [`vllm_plugin_easymagpie_omni/`](vllm_plugin_easymagpie_omni/).
 Deployment knobs are in [`deploy/easymagpie.yaml`](deploy/easymagpie.yaml).
 
-Stage 0 supports two `codebook_prediction_mode` values in `config.json`:
+Stage 0 supports three `codebook_prediction_mode` values in `config.json`:
 
 - `autoregressive` (default) runs the intra-frame local transformer and its
   per-codebook projection heads.
@@ -24,6 +24,27 @@ Stage 0 supports two `codebook_prediction_mode` values in `config.json`:
   projection to produce every stacked-codebook distribution in a single graph.
   A real checkpoint must provide `parallel_codebook_out_projection.{weight,bias}`;
   dummy loading initializes these parameters automatically.
+- `backbone` also omits the local transformer. It keeps
+  `backbone_codebook_start_layer` ordinary temporal blocks, then assigns one
+  trailing logical block to each stacked codebook. After each tail block, the
+  sampled code is embedded and added to the live hidden/residual stream before
+  the next block. `backbone_codebook_layer_type` selects `attention_ffn`,
+  `mamba_ffn`, or `attention`. The `hybrid_override_pattern` tail must contain
+  one `M` entry per codebook for `mamba_ffn`, or one `*` entry per codebook for
+  either attention variant. A trained checkpoint must
+  provide `backbone_codebook_output_norms.*` and
+  `backbone_codebook_output_projections.*` plus tail block weights. Pipeline
+  parallelism is not supported for this experimental mode.
+
+The review dummy checkpoints use 32 logical layers and retain the current
+model's first 16 entries verbatim (`MEMEM*EMEMEM*EME`). Their 16-entry tails
+compare attention+FFN, Mamba+FFN, and attention-only codebook blocks. The two
+composite variants therefore execute two mixer sublayers inside each logical
+tail block while preserving one codebook prediction per layer entry.
+The corresponding directories are
+`converted_model_roy_fullsize_32khz_backbone_attn_ffn_dummy`,
+`converted_model_roy_fullsize_32khz_backbone_mamba_ffn_dummy`, and
+`converted_model_roy_fullsize_32khz_backbone_attn_dummy`.
 
 The converter currently emits `autoregressive` checkpoints because the NeMo
 training checkpoints contain local-transformer weights.
