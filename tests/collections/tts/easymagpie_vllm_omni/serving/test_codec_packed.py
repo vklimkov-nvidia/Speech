@@ -116,6 +116,40 @@ def mixed_metadata(prefill_frames: int, *, device: torch.device | str = "cpu") -
     return result
 
 
+@pytest.mark.parametrize(
+    ("rates", "filters"),
+    [
+        ([10, 8, 8], [512, 256, 64]),
+        ([8, 10, 8], [512, 128, 32]),
+    ],
+)
+def test_state_page_scales_for_32khz_layouts(rates, filters) -> None:
+    config = EasyMagpieCodecConfig(
+        input_dim=48,
+        input_filters=1024,
+        hidden_filters=1536,
+        num_hidden_layers=6,
+        pre_upsample_rates=[2],
+        pre_upsample_filters=[1024],
+        resblock_upsample_rates=rates,
+        resblock_upsample_filters=filters,
+        num_codebooks=8,
+        codebook_size=4096,
+        num_levels_per_group=[4, 4, 4, 4, 4, 4],
+        frame_stacking_factor=2,
+        output_sample_rate=32000,
+    )
+    assert config.samples_per_frame == 2560
+    assert config.state_elements == 6144
+
+    vllm_config = VllmConfig()
+    with set_current_vllm_config(vllm_config):
+        packed = PackedEasyMagpieCodec(config, dtype=torch.float32).eval()
+    state_layers = [module for module in packed.modules() if isinstance(module, CodecStateLayer)]
+    assert state_layers
+    assert all(layer.state_elements == 6144 for layer in state_layers)
+
+
 def test_packed_profile_path_registers_state_layers() -> None:
     torch.manual_seed(11)
     config = tiny_config()

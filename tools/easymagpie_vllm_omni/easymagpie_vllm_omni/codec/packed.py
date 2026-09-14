@@ -40,9 +40,8 @@ from vllm.v1.attention.backends.mamba1_attn import (
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 from vllm.v1.kv_cache_interface import KVCacheSpec, MambaSpec
 
-# Largest real history is 6 * 768 = 4608 values (a k=7 skip conv).
-# Every codec state layer advertises the same allocation so vLLM can place all
-# layers in uniform Mamba-style cache groups.
+# Backward-compatible default for the 22.05 kHz codec. Real model layers use
+# ``config.state_elements`` so wider decoders receive a sufficiently large page.
 CODEC_STATE_ELEMENTS = 4608
 
 
@@ -138,9 +137,12 @@ class PackedHalfSnake(nn.Module):
 class CodecStateLayer(nn.Module, AttentionLayerBase):
     """Base class for a cache-owning packed codec layer."""
 
-    def __init__(self, *, time_factor: int, dtype: torch.dtype, prefix: str) -> None:
+    def __init__(
+        self, *, time_factor: int, state_elements: int = CODEC_STATE_ELEMENTS, dtype: torch.dtype, prefix: str
+    ) -> None:
         super().__init__()
         self.time_factor = int(time_factor)
+        self.state_elements = int(state_elements)
         self.dtype = dtype
         self.kv_cache = [torch.tensor([])]
 
@@ -163,7 +165,7 @@ class CodecStateLayer(nn.Module, AttentionLayerBase):
             raise ValueError("EasyMagpie codec requires a resolved mamba_block_size")
         return MambaSpec(
             block_size=block_size,
-            shapes=((CODEC_STATE_ELEMENTS,),),
+            shapes=((self.state_elements,),),
             dtypes=(self.dtype,),
             page_size_padded=vllm_config.cache_config.mamba_page_size_padded,
             mamba_type=MambaAttentionBackendEnum.MAMBA1,
@@ -257,15 +259,16 @@ class PackedCausalConv1d(CodecStateLayer):
         *,
         activate: bool,
         time_factor: int,
+        state_elements: int = CODEC_STATE_ELEMENTS,
         dtype: torch.dtype,
         prefix: str,
     ) -> None:
-        super().__init__(time_factor=time_factor, dtype=dtype, prefix=prefix)
+        super().__init__(time_factor=time_factor, state_elements=state_elements, dtype=dtype, prefix=prefix)
         self.conv = nn.Conv1d(in_channels, out_channels, kernel_size)
         self.in_channels = in_channels
         self.history = kernel_size - 1
         self.activation = PackedHalfSnake(out_channels) if activate else nn.Identity()
-        if self.history * self.in_channels > CODEC_STATE_ELEMENTS:
+        if self.history * self.in_channels > self.state_elements:
             raise ValueError("codec convolution history exceeds the uniform state page")
 
     def _one(self, inputs: torch.Tensor, page: torch.Tensor, has_initial: bool) -> torch.Tensor:
@@ -397,10 +400,11 @@ class PackedCausalConvTranspose1d(CodecStateLayer):
         stride: int,
         *,
         time_factor: int,
+        state_elements: int = CODEC_STATE_ELEMENTS,
         dtype: torch.dtype,
         prefix: str,
     ) -> None:
-        super().__init__(time_factor=time_factor, dtype=dtype, prefix=prefix)
+        super().__init__(time_factor=time_factor, state_elements=state_elements, dtype=dtype, prefix=prefix)
         self.in_channels = in_channels
         self.stride = stride
         self.conv = nn.ConvTranspose1d(
@@ -411,6 +415,8 @@ class PackedCausalConvTranspose1d(CodecStateLayer):
             groups=out_channels,
         )
         self.activation = PackedHalfSnake(out_channels)
+        if self.in_channels > self.state_elements:
+            raise ValueError("codec transposed-convolution state exceeds the uniform state page")
 
     def _one(self, inputs: torch.Tensor, page: torch.Tensor, has_initial: bool) -> torch.Tensor:
         state = page[: self.in_channels].view(1, self.in_channels)
@@ -546,6 +552,7 @@ class PackedResidualBlock(nn.Module):
         kernel_size: int,
         *,
         time_factor: int,
+        state_elements: int = CODEC_STATE_ELEMENTS,
         dtype: torch.dtype,
         prefix: str,
     ) -> None:
@@ -556,6 +563,7 @@ class PackedResidualBlock(nn.Module):
             kernel_size,
             activate=True,
             time_factor=time_factor,
+            state_elements=state_elements,
             dtype=dtype,
             prefix=f"{prefix}.input_conv",
         )
@@ -565,6 +573,7 @@ class PackedResidualBlock(nn.Module):
             kernel_size,
             activate=False,
             time_factor=time_factor,
+            state_elements=state_elements,
             dtype=dtype,
             prefix=f"{prefix}.skip_conv",
         )
@@ -578,12 +587,14 @@ class PackedResNetDecoder(nn.Module):
     def __init__(self, config: EasyMagpieCodecConfig, *, dtype: torch.dtype, prefix: str) -> None:
         super().__init__()
         factor = config.frame_stacking_factor
+        state_elements = config.state_elements
         self.pre_conv = PackedCausalConv1d(
             config.input_dim,
             config.input_filters,
             config.kernel_size,
             activate=False,
             time_factor=factor,
+            state_elements=state_elements,
             dtype=dtype,
             prefix=f"{prefix}.pre_conv",
         )
@@ -598,6 +609,7 @@ class PackedResNetDecoder(nn.Module):
                     2 * channels,
                     config.kernel_size,
                     time_factor=factor,
+                    state_elements=state_elements,
                     dtype=dtype,
                     prefix=f"{prefix}.pre_resblocks.{index}",
                 )
@@ -608,6 +620,7 @@ class PackedResNetDecoder(nn.Module):
                     filters,
                     rate,
                     time_factor=factor,
+                    state_elements=state_elements,
                     dtype=dtype,
                     prefix=f"{prefix}.pre_up_sample_layers.{index}",
                 )
@@ -621,6 +634,7 @@ class PackedResNetDecoder(nn.Module):
                 config.hidden_filters,
                 config.kernel_size,
                 time_factor=factor,
+                state_elements=state_elements,
                 dtype=dtype,
                 prefix=f"{prefix}.conv_layers.{index}",
             )
@@ -636,6 +650,7 @@ class PackedResNetDecoder(nn.Module):
                     filters,
                     rate,
                     time_factor=factor,
+                    state_elements=state_elements,
                     dtype=dtype,
                     prefix=f"{prefix}.resblock_up_sample_layers.{index}",
                 )
@@ -647,6 +662,7 @@ class PackedResNetDecoder(nn.Module):
                     2 * filters,
                     config.resblock_kernel_size,
                     time_factor=factor,
+                    state_elements=state_elements,
                     dtype=dtype,
                     prefix=f"{prefix}.resblocks.{index}",
                 )
@@ -659,6 +675,7 @@ class PackedResNetDecoder(nn.Module):
             config.resblock_kernel_size,
             activate=False,
             time_factor=factor,
+            state_elements=state_elements,
             dtype=dtype,
             prefix=f"{prefix}.post_conv",
         )

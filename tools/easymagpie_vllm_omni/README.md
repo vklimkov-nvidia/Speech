@@ -3,12 +3,12 @@
 Streaming TTS for **NemotronTTS** (Nemotron-H backbone + per-codebook local
 transformer over a 25 fps spectral codec) via [vLLM-Omni](https://github.com/vllm-project/vllm-omni).
 
-EasyMagpieTTS decomposes into EasyMagpie LM and SpectralCodec-BWE-22kHz:
+EasyMagpieTTS decomposes into an EasyMagpie LM and a causal spectral codec:
 
 | Stage | Role |
 |-------|------|
 | **0 — EasyMagpie LM** | `EasyMagpie_LM_Backbone` (Nemotron-H) + `EasyMagpie_LM_LT` → stacked acoustic codes |
-| **1 — SpectralCodec-BWE-22kHz** | Stateful native vLLM codec → 22.05 kHz waveform |
+| **1 — SpectralCodec** | Stateful native vLLM codec → checkpoint-native-rate waveform |
 
 Model definition and pipeline registration live in
 [`easymagpie_vllm_omni/`](easymagpie_vllm_omni/) and
@@ -31,6 +31,11 @@ python tools/easymagpie_vllm_omni/scripts/convert_to_vllm.py \
   --context_audio /path/to/reference_voice.wav \
   --speaker_name eng
 ```
+
+The codec converter accepts either a packaged `.nemo` file or a NeMo
+Lightning `.ckpt`. It infers the FSQ group count and levels from checkpoint
+metadata, including 32 kHz codecs with 4096-entry codebooks and alternate
+upsampling layouts.
 
 ### Setup the serving environment
 
@@ -109,7 +114,19 @@ python scripts/benchmark_model.py --model ./converted_model -n 128 -c 1 32 \
 # Benchmark the service's HTTP API.
 python scripts/benchmark_server.py --text-file vctk_subset.txt -n 128 -c 1 32
 
+# Benchmark both service stages with dummy weights and a fixed 128-step decode.
+EASYMAGPIE_DEPLOY_CONFIG=deploy/easymagpie_dummy.yaml \\
+    bash scripts/run_server.sh ./converted_model 8091
+python scripts/benchmark_server.py --text-file vctk_subset.txt -n 128 -c 32 \\
+    --max-new-tokens 128
+
 # Benchmark the service's incremental synthesis via its WebSocket API.
 python scripts/benchmark_incremental_server.py --model ./converted_model \
     --text-file vctk_subset.txt --tokens-per-chunk 5 -n 128 -c 1 32
 ```
+
+The dummy deployment loads random weights for both stages. For a dummy-loaded
+talker, the HTTP adapter ignores its synthetic audio-EOS signal so
+`--max-new-tokens` is the exact decode length for every request.
+Use `deploy/easymagpie_dummy_talker.yaml` to keep that fixed-length dummy
+talker while loading the converted codec weights from `codec_native`.
