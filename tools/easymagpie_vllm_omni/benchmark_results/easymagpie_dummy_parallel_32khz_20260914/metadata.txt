@@ -1,0 +1,17 @@
+started_at=2026-09-14T16:43:29+02:00
+git_commit=065059398f02555f1461b95255e4c36bc8aacb41
+model=/home/vklimkov/workspace/benchmarks/Speech/tools/easymagpie_vllm_omni/converted_model_roy_fullsize_32khz_parallel_dummy
+codebook_prediction_mode=parallel
+local_transformer_n_layers=0
+deploy_config=/home/vklimkov/workspace/benchmarks/Speech/tools/easymagpie_vllm_omni/deploy/easymagpie_dummy.yaml
+requests_per_run=128
+concurrency=1,32
+repetitions=5
+max_new_tokens=128
+sample_rate=32000
+INFO 09-14 16:43:33 [patch.py:252] NVFP4 W4A4 weight_scale NaN-clamp: installed.
+torch=2.11.0+cu130
+vllm=0.24.0
+vllm_omni=0.24.0
+gpu=NVIDIA RTX A6000
+completed_at=2026-09-14T16:50:56+02:00

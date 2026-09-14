@@ -1,19 +1,32 @@
 ## EasyMagpieTTS — vLLM-Omni two-stage inference
 
-Streaming TTS for **NemotronTTS** (Nemotron-H backbone + per-codebook local
-transformer over a 25 fps spectral codec) via [vLLM-Omni](https://github.com/vllm-project/vllm-omni).
+Streaming TTS for **NemotronTTS** (Nemotron-H backbone + configurable
+codebook predictor over a 25 fps spectral codec) via
+[vLLM-Omni](https://github.com/vllm-project/vllm-omni).
 
 EasyMagpieTTS decomposes into an EasyMagpie LM and a causal spectral codec:
 
 | Stage | Role |
 |-------|------|
-| **0 — EasyMagpie LM** | `EasyMagpie_LM_Backbone` (Nemotron-H) + `EasyMagpie_LM_LT` → stacked acoustic codes |
+| **0 — EasyMagpie LM** | Nemotron-H backbone + configured codebook predictor → stacked acoustic codes |
 | **1 — SpectralCodec** | Stateful native vLLM codec → checkpoint-native-rate waveform |
 
 Model definition and pipeline registration live in
 [`easymagpie_vllm_omni/`](easymagpie_vllm_omni/) and
 [`vllm_plugin_easymagpie_omni/`](vllm_plugin_easymagpie_omni/).
 Deployment knobs are in [`deploy/easymagpie.yaml`](deploy/easymagpie.yaml).
+
+Stage 0 supports two `codebook_prediction_mode` values in `config.json`:
+
+- `autoregressive` (default) runs the intra-frame local transformer and its
+  per-codebook projection heads.
+- `parallel` omits the local transformer and uses one direct backbone
+  projection to produce every stacked-codebook distribution in a single graph.
+  A real checkpoint must provide `parallel_codebook_out_projection.{weight,bias}`;
+  dummy loading initializes these parameters automatically.
+
+The converter currently emits `autoregressive` checkpoints because the NeMo
+training checkpoints contain local-transformer weights.
 
 ### Convert a NeMo checkpoint
 

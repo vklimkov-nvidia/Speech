@@ -411,6 +411,7 @@ def build_config(model, vocab_size: int, torch_dtype: str) -> dict:
 
     config["num_task_embeddings"] = len(model.training_modes) if model.task_embedding is not None else 0
 
+    config["codebook_prediction_mode"] = "autoregressive"
     config["local_transformer_n_layers"] = int(cfg.get("local_transformer_n_layers", 2))
     config["local_transformer_n_heads"] = int(cfg.get("local_transformer_n_heads", 1))
     config["local_transformer_hidden_dim"] = int(cfg.get("local_transformer_hidden_dim", hidden_dim))

@@ -68,6 +68,10 @@ class EasyMagpieOmniArch:
     # Number of task embeddings; zero disables task conditioning.
     num_task_embeddings: int = 0
 
+    # How each backbone hidden state is expanded into the stacked audio
+    # codebooks. ``autoregressive`` uses the intra-frame local transformer;
+    # ``parallel`` projects the backbone state to every codebook at once.
+    codebook_prediction_mode: str = "autoregressive"
     local_transformer_n_layers: int = 3
     local_transformer_n_heads: int = 12
     local_transformer_hidden_dim: int = 1536
@@ -82,6 +86,12 @@ class EasyMagpieOmniArch:
     def validate(self, *, text_vocab_size: int | None = None) -> None:
         """Reject architecture variants the current vLLM implementation cannot serve."""
 
+        if self.codebook_prediction_mode not in {"autoregressive", "parallel"}:
+            raise ValueError(
+                "codebook_prediction_mode must be 'autoregressive' or 'parallel', got "
+                f"{self.codebook_prediction_mode!r}"
+            )
+
         positive_fields = (
             "hidden_dim",
             "embedding_dim",
@@ -89,10 +99,13 @@ class EasyMagpieOmniArch:
             "num_audio_codebooks",
             "codebook_size",
             "frame_stacking_factor",
-            "local_transformer_n_layers",
-            "local_transformer_n_heads",
-            "local_transformer_hidden_dim",
         )
+        if self.uses_local_transformer:
+            positive_fields += (
+                "local_transformer_n_layers",
+                "local_transformer_n_heads",
+                "local_transformer_hidden_dim",
+            )
         for name in positive_fields:
             if getattr(self, name) <= 0:
                 raise ValueError(f"{name} must be positive, got {getattr(self, name)}")
@@ -103,7 +116,7 @@ class EasyMagpieOmniArch:
                 "embeddings without an input projection. Add the corresponding projection to support unequal widths; "
                 f"got hidden_dim={self.hidden_dim}, embedding_dim={self.embedding_dim}."
             )
-        if self.local_transformer_hidden_dim % self.local_transformer_n_heads != 0:
+        if self.uses_local_transformer and self.local_transformer_hidden_dim % self.local_transformer_n_heads != 0:
             raise ValueError(
                 "local_transformer_hidden_dim must be divisible by local_transformer_n_heads for the current "
                 "attention implementation; extend EasyMagpieCodePredictor to support other head layouts. Got "
@@ -171,8 +184,13 @@ class EasyMagpieOmniArch:
 
     @property
     def num_stacked_codebooks(self) -> int:
-        """Number of independent codebooks the model autoregresses over (``C * S``)."""
+        """Number of independent codebooks the model predicts per frame (``C * S``)."""
         return self.num_audio_codebooks * self.frame_stacking_factor
+
+    @property
+    def uses_local_transformer(self) -> bool:
+        """Whether codebooks are predicted by the autoregressive local transformer."""
+        return self.codebook_prediction_mode == "autoregressive"
 
     @property
     def text_prefill_num(self) -> int:
@@ -264,6 +282,7 @@ class EasyMagpieOmniArch:
             "phoneme_unk_id",
             "phoneme_confidence_unk_threshold",
             "num_task_embeddings",
+            "codebook_prediction_mode",
             "local_transformer_n_layers",
             "local_transformer_n_heads",
             "local_transformer_hidden_dim",
