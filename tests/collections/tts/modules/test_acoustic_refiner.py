@@ -108,6 +108,32 @@ def test_compute_loss_is_finite_and_differentiable(commit_order):
     assert all(torch.isfinite(parameter.grad).all() for parameter in refiner.out_proj.parameters())
 
 
+@pytest.mark.parametrize("commit_order", [AcousticRefinerOrder.CODEBOOK, AcousticRefinerOrder.CONFIDENCE])
+def test_code_masking_hides_committed_codes_only_while_training(commit_order):
+    """Masking the codes is a training-time regularizer, so evaluation has to be left untouched."""
+    # a share of 1.0 hides every frame, leaving every step to predict from the hidden states alone
+    refiner = _make_refiner(commit_order=commit_order, mask_codes=True, mask_min=1.0, mask_max=1.0)
+    plain = _make_refiner(commit_order=commit_order)
+    target_codes = _codes(batch_size=2, frames=5)
+    hidden_states = torch.randn(2, 5, D_MODEL)
+    lengths = torch.tensor([5, 4])
+
+    refiner.eval()
+    plain.eval()
+    torch.testing.assert_close(
+        refiner.compute_loss(hidden_states, target_codes, lengths),
+        plain.compute_loss(hidden_states, target_codes, lengths),
+    )
+
+    refiner.train()
+    masked = refiner.compute_loss(hidden_states, target_codes, lengths)
+    masked.backward()
+
+    assert torch.isfinite(masked) and masked > 0
+    assert not torch.isclose(masked, plain.compute_loss(hidden_states, target_codes, lengths))
+    assert all(torch.isfinite(parameter.grad).all() for parameter in refiner.out_proj.parameters())
+
+
 def test_compute_loss_ignores_frames_beyond_length():
     refiner = _make_refiner()
     target_codes = _codes(batch_size=2, frames=5)

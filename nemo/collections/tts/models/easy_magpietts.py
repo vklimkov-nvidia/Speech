@@ -39,6 +39,7 @@ from nemo.collections.tts.models.easy_magpietts_inference import EasyMagpieTTSIn
 from nemo.collections.tts.modules.magpietts_modules import (
     LocalTransformerType,
     add_special_tokens,
+    create_feature_mask,
     remove_eos_token,
     remove_special_tokens,
     worker_init_fn,
@@ -813,6 +814,17 @@ class EasyMagpieTTSModel(EasyMagpieTTSInferenceModel):
                     end_tok_input,
                     audio_codes_input,
                 )
+
+        if self.mask_audio_history and self.training:
+            # Hiding a share of the history leaves the model to predict those frames from the text
+            # and the frames further back, rather than from the frame right before them.
+            hidden_frames = create_feature_mask(
+                lengths=audio_codes_lens_target,
+                mask_min=self.audio_history_mask_min,
+                mask_max=self.audio_history_mask_max,
+                x=audio_codes_input[:, 0, :],
+            )
+            audio_codes_input = torch.where(hidden_frames.unsqueeze(1), self.mask_token_id, audio_codes_input)
 
         # Embed audio tokens
         audio_embedded = self.embed_audio_tokens(audio_codes_input)  # (B, T'-1, E)

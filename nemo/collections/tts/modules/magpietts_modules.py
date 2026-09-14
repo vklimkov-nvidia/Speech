@@ -150,6 +150,47 @@ def cosine_schedule(x: torch.Tensor):
     return torch.cos(x * (torch.pi / 2))
 
 
+def create_feature_mask(
+    lengths: Tensor,
+    mask_min: float,
+    mask_max: float,
+    x: Optional[Tensor] = None,
+    alpha: float = 2.0,
+    beta: float = 1.0,
+) -> Tensor:
+    """
+    Picks a random share of every sequence's timesteps to hide during training.
+
+    The share is drawn per sequence from a Beta distribution and rescaled into [mask_min, mask_max].
+    The timesteps themselves are drawn uniformly, so the hidden ones are scattered over the sequence
+    rather than forming contiguous spans.
+
+    Args:
+        lengths (Tensor): Valid length of each sequence, shaped (B,).
+        mask_min (float): Smallest share of timesteps to hide.
+        mask_max (float): Largest share of timesteps to hide.
+        x (Optional[Tensor]): Tensor to shape the mask after, its last dimension being time.
+            Defaults to the longest sequence, as in `get_mask_from_lengths`.
+        alpha (float): First shape parameter of the Beta distribution the share is drawn from.
+        beta (float): Second shape parameter of the Beta distribution.
+
+    Returns:
+        Tensor: Boolean mask shaped (B, T), True where a timestep is hidden.
+    """
+    len_mask = get_mask_from_lengths(lengths, x=x)
+    batch_size, max_len = len_mask.shape
+
+    mask_dist = torch.distributions.beta.Beta(concentration1=alpha, concentration0=beta)
+    mask_share = mask_dist.sample(sample_shape=torch.Size([batch_size])).to(lengths.device)
+    mask_share = mask_min + (mask_max - mask_min) * mask_share
+    # rank the last hidden timestep takes among the draws below, so that as many are hidden as asked
+    mask_rank = torch.clamp_min(mask_share * lengths.float() - 1, 0).long().unsqueeze(1)
+
+    mask_vals = torch.rand((batch_size, max_len), device=lengths.device) * len_mask
+    threshold = torch.gather(mask_vals.sort(dim=1, descending=True).values, index=mask_rank, dim=1)
+    return (mask_vals >= threshold) & len_mask
+
+
 def build_vocabs(subword_vocab: dict, subword_padding_idx: int, special_vocab: dict = None) -> tuple[dict, dict]:
     """
     Builds the character vocabulary and the mapping from subword ids to character ids.
@@ -960,6 +1001,9 @@ class AcousticRefiner(torch.nn.Module):
         codebook_size,
         prediction_schedule=PREDICTION_SCHEDULE,
         commit_order=AcousticRefinerOrder.CODEBOOK,
+        mask_codes=False,
+        mask_min=0.0,
+        mask_max=0.9,
     ):
         super().__init__()
 
@@ -1009,6 +1053,9 @@ class AcousticRefiner(torch.nn.Module):
         self.audio_eos_id = audio_eos_id
         self.mask_token_id = mask_token_id
         self.codebook_size = codebook_size
+        self.mask_codes = mask_codes
+        self.mask_min = mask_min
+        self.mask_max = mask_max
 
     def make_cache(self, batch_size: int, device, dtype) -> List[HybridMambaAttentionDynamicCache]:
         """
@@ -1061,7 +1108,17 @@ class AcousticRefiner(torch.nn.Module):
         num_predictions = torch.zeros((), dtype=torch.long, device=target_codes.device)
         last_step = len(self.prediction_schedule) - 1
         for step, num_to_commit in enumerate(self.prediction_schedule):
-            input_codes = torch.where(committed, target_codes, self.mask_token_id)
+            # Hiding codes a step has committed leaves it to predict those frames from the hidden
+            # states alone. What is hidden is kept apart from what is committed, the loss and the
+            # codebooks a step commits having to stay what they are at inference time.
+            visible = committed
+            if self.mask_codes and self.training:
+                # every step draws its own mask, so that each of them sees a different set of frames
+                hidden_frames = create_feature_mask(
+                    lengths=lengths, mask_min=self.mask_min, mask_max=self.mask_max, x=target_codes[:, :, 0]
+                )
+                visible = committed & ~hidden_frames.unsqueeze(-1)
+            input_codes = torch.where(visible, target_codes, self.mask_token_id)
             hidden_states = self.transformers[step](hidden_states + self._embed(input_codes))
             logits = self.out_proj(hidden_states).reshape(target_codes.shape + (self.codebook_size,))
 

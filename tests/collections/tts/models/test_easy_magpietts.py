@@ -29,7 +29,7 @@ from torch import nn
 from nemo.collections.tts.models import AudioCodecModel
 from nemo.collections.tts.models.easy_magpietts import EasyMagpieTTSModel
 from nemo.collections.tts.models.easy_magpietts_inference import EasyModelInferenceParameters, TrainingMode
-from nemo.collections.tts.modules.magpietts_modules import AcousticRefiner, SpecialAudioToken
+from nemo.collections.tts.modules.magpietts_modules import AcousticRefiner, SpecialAudioToken, create_feature_mask
 from tests.collections.tts.models.test_audio_codec import create_codec_config
 
 
@@ -287,6 +287,55 @@ def test_audio_and_text_embedding_shapes(model):
     assert text_embedded.shape == (2, text_tokens.size(1), model.cfg.embedding_dim)
     assert text_embedded.dtype == torch.float32
     assert torch.isfinite(text_embedded).all()
+
+
+def test_create_feature_mask_hides_the_requested_share_of_valid_timesteps():
+    _seed_everything()
+    lengths = torch.tensor([10, 8, 4], dtype=torch.long)
+    # pinning the share takes the randomness out of how many timesteps are hidden, but not of which
+    mask = create_feature_mask(lengths, mask_min=0.5, mask_max=0.5, x=torch.zeros(3, 10))
+
+    assert mask.shape == (3, 10)
+    assert mask.dtype == torch.bool
+    assert mask.sum(dim=1).tolist() == [5, 4, 2]
+    # padding is never hidden, there being nothing there to hide
+    assert not mask[1, 8:].any()
+    assert not mask[2, 4:].any()
+
+
+@pytest.mark.parametrize("use_codec_latent", [False, True])
+def test_audio_history_masking_only_applies_while_training(use_codec_latent):
+    model = _make_easy_magpie_model(
+        tiny_easy_magpie_cfg(
+            {
+                "mask_audio_history": True,
+                "audio_history_mask_min": 1.0,
+                "audio_history_mask_max": 1.0,
+                "use_codec_latent_audio_embedding": use_codec_latent,
+            }
+        )
+    )
+    codes_kwargs = {
+        "audio_codes": _toy_codes(model, batch_size=2, num_frames=3),
+        "audio_codes_lens": torch.tensor([3, 3], dtype=torch.long),
+        "delay": torch.zeros(2, dtype=torch.long),
+    }
+
+    model.eval()
+    plain, _, _, target_lens, _ = model.prepare_audio_channel_embeddings(**codes_kwargs)
+
+    model.train()
+    masked, _, _, _, _ = model.prepare_audio_channel_embeddings(**codes_kwargs)
+
+    # a share of 1.0 hides every frame, leaving a history of nothing but mask tokens
+    num_frames = int(target_lens.max())
+    all_masked = torch.full(
+        (2, model.num_audio_codebooks * model.frame_stacking_factor, num_frames),
+        model.mask_token_id,
+        dtype=torch.long,
+    )
+    torch.testing.assert_close(masked[:, :num_frames], model.embed_audio_tokens(all_masked))
+    assert not torch.allclose(plain[:, :num_frames], masked[:, :num_frames])
 
 
 def _codec_latent_cfg(overrides=None):
