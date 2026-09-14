@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Autoregressive intra-frame codebook predictor for EasyMagpieTTS."""
+"""Autoregressive and parallel codebook predictors for EasyMagpieTTS."""
 from __future__ import annotations
 
 import torch
@@ -209,6 +209,38 @@ class EasyMagpieCodeLoop(nn.Module):
         return torch.stack(codes, dim=1)
 
 
+@support_torch_compile(dynamic_arg_dims={"dec_hidden": 0, "gumbel_noise": 0})
+class EasyMagpieParallelCodeLoop(nn.Module):
+    """Compiled direct projection and sampling graph for all codebooks."""
+
+    def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
+        super().__init__()
+        arch = EasyMagpieOmniArch.from_hf_config(vllm_config.model_config.hf_config)
+        self.num_codebooks = arch.num_stacked_codebooks
+        self.num_tokens_per_codebook = arch.num_all_tokens_per_codebook
+        self.top_k = min(_DEFAULT_TOP_K, self.num_tokens_per_codebook)
+        self._predictor_ref: tuple = ()
+
+    def bind_predictor(self, predictor: "EasyMagpieCodePredictor") -> None:
+        self._predictor_ref = (predictor,)
+        self.top_k = predictor._sample_top_k
+
+    def forward(
+        self,
+        dec_hidden: torch.Tensor,
+        gumbel_noise: torch.Tensor,
+        temperature: torch.Tensor,
+    ) -> torch.Tensor:
+        """Project one backbone state to every codebook and sample in parallel."""
+        cp = self._predictor_ref[0]
+        logits = cp.parallel_codebook_out_projection(dec_hidden)
+        logits = logits.unflatten(-1, (self.num_codebooks, self.num_tokens_per_codebook))
+        logits = logits.masked_fill(cp.forbidden_mask.view(1, 1, -1), float("-inf")) / temperature
+        vals, idxs = torch.topk(logits, self.top_k, dim=-1)
+        picked = (vals + gumbel_noise).argmax(dim=-1, keepdim=True)
+        return idxs.gather(-1, picked).squeeze(-1)
+
+
 class EasyMagpieCodePredictor(nn.Module):
     """Predict all stacked audio codebooks from each backbone hidden state."""
 
@@ -220,6 +252,7 @@ class EasyMagpieCodePredictor(nn.Module):
         self.num_tokens_per_codebook = arch.num_all_tokens_per_codebook
         self.audio_embedding_dim = arch.audio_embedding_dim
         self.embedding_dim = arch.embedding_dim
+        self.prediction_mode = arch.codebook_prediction_mode
         lt_hidden = arch.local_transformer_hidden_dim
 
         # Per-codebook audio token embeddings (shared with the outer model's
@@ -233,26 +266,34 @@ class EasyMagpieCodePredictor(nn.Module):
         else:
             self.audio_in_projection = nn.Identity()
 
-        # embedding_dim (== backbone hidden) -> local-transformer hidden.
-        if lt_hidden != self.embedding_dim:
-            self.local_transformer_in_projection = nn.Linear(self.embedding_dim, lt_hidden)
+        if arch.uses_local_transformer:
+            # embedding_dim (== backbone hidden) -> local-transformer hidden.
+            if lt_hidden != self.embedding_dim:
+                self.local_transformer_in_projection = nn.Linear(self.embedding_dim, lt_hidden)
+            else:
+                self.local_transformer_in_projection = nn.Identity()
+
+            self.local_transformer = EasyMagpieLocalTransformer(
+                vllm_config=vllm_config, prefix=f"{prefix}.local_transformer"
+            )
+
+            # local-transformer hidden -> audio_embedding_dim (Identity when equal).
+            if self.audio_embedding_dim != lt_hidden:
+                self.local_transformer_audio_out_projection = nn.Linear(lt_hidden, self.audio_embedding_dim)
+            else:
+                self.local_transformer_audio_out_projection = nn.Identity()
+
+            # Per-codebook output heads.
+            self.local_transformer_out_projections = nn.ModuleList(
+                [nn.Linear(self.audio_embedding_dim, self.num_tokens_per_codebook) for _ in range(self.num_codebooks)]
+            )
         else:
-            self.local_transformer_in_projection = nn.Identity()
-
-        self.local_transformer = EasyMagpieLocalTransformer(
-            vllm_config=vllm_config, prefix=f"{prefix}.local_transformer"
-        )
-
-        # local-transformer hidden -> audio_embedding_dim (Identity when equal).
-        if self.audio_embedding_dim != lt_hidden:
-            self.local_transformer_audio_out_projection = nn.Linear(lt_hidden, self.audio_embedding_dim)
-        else:
-            self.local_transformer_audio_out_projection = nn.Identity()
-
-        # Per-codebook output heads.
-        self.local_transformer_out_projections = nn.ModuleList(
-            [nn.Linear(self.audio_embedding_dim, self.num_tokens_per_codebook) for _ in range(self.num_codebooks)]
-        )
+            # One GEMM emits ``[batch, codebook, vocabulary]`` logits directly
+            # from the backbone state. No local-transformer module is built.
+            self.parallel_codebook_out_projection = nn.Linear(
+                self.embedding_dim,
+                self.num_codebooks * self.num_tokens_per_codebook,
+            )
 
         # Forbidden-token mask (reserved/special tokens, EOS kept reachable).
         # Populated by :meth:`init_forbidden_mask` once arch ids are known.
@@ -271,9 +312,12 @@ class EasyMagpieCodePredictor(nn.Module):
         self.lt_hidden = lt_hidden
         self._sample_top_k = min(self.top_k, self.num_tokens_per_codebook)
 
-        # Compiled single-graph autoregressive loop (owns no params; reaches the
-        # projection heads / embeddings / mask on ``self`` via a bound reference).
-        self._code_loop = EasyMagpieCodeLoop(vllm_config=vllm_config, prefix=f"{prefix}.code_loop")
+        # Compiled single-graph sampler (owns no params; reaches the projection
+        # heads / embeddings / mask on ``self`` via a bound reference).
+        if arch.uses_local_transformer:
+            self._code_loop = EasyMagpieCodeLoop(vllm_config=vllm_config, prefix=f"{prefix}.code_loop")
+        else:
+            self._code_loop = EasyMagpieParallelCodeLoop(vllm_config=vllm_config, prefix=f"{prefix}.parallel_loop")
         self._code_loop.bind_predictor(self)
 
         # ── Persistent address-stable scratch buffers ──────────────────
@@ -327,12 +371,12 @@ class EasyMagpieCodePredictor(nn.Module):
 
     @torch.no_grad()
     def generate_codes(self, dec_hidden: torch.Tensor) -> torch.Tensor:
-        """Autoregressively sample all ``C * S`` codebooks for each frame.
+        """Sample all ``C * S`` codebooks for each frame.
 
         Draws this frame's Gumbel noise eagerly into a stable buffer (fresh
         randomness per frame, outside the captured graph) and stages the inputs
-        at fixed addresses, then runs the whole loop as a single captured graph
-        via :class:`EasyMagpieCodeLoop`.
+        at fixed addresses. The configured compiled graph either runs the local
+        transformer autoregressively or projects every codebook in parallel.
 
         Args:
             dec_hidden: ``[num_tokens, hidden]`` backbone hidden state (one row
