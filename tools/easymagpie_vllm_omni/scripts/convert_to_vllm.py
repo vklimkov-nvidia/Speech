@@ -459,6 +459,12 @@ def build_config(
 
 def select_weights(state_dict: dict, hidden_dim: int, dtype: torch.dtype) -> dict:
     """Select + rename checkpoint weights into the vLLM ``load_weights`` layout."""
+    if any(key.startswith("local_transformer_out_projections.proj.") for key in state_dict):
+        raise ValueError(
+            "this checkpoint was trained with local_transformer_predict_all_codebooks, which holds "
+            "the local transformer's output heads as one fused projection, and vLLM wants a head "
+            "per codebook"
+        )
     weights: dict = {}
 
     # Backbone: keep all ``decoder.*`` except the unused token-embedding table.

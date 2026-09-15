@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import functools
 import math
 from enum import Enum
 from typing import Dict, List, Optional
@@ -475,6 +476,57 @@ class CodecHelper:
             return audio, audio_len, codes
 
 
+class FusedCodebookHeads(torch.nn.Module):
+    """One projection carrying every codebook's output head, sliceable back into the separate ones.
+
+    Stands in for a ``ModuleList`` of per-codebook ``nn.Linear`` heads and is mathematically
+    identical to one, the fused weight being their concatenation: ``heads[k](x)`` is head ``k``.
+    Fusing them lets a caller read every codebook off a single position in one matmul, which is
+    what predicting all the codebooks on every local transformer step needs, while the
+    autoregressive readout keeps taking one head at a time and gets exactly what it got before.
+
+    Args:
+        in_features: Width of the input the heads read.
+        num_codebooks: Number of codebooks (C), one head each.
+        num_tokens_per_codebook: Size of a codebook's output vocabulary (V), including special tokens.
+    """
+
+    def __init__(self, in_features: int, num_codebooks: int, num_tokens_per_codebook: int):
+        super().__init__()
+        self.num_codebooks = num_codebooks
+        self.num_tokens_per_codebook = num_tokens_per_codebook
+        self.proj = torch.nn.Linear(in_features, num_codebooks * num_tokens_per_codebook)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply every codebook's head.
+
+        x  (... x in_features)
+
+        returns  (... x num_codebooks x num_tokens_per_codebook)
+        """
+        return self.proj(x).unflatten(-1, (self.num_codebooks, self.num_tokens_per_codebook))
+
+    def forward_codebook(self, codebook_index: int, x: torch.Tensor) -> torch.Tensor:
+        """Apply one codebook's head, the slice of the fused projection that belongs to it.
+
+        x  (... x in_features)
+
+        returns  (... x num_tokens_per_codebook)
+        """
+        start = codebook_index * self.num_tokens_per_codebook
+        end = start + self.num_tokens_per_codebook
+        return torch.nn.functional.linear(x, self.proj.weight[start:end], self.proj.bias[start:end])
+
+    def __len__(self) -> int:
+        return self.num_codebooks
+
+    def __getitem__(self, codebook_index: int):
+        """Return one codebook's head as a callable, the way a ``ModuleList`` of heads indexes."""
+        if not -self.num_codebooks <= codebook_index < self.num_codebooks:
+            raise IndexError(f"codebook index {codebook_index} is out of range for {self.num_codebooks} heads")
+        return functools.partial(self.forward_codebook, codebook_index % self.num_codebooks)
+
+
 class LocalTransformerHelper:
     """Orchestrates local-transformer forward passes and sampling.
 
@@ -591,28 +643,9 @@ class LocalTransformerHelper:
                 if True, target for index 1 is codebook 0 (MaskGit).
         """
         C = self.num_audio_codebooks
-        dec_out_all = dec_out.reshape(-1, dec_out.size(-1))  # (B*T', E)
-        local_transformer_input = [dec_out_all]
-        audio_codes_target = pad_audio_codes(audio_codes_target, self.frame_stacking_factor).long()
-        for fs_index in range(self.frame_stacking_factor):
-            for codebook_num in range(C):
-                codes = audio_codes_target[:, codebook_num, fs_index :: self.frame_stacking_factor]
-                codes = codes.reshape(-1)
-                codebook_embedding = self.embed_codebook(codebook_num + fs_index * C, codes)
-                local_transformer_input.append(codebook_embedding)
-
-        local_transformer_input = torch.stack(local_transformer_input, dim=1)
-        local_transformer_input = self.local_transformer_in_projection(local_transformer_input)
-        _mask = torch.ones(
-            local_transformer_input.size(0), local_transformer_input.size(1), device=local_transformer_input.device
+        local_transformer_output, audio_codes_target = self._run_local_transformer(
+            dec_out, audio_codes_target, targets_offset_by_one=targets_offset_by_one
         )
-        local_transformer_output = self.local_transformer(local_transformer_input, _mask)['output']
-        if not targets_offset_by_one:
-            local_transformer_output = local_transformer_output[:, :-1, :]
-        else:
-            local_transformer_output = local_transformer_output[:, 1:, :]
-
-        local_transformer_output = self.local_transformer_audio_out_projection(local_transformer_output)
 
         all_code_logits = []
         for fs_index in range(self.frame_stacking_factor):
@@ -628,6 +661,79 @@ class LocalTransformerHelper:
         )
 
         return all_code_logits
+
+    def compute_all_codebook_logits(self, dec_out, audio_codes_target):
+        """Predicts every codebook from every local transformer step, rather than one each.
+
+        The local transformer pass is the one ``compute_logits`` makes: the same sequence of the
+        backbone latent followed by the frame's codes, read causally. Only the readout differs, in
+        that every step goes through every codebook's head instead of its own. Step ``i`` has been
+        fed the codes of channels ``0..i-1``, so channel ``i`` is the prediction ``compute_logits``
+        takes and the channels after it are predictions made without having seen what comes
+        between, which is what speculative decoding drafts and then verifies against the
+        autoregressive readout. ``draft_pair_mask`` says which pairs those are.
+
+        Requires the fused output projection, which reads all the heads in one matmul.
+
+        Args:
+            dec_out: (B, T', E)
+            audio_codes_target: (B, C, T')
+
+        Returns:
+            Logits of shape ``(B, T', C, C, num_tokens_per_codebook)``, indexed by local
+            transformer step and then by predicted codebook.
+        """
+        if not isinstance(self.local_transformer_out_projections, FusedCodebookHeads):
+            raise ValueError(
+                "predicting every codebook on every local transformer step reads all the output "
+                "heads at once, so it needs the fused output projection"
+            )
+        if self.frame_stacking_factor != 1:
+            # The channel order the readout walks (`codebook + fs_index * C`) and the one the
+            # target codes come in (codebook major) only agree when there is nothing to unstack.
+            raise ValueError(
+                f"predicting every codebook on every local transformer step expects the stacked "
+                f"frames to already be channels, but frame_stacking_factor is {self.frame_stacking_factor}"
+            )
+
+        local_transformer_output, audio_codes_target = self._run_local_transformer(
+            dec_out, audio_codes_target, targets_offset_by_one=False
+        )
+        # (B*T', C, E) -> (B*T', C steps, C codebooks, V)
+        all_code_logits = self.local_transformer_out_projections(local_transformer_output)
+        return all_code_logits.view(
+            audio_codes_target.size(0),
+            audio_codes_target.size(2) // self.frame_stacking_factor,
+            *all_code_logits.shape[1:],
+        )
+
+    def select_autoregressive_logits(self, all_code_logits):
+        """Takes the autoregressive predictions out of ``compute_all_codebook_logits``.
+
+        Step ``i`` predicting channel ``i`` is the one prediction the autoregressive readout makes
+        for that channel, so this diagonal is what ``compute_logits`` returns, in its layout.
+
+        all_code_logits  (batch x time x steps x codebooks x tokens per codebook)
+
+        returns  (batch x time x codebooks * tokens per codebook)
+        """
+        channels = torch.arange(all_code_logits.size(2), device=all_code_logits.device)
+        return all_code_logits[:, :, channels, channels, :].flatten(-2)
+
+    def draft_pair_mask(self, device=None):
+        """Which ``(step, codebook)`` pairs of ``compute_all_codebook_logits`` are drafts.
+
+        A step has read the codes of every channel before it, so those are copies of its own input
+        and its own channel is what the autoregressive readout already predicts. What is left, the
+        channels strictly after it, are the drafts. Channels the backbone owns are not drafted,
+        the local transformer being given them rather than deciding them at inference.
+
+        returns  (steps x codebooks) bool, True where the step drafts the codebook
+        """
+        num_channels = self.num_audio_codebooks * self.frame_stacking_factor
+        steps = torch.arange(num_channels, device=device).unsqueeze(1)
+        codebooks = torch.arange(num_channels, device=device).unsqueeze(0)
+        return (codebooks > steps) & (codebooks >= self.num_backbone_codebooks)
 
     def sample_autoregressive(
         self,
@@ -897,6 +1003,43 @@ class LocalTransformerHelper:
         if use_cfg:
             codes = codes[:actual_batch_size]
         return codes
+
+    def _run_local_transformer(self, dec_out, audio_codes_target, targets_offset_by_one):
+        """
+        Reads a frame's codes with the local transformer and hands back what the output heads read.
+
+        The sequence is the backbone latent followed by every channel's code, and the output is
+        shifted so that position `i` is the one whose prediction belongs to channel `i`.
+
+        dec_out  (batch x time x embedding_dim)
+        audio_codes_target  (batch x channels x time)
+
+        returns the projected output (batch * time x channels x audio_embedding_dim) along with
+        the target codes padded to a whole number of stacked frames
+        """
+        C = self.num_audio_codebooks
+        dec_out_all = dec_out.reshape(-1, dec_out.size(-1))  # (B*T', E)
+        local_transformer_input = [dec_out_all]
+        audio_codes_target = pad_audio_codes(audio_codes_target, self.frame_stacking_factor).long()
+        for fs_index in range(self.frame_stacking_factor):
+            for codebook_num in range(C):
+                codes = audio_codes_target[:, codebook_num, fs_index :: self.frame_stacking_factor]
+                codes = codes.reshape(-1)
+                codebook_embedding = self.embed_codebook(codebook_num + fs_index * C, codes)
+                local_transformer_input.append(codebook_embedding)
+
+        local_transformer_input = torch.stack(local_transformer_input, dim=1)
+        local_transformer_input = self.local_transformer_in_projection(local_transformer_input)
+        _mask = torch.ones(
+            local_transformer_input.size(0), local_transformer_input.size(1), device=local_transformer_input.device
+        )
+        local_transformer_output = self.local_transformer(local_transformer_input, _mask)['output']
+        if not targets_offset_by_one:
+            local_transformer_output = local_transformer_output[:, :-1, :]
+        else:
+            local_transformer_output = local_transformer_output[:, 1:, :]
+
+        return self.local_transformer_audio_out_projection(local_transformer_output), audio_codes_target
 
     def _append_code(self, local_transformer_input, codebook_index, codes):
         """

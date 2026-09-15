@@ -46,6 +46,7 @@ from nemo.collections.tts.modules.magpietts_modules import (
     AcousticRefinerOrder,
     CharAwareSubwordEncoder,
     CodecHelper,
+    FusedCodebookHeads,
     LocalTransformerHelper,
     LocalTransformerType,
     SpecialAudioToken,
@@ -638,6 +639,17 @@ class EasyMagpieTTSInferenceModel(ModelPT):
 
         self.local_transformer_type = LocalTransformerType(cfg.get('local_transformer_type', 'none').lower())
         logging.info(f"Local transformer type: {self.local_transformer_type}")
+
+        # Read every codebook off every local transformer step instead of one each, so a step also
+        # predicts the channels it has not been fed. Those extra predictions are what speculative
+        # decoding drafts; the autoregressive readout keeps taking one codebook per step either way.
+        self.local_transformer_predict_all_codebooks = cfg.get('local_transformer_predict_all_codebooks', False)
+        if self.local_transformer_predict_all_codebooks and self.local_transformer_type != LocalTransformerType.AR:
+            raise ValueError(
+                f"local_transformer_predict_all_codebooks needs the autoregressive local transformer, "
+                f"but local_transformer_type is {self.local_transformer_type}"
+            )
+
         if self.local_transformer_type in (LocalTransformerType.AR, LocalTransformerType.MASKGIT):
             local_transformer_hidden_dim = cfg.get('local_transformer_hidden_dim', 256)
             if local_transformer_hidden_dim != cfg.hidden_dim:
@@ -661,13 +673,24 @@ class EasyMagpieTTSInferenceModel(ModelPT):
                 )
             else:
                 self.local_transformer_audio_out_projection = nn.Identity()
-            local_transformer_out_projections = []
-            for _ in range(self.num_audio_codebooks * self.frame_stacking_factor):
-                # Have a separate projection layer for each codebook, to distinguish between them
-                local_transformer_out_projections.append(
-                    nn.Linear(self.audio_embedding_dim, self.num_all_tokens_per_codebook)
+            num_local_transformer_channels = self.num_audio_codebooks * self.frame_stacking_factor
+            if self.local_transformer_predict_all_codebooks:
+                # The separate heads concatenated into one projection, so that a single matmul
+                # reads every codebook off one step. Sliced per codebook it is still the separate
+                # heads, which is what the autoregressive readout and sampling keep taking.
+                self.local_transformer_out_projections = FusedCodebookHeads(
+                    in_features=self.audio_embedding_dim,
+                    num_codebooks=num_local_transformer_channels,
+                    num_tokens_per_codebook=self.num_all_tokens_per_codebook,
                 )
-            self.local_transformer_out_projections = nn.ModuleList(local_transformer_out_projections)
+            else:
+                local_transformer_out_projections = []
+                for _ in range(num_local_transformer_channels):
+                    # Have a separate projection layer for each codebook, to distinguish between them
+                    local_transformer_out_projections.append(
+                        nn.Linear(self.audio_embedding_dim, self.num_all_tokens_per_codebook)
+                    )
+                self.local_transformer_out_projections = nn.ModuleList(local_transformer_out_projections)
 
             # EasyMagpie stacks frames into the channel dimension (B, C*S, T_stacked)
             # via stack_codes, unlike Magpie which keeps them interleaved in time (B, C, T_full).

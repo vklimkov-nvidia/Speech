@@ -76,6 +76,8 @@ class ProcessBatchOutput:
         codebook_loss: Cross-entropy loss for parallel audio codebook prediction
         phoneme_loss: Cross-entropy loss for phoneme prediction (None if no phoneme tokenizer)
         local_transformer_loss: Loss from local transformer (None if not used)
+        local_transformer_draft_loss: Loss over the codebooks each local transformer step predicts
+            ahead of its own (None unless local_transformer_predict_all_codebooks is set)
         local_transformer_logits: Logits from local transformer (None if not used)
         logits: Predicted logits for audio codes (B, T', num_codebooks * num_tokens_per_codebook)
         phoneme_logits: Predicted logits for phoneme tokens (None if no phoneme tokenizer)
@@ -92,6 +94,7 @@ class ProcessBatchOutput:
     codebook_loss: torch.Tensor
     phoneme_loss: Optional[torch.Tensor]
     local_transformer_loss: Optional[torch.Tensor]
+    local_transformer_draft_loss: Optional[torch.Tensor]
     local_transformer_logits: Optional[torch.Tensor]
     logits: torch.Tensor
     phoneme_logits: Optional[torch.Tensor]
@@ -125,6 +128,9 @@ class EasyMagpieTTSModel(EasyMagpieTTSInferenceModel):
         self.phoneme_loss_weight = cfg.get('phoneme_loss_weight', 1.0)
         self.parallel_codebook_loss_scale = cfg.get('parallel_codebook_loss_scale', 1.0)
         self.local_transformer_loss_scale = cfg.get('local_transformer_loss_scale', 1.0)
+        # Weighs the drafted codebooks on their own, so that turning them on leaves the
+        # autoregressive prediction the local transformer is there for weighted as it was.
+        self.local_transformer_draft_loss_scale = cfg.get('local_transformer_draft_loss_scale', 1.0)
 
         self.cross_entropy_loss = nn.CrossEntropyLoss(reduction='none')
 
@@ -225,6 +231,51 @@ class EasyMagpieTTSModel(EasyMagpieTTSInferenceModel):
 
         total_codebook_loss = total_codebook_loss / audio_codes.size(1)
         return total_codebook_loss, loss_mask
+
+    def compute_draft_loss(
+        self,
+        all_code_logits,
+        audio_codes,
+        audio_codes_lens,
+        agent_mask_target=None,
+    ):
+        """Compute the cross-entropy loss over the codebooks a local transformer step drafts.
+
+        ``LocalTransformerHelper.compute_all_codebook_logits`` reads every codebook off every
+        local transformer step. A step's own codebook is the autoregressive prediction
+        :meth:`compute_loss` already supervises, and the codebooks before it are copies of what it
+        was fed, so this covers what is left: the codebooks after it, predicted without having seen
+        the ones in between. Those are the drafts speculative decoding would later verify against
+        the autoregressive readout.
+
+        Args:
+            all_code_logits: Predicted logits with shape
+                ``(B, T, num_steps, num_codebooks, num_tokens_per_codebook)``.
+            audio_codes: Target audio codes with shape ``(B, C, T)``.
+            audio_codes_lens: Valid target lengths with shape ``(B,)``.
+            agent_mask_target: Optional frame-level mask with shape ``(B, T)``.
+                When provided, loss is computed only at positions where the mask
+                is nonzero.
+
+        Returns:
+            The scalar cross-entropy averaged over every drafted prediction.
+        """
+        draft_mask = self._lt_helper.draft_pair_mask(device=all_code_logits.device)  # (num_steps, C)
+        frame_mask = get_mask_from_lengths(audio_codes_lens).bool()  # (B, T)
+        if agent_mask_target is not None:
+            frame_mask = frame_mask & agent_mask_target.to(device=frame_mask.device, dtype=torch.bool)
+        loss_mask = frame_mask[:, :, None, None] & draft_mask  # (B, T, num_steps, C)
+
+        # every step reads the same frame, so they all predict against the same codes
+        targets = audio_codes.long().permute(0, 2, 1)  # (B, T, C)
+        targets = targets[:, :, None, :].expand_as(loss_mask)
+
+        raw_loss = self.cross_entropy_loss(
+            all_code_logits.reshape(-1, all_code_logits.size(-1)),
+            targets.reshape(-1),
+        ).view(loss_mask.shape)
+        loss_mask = loss_mask.to(raw_loss.dtype)
+        return (raw_loss * loss_mask).sum() / loss_mask.sum().clamp_min(1.0)
 
     def compute_phoneme_loss(
         self,
@@ -1253,27 +1304,43 @@ class EasyMagpieTTSModel(EasyMagpieTTSInferenceModel):
         pred_embeddings_audio = self.audio_out_projection(pred_embeddings)
         logits = self.final_proj(pred_embeddings_audio)
 
+        # Whether the audio losses are only taken over the agent's own speech
+        agent_mask_target = agent_mask if self.cfg.get("mask_user_on_loss", False) else None
+
         # Compute codebook loss
         codebook_loss, _ = self.compute_loss(
             logits,
             audio_codes_target,
             audio_codes_lens_target,
-            agent_mask_target=agent_mask if self.cfg.get("mask_user_on_loss", False) else None,
+            agent_mask_target=agent_mask_target,
         )
         loss = self.parallel_codebook_loss_scale * codebook_loss
 
         # Compute local transformer loss if applicable
         local_transformer_loss = None
+        local_transformer_draft_loss = None
         local_transformer_logits = None
         if self.local_transformer_type == LocalTransformerType.AR:
-            local_transformer_logits = self._lt_helper.compute_logits(
-                pred_embeddings, audio_codes_target, targets_offset_by_one=False
-            )
+            if self.local_transformer_predict_all_codebooks:
+                all_code_logits = self._lt_helper.compute_all_codebook_logits(pred_embeddings, audio_codes_target)
+                local_transformer_draft_loss = self.compute_draft_loss(
+                    all_code_logits,
+                    audio_codes_target,
+                    audio_codes_lens_target,
+                    agent_mask_target=agent_mask_target,
+                )
+                # The diagonal is the autoregressive prediction, so the loss below stays the one
+                # the local transformer is trained on with a head per codebook and nothing else.
+                local_transformer_logits = self._lt_helper.select_autoregressive_logits(all_code_logits)
+            else:
+                local_transformer_logits = self._lt_helper.compute_logits(
+                    pred_embeddings, audio_codes_target, targets_offset_by_one=False
+                )
             local_transformer_loss, _ = self.compute_loss(
                 local_transformer_logits,
                 audio_codes_target,
                 audio_codes_lens_target,
-                agent_mask_target=agent_mask if self.cfg.get("mask_user_on_loss", False) else None,
+                agent_mask_target=agent_mask_target,
             )
         elif self.local_transformer_type == LocalTransformerType.PARALLEL:
             # The refiner caches along the decoder timeline, so it runs on the whole sequence the
@@ -1292,6 +1359,8 @@ class EasyMagpieTTSModel(EasyMagpieTTSInferenceModel):
             raise ValueError(f"Unexpected local transformer type for easy magpietts: {self.local_transformer_type}")
         if local_transformer_loss is not None:
             loss = loss + self.local_transformer_loss_scale * local_transformer_loss
+        if local_transformer_draft_loss is not None:
+            loss = loss + self.local_transformer_draft_loss_scale * local_transformer_draft_loss
 
         # Compute phoneme loss if applicable
         phoneme_loss = None
@@ -1334,6 +1403,7 @@ class EasyMagpieTTSModel(EasyMagpieTTSInferenceModel):
             codebook_loss=codebook_loss,
             phoneme_loss=phoneme_loss,
             local_transformer_loss=local_transformer_loss,
+            local_transformer_draft_loss=local_transformer_draft_loss,
             local_transformer_logits=local_transformer_logits,
             logits=logits,
             phoneme_logits=pb_phoneme_logits,
@@ -1582,6 +1652,10 @@ class EasyMagpieTTSModel(EasyMagpieTTSInferenceModel):
         if local_transformer_loss is not None:
             self.log('train/local_transformer_loss', local_transformer_loss, prog_bar=True, sync_dist=True)
 
+        local_transformer_draft_loss = batch_output.local_transformer_draft_loss
+        if local_transformer_draft_loss is not None:
+            self.log('train/local_transformer_draft_loss', local_transformer_draft_loss, prog_bar=True, sync_dist=True)
+
         # Log training mode info for multi-mode training
         if batch_output.selected_training_mode is not None:
             # Log which mode was selected for this batch
@@ -1701,6 +1775,9 @@ class EasyMagpieTTSModel(EasyMagpieTTSInferenceModel):
             'val_codebook_loss': codebook_loss,
             'val_local_transformer_loss': local_transformer_loss,
         }
+
+        if batch_output.local_transformer_draft_loss is not None:
+            val_output['val_local_transformer_draft_loss'] = batch_output.local_transformer_draft_loss
 
         if self.phoneme_tokenizer is not None:
             phoneme_loss = batch_output.phoneme_loss
@@ -1943,6 +2020,15 @@ class EasyMagpieTTSModel(EasyMagpieTTSInferenceModel):
         if self.local_transformer_type != LocalTransformerType.NO_LT:
             val_local_transformer_loss = collect("val_local_transformer_loss")
             self.log("val/local_transformer_loss", val_local_transformer_loss, prog_bar=True, sync_dist=True)
+
+        if self.local_transformer_predict_all_codebooks:
+            val_local_transformer_draft_loss = collect("val_local_transformer_draft_loss")
+            self.log(
+                "val/local_transformer_draft_loss",
+                val_local_transformer_draft_loss,
+                prog_bar=True,
+                sync_dist=True,
+            )
 
         if self.phoneme_tokenizer is not None:
             val_phoneme_loss = collect("val_phoneme_loss")

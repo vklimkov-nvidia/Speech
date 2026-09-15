@@ -653,8 +653,131 @@ def test_process_batch_with_autoregressive_local_transformer():
     assert torch.isfinite(output.loss)
     assert torch.isfinite(output.codebook_loss)
     assert torch.isfinite(output.local_transformer_loss)
+    assert output.local_transformer_draft_loss is None
     assert output.local_transformer_logits is not None
     assert output.local_transformer_logits.shape == output.logits.shape
+
+
+def _all_codebook_local_transformer_cfg(overrides=None):
+    cfg = {"local_transformer_predict_all_codebooks": True, "local_transformer_draft_loss_scale": 0.25}
+    cfg.update(overrides or {})
+    return _autoregressive_local_transformer_cfg(cfg)
+
+
+def test_process_batch_predicting_all_codebooks_per_local_transformer_step():
+    _seed_everything()
+    model = _make_easy_magpie_model(_all_codebook_local_transformer_cfg())
+    batch = _toy_batch(model)
+
+    output = model.process_batch(
+        text=batch["text"],
+        text_lens=batch["text_lens"],
+        context_text_tokens=batch["context_text_tokens"],
+        context_text_tokens_lens=batch["context_text_tokens_lens"],
+        audio_codes=batch["audio_codes"],
+        audio_codes_lens=batch["audio_codes_lens"],
+        context_audio_codes=batch["context_audio_codes"],
+        context_audio_codes_lens=batch["context_audio_codes_lens"],
+        mode="val",
+        training_mode=model.training_modes[0],
+        agent_mask=batch["agent_mask"],
+    )
+
+    assert torch.isfinite(output.loss)
+    assert torch.isfinite(output.local_transformer_loss)
+    assert torch.isfinite(output.local_transformer_draft_loss)
+    # the autoregressive predictions stay the ones a head per codebook makes, so they keep their shape
+    assert output.local_transformer_logits.shape == output.logits.shape
+    # the drafts are weighted on their own, so the autoregressive prediction keeps its weight
+    assert torch.allclose(
+        output.loss,
+        model.parallel_codebook_loss_scale * output.codebook_loss
+        + model.local_transformer_loss_scale * output.local_transformer_loss
+        + model.local_transformer_draft_loss_scale * output.local_transformer_draft_loss,
+    )
+
+
+def test_predicting_all_codebooks_leaves_the_autoregressive_predictions_alone():
+    """The drafts ride along with the autoregressive readout, which has to stay what it was."""
+    _seed_everything()
+    model = _make_easy_magpie_model(_all_codebook_local_transformer_cfg())
+    dec_out = torch.randn(2, 4, model.cfg.hidden_dim)
+    audio_codes = _toy_codes(model, batch_size=2, num_frames=4)
+
+    all_code_logits = model._lt_helper.compute_all_codebook_logits(dec_out, audio_codes)
+    autoregressive_logits = model._lt_helper.compute_logits(dec_out, audio_codes, targets_offset_by_one=False)
+
+    num_channels = model.num_audio_codebooks * model.frame_stacking_factor
+    assert all_code_logits.shape == (2, 4, num_channels, num_channels, model.num_all_tokens_per_codebook)
+    assert torch.allclose(
+        model._lt_helper.select_autoregressive_logits(all_code_logits), autoregressive_logits, atol=1e-5
+    )
+
+
+def test_predicting_all_codebooks_drafts_only_the_codebooks_a_step_has_not_been_fed():
+    _seed_everything()
+    model = _make_easy_magpie_model(_all_codebook_local_transformer_cfg({"num_backbone_codebooks": 2}))
+
+    draft_mask = model._lt_helper.draft_pair_mask()
+
+    num_channels = model.num_audio_codebooks * model.frame_stacking_factor
+    assert draft_mask.shape == (num_channels, num_channels)
+    for step in range(num_channels):
+        for codebook in range(num_channels):
+            # a step reads the codes before it and predicts its own, so only later ones are drafts,
+            # and the backbone's codebooks are given to the local transformer rather than drafted
+            expected = codebook > step and codebook >= 2
+            assert bool(draft_mask[step, codebook]) == expected, (step, codebook)
+
+
+def test_draft_loss_covers_every_drafted_prediction_and_nothing_else():
+    _seed_everything()
+    model = _make_easy_magpie_model(_all_codebook_local_transformer_cfg())
+    batch_size, num_frames = 2, 4
+    num_channels = model.num_audio_codebooks * model.frame_stacking_factor
+    audio_codes = _toy_codes(model, batch_size=batch_size, num_frames=num_frames)
+    audio_codes_lens = torch.tensor([num_frames, num_frames - 1], dtype=torch.long)
+    # a peak on the target of every pair drives the cross entropy of a drafted pair to ~0, so any
+    # pair that enters the loss shows up by flattening its peak back out
+    matched_logits = torch.zeros(batch_size, num_frames, num_channels, num_channels, model.num_all_tokens_per_codebook)
+    targets = audio_codes.permute(0, 2, 1)[:, :, None, :, None]
+    matched_logits.scatter_(-1, targets.expand(-1, -1, num_channels, -1, -1), 30.0)
+
+    def draft_loss(flatten=None, agent_mask_target=None):
+        logits = matched_logits.clone()
+        if flatten is not None:
+            logits[flatten] = 0.0
+        return model.compute_draft_loss(logits, audio_codes, audio_codes_lens, agent_mask_target)
+
+    assert draft_loss() < 1e-6
+
+    # a step's own codebook is the autoregressive prediction, which has its own loss
+    assert draft_loss(flatten=(slice(None), slice(None), 1, 1)) < 1e-6
+    # and the codebooks before it were fed to it, so there was nothing to predict
+    assert draft_loss(flatten=(slice(None), slice(None), 3, 1)) < 1e-6
+    # the codebooks after it are the drafts, which do count
+    assert draft_loss(flatten=(slice(None), slice(None), 1, 3)) > 0.1
+    # frames past an item's length are padding
+    assert draft_loss(flatten=(1, num_frames - 1)) < 1e-6
+    assert draft_loss(flatten=(0, num_frames - 1)) > 0.1
+    # and a frame mask keeps whole frames out, down to nothing left to average over
+    assert draft_loss(agent_mask_target=torch.zeros(batch_size, num_frames, dtype=torch.bool)) == 0.0
+
+
+def test_predicting_all_codebooks_needs_the_autoregressive_local_transformer():
+    _seed_everything()
+    with pytest.raises(ValueError, match="needs the autoregressive local transformer"):
+        _make_easy_magpie_model(_all_codebook_local_transformer_cfg({"local_transformer_type": "maskgit"}))
+
+
+def test_predicting_all_codebooks_needs_the_fused_output_projection():
+    _seed_everything()
+    model = _make_easy_magpie_model(_autoregressive_local_transformer_cfg())
+
+    with pytest.raises(ValueError, match="fused output projection"):
+        model._lt_helper.compute_all_codebook_logits(
+            torch.randn(2, 4, model.cfg.hidden_dim), _toy_codes(model, batch_size=2, num_frames=4)
+        )
 
 
 @pytest.mark.parametrize("frame_stacking_factor", [1, 2])
