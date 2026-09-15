@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Nemotron-H backbone with sequential codebook prediction in its tail."""
+"""Nemotron-H backbone with grouped codebook prediction in its tail."""
 from __future__ import annotations
 
 from typing import Any, Optional
@@ -112,13 +112,14 @@ class _MambaFFNCodebookBlock(nn.Module):
     }
 )
 class EasyMagpieBackboneCodebookModel(NemotronHModel):
-    """Nemotron-H whose final blocks predict one codebook apiece.
+    """Nemotron-H whose final blocks predict groups of codebooks.
 
     The first ``backbone_codebook_start_layer`` entries use the ordinary
-    Nemotron-H pattern. Each remaining logical block predicts one codebook. A
-    sampled code is embedded and added to the live residual stream before the
-    next codebook block, so that block receives both the preceding hidden state
-    and an explicit acoustic-token connection.
+    Nemotron-H pattern. Each tail group runs its configured logical blocks and
+    then predicts one or more codebooks in parallel. Their sampled embeddings
+    are averaged and added to the live residual stream before the next group,
+    so it receives both the preceding hidden state and explicit acoustic-token
+    connections.
     """
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
@@ -135,6 +136,8 @@ class EasyMagpieBackboneCodebookModel(NemotronHModel):
         self.vocab_size = config.vocab_size
         self.codebook_start_layer = arch.backbone_codebook_start_layer
         self.num_codebooks = arch.num_stacked_codebooks
+        self.codebook_layers_per_group = arch.backbone_codebook_layers_per_group
+        self.codebooks_per_group = arch.backbone_codebooks_per_group
         self.num_tokens_per_codebook = arch.num_all_tokens_per_codebook
         self.audio_embedding_dim = arch.audio_embedding_dim
         self.embedding_dim = arch.embedding_dim
@@ -279,19 +282,32 @@ class EasyMagpieBackboneCodebookModel(NemotronHModel):
             if layer_idx < self.codebook_start_layer:
                 continue
 
-            codebook_idx = layer_idx - self.codebook_start_layer
-            prediction_state = hidden_states if residual is None else hidden_states + residual
-            prediction_state = self.codebook_output_norms[codebook_idx](prediction_state)
-            code = self._sample_codebook(
-                codebook_idx,
-                prediction_state,
-                gumbel_noise[:, codebook_idx, :],
-                temperature,
-            )
-            codes.append(code)
+            tail_layer_idx = layer_idx - self.codebook_start_layer
+            if (tail_layer_idx + 1) % self.codebook_layers_per_group != 0:
+                continue
 
-            if codebook_idx + 1 < self.num_codebooks:
-                feedback = self.audio_in_projection(self.audio_embeddings[codebook_idx](code))
+            group_idx = tail_layer_idx // self.codebook_layers_per_group
+            first_codebook_idx = group_idx * self.codebooks_per_group
+            next_codebook_idx = first_codebook_idx + self.codebooks_per_group
+            prediction_state = hidden_states if residual is None else hidden_states + residual
+            group_codes: list[torch.Tensor] = []
+            for codebook_idx in range(first_codebook_idx, next_codebook_idx):
+                normalized_state = self.codebook_output_norms[codebook_idx](prediction_state)
+                code = self._sample_codebook(
+                    codebook_idx,
+                    normalized_state,
+                    gumbel_noise[:, codebook_idx, :],
+                    temperature,
+                )
+                group_codes.append(code)
+                codes.append(code)
+
+            if next_codebook_idx < self.num_codebooks:
+                feedback = self.audio_embeddings[first_codebook_idx](group_codes[0])
+                for group_offset in range(1, self.codebooks_per_group):
+                    codebook_idx = first_codebook_idx + group_offset
+                    feedback = feedback + self.audio_embeddings[codebook_idx](group_codes[group_offset])
+                feedback = self.audio_in_projection(feedback / self.codebooks_per_group)
                 feedback = feedback * code_prediction_mask.unsqueeze(-1).to(feedback.dtype)
                 hidden_states = hidden_states + feedback
 

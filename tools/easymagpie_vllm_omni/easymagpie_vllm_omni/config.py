@@ -78,10 +78,13 @@ class EasyMagpieOmniArch:
     local_transformer_hidden_dim: int = 1536
 
     # ``backbone`` mode keeps this many ordinary temporal layers before the
-    # per-codebook tail. Each tail entry is one logical backbone block, with the
-    # selected internal mixer composition.
+    # codebook tail. Each tail entry is one logical backbone block, with the
+    # selected internal mixer composition. Groups may use multiple blocks to
+    # predict multiple codebooks in parallel before adding acoustic feedback.
     backbone_codebook_start_layer: int = 16
     backbone_codebook_layer_type: str = "attention_ffn"
+    backbone_codebook_layers_per_group: int = 1
+    backbone_codebooks_per_group: int = 1
 
     # Optional checkpoint-specific special-token ids.
     forced_audio_bos_id: int | None = None
@@ -108,6 +111,21 @@ class EasyMagpieOmniArch:
                 raise ValueError(
                     "backbone_codebook_layer_type must be 'attention_ffn', 'mamba_ffn', or 'attention', got "
                     f"{self.backbone_codebook_layer_type!r}"
+                )
+            if self.backbone_codebook_layers_per_group <= 0:
+                raise ValueError(
+                    "backbone_codebook_layers_per_group must be positive in backbone mode, got "
+                    f"{self.backbone_codebook_layers_per_group}"
+                )
+            if self.backbone_codebooks_per_group <= 0:
+                raise ValueError(
+                    "backbone_codebooks_per_group must be positive in backbone mode, got "
+                    f"{self.backbone_codebooks_per_group}"
+                )
+            if self.num_stacked_codebooks % self.backbone_codebooks_per_group != 0:
+                raise ValueError(
+                    "backbone_codebooks_per_group must divide num_stacked_codebooks exactly, got "
+                    f"{self.backbone_codebooks_per_group} and {self.num_stacked_codebooks}"
                 )
 
         positive_fields = (
@@ -215,27 +233,38 @@ class EasyMagpieOmniArch:
         """Whether trailing backbone blocks predict codebooks sequentially."""
         return self.codebook_prediction_mode == "backbone"
 
+    @property
+    def num_backbone_codebook_groups(self) -> int:
+        """Number of sequential codebook-prediction groups in backbone mode."""
+        return self.num_stacked_codebooks // self.backbone_codebooks_per_group
+
+    @property
+    def num_backbone_codebook_tail_layers(self) -> int:
+        """Number of logical backbone blocks assigned to codebook prediction."""
+        return self.num_backbone_codebook_groups * self.backbone_codebook_layers_per_group
+
     def validate_backbone_codebook_layout(self, hf_config: Any) -> None:
         """Validate the logical layer count and cache topology for backbone mode."""
         if not self.uses_backbone_codebook_layers:
             return
 
-        expected_layers = self.backbone_codebook_start_layer + self.num_stacked_codebooks
+        expected_tail_layers = self.num_backbone_codebook_tail_layers
+        expected_layers = self.backbone_codebook_start_layer + expected_tail_layers
         num_hidden_layers = int(getattr(hf_config, "num_hidden_layers", 0) or 0)
         pattern = str(getattr(hf_config, "hybrid_override_pattern", "") or "")
         if num_hidden_layers != expected_layers or len(pattern) != expected_layers:
             raise ValueError(
-                "backbone codebook prediction requires one logical tail block per stacked codebook: "
+                "backbone codebook prediction has an inconsistent grouped tail: "
                 f"expected num_hidden_layers=len(hybrid_override_pattern)={expected_layers}, got "
                 f"{num_hidden_layers} and {len(pattern)}"
             )
 
         expected_tail_symbol = "M" if self.backbone_codebook_layer_type == "mamba_ffn" else "*"
         tail = pattern[self.backbone_codebook_start_layer :]
-        if tail != expected_tail_symbol * self.num_stacked_codebooks:
+        if tail != expected_tail_symbol * expected_tail_layers:
             raise ValueError(
                 f"backbone_codebook_layer_type={self.backbone_codebook_layer_type!r} requires a tail of "
-                f"{self.num_stacked_codebooks} {expected_tail_symbol!r} symbols, got {tail!r}"
+                f"{expected_tail_layers} {expected_tail_symbol!r} symbols, got {tail!r}"
             )
 
     @property
@@ -334,6 +363,8 @@ class EasyMagpieOmniArch:
             "local_transformer_hidden_dim",
             "backbone_codebook_start_layer",
             "backbone_codebook_layer_type",
+            "backbone_codebook_layers_per_group",
+            "backbone_codebooks_per_group",
             "forced_audio_bos_id",
             "forced_audio_eos_id",
             "forced_mask_token_id",

@@ -60,13 +60,43 @@ def test_backbone_codebook_prediction_accepts_one_tail_block_per_codebook(layer_
 
 
 def test_backbone_codebook_prediction_requires_one_tail_block_per_codebook():
-    with pytest.raises(ValueError, match="one logical tail block per stacked codebook"):
+    with pytest.raises(ValueError, match="inconsistent grouped tail"):
         EasyMagpieOmniArch.from_hf_config(
             SimpleNamespace(
                 codebook_prediction_mode="backbone",
                 backbone_codebook_start_layer=16,
                 num_hidden_layers=31,
                 hybrid_override_pattern="MEMEM*EMEMEM*EME" + "*" * 15,
+                local_transformer_n_layers=0,
+            )
+        )
+
+
+def test_backbone_codebook_prediction_accepts_grouped_tail():
+    prefix = "MEMEM*EMEMEM*EMEMEMEM*EMEMEMEME"
+    arch = EasyMagpieOmniArch.from_hf_config(
+        SimpleNamespace(
+            codebook_prediction_mode="backbone",
+            backbone_codebook_start_layer=31,
+            backbone_codebook_layer_type="attention_ffn",
+            backbone_codebook_layers_per_group=3,
+            backbone_codebooks_per_group=4,
+            num_hidden_layers=43,
+            hybrid_override_pattern=prefix + "*" * 12,
+            local_transformer_n_layers=0,
+        )
+    )
+
+    assert arch.num_backbone_codebook_groups == 4
+    assert arch.num_backbone_codebook_tail_layers == 12
+
+
+def test_backbone_codebook_prediction_requires_even_codebook_groups():
+    with pytest.raises(ValueError, match="must divide num_stacked_codebooks exactly"):
+        EasyMagpieOmniArch.from_hf_config(
+            SimpleNamespace(
+                codebook_prediction_mode="backbone",
+                backbone_codebooks_per_group=3,
                 local_transformer_n_layers=0,
             )
         )

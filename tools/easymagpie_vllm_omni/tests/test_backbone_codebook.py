@@ -32,6 +32,8 @@ def _make_tiny_backbone():
     nn.Module.__init__(model)
     model.codebook_start_layer = 0
     model.num_codebooks = 2
+    model.codebook_layers_per_group = 1
+    model.codebooks_per_group = 1
     first = _RecordingBlock()
     second = _RecordingBlock()
     model.layers = nn.ModuleList([first, second])
@@ -62,3 +64,44 @@ def test_sampled_code_is_added_to_next_backbone_block_only_for_prediction_rows(p
 
     torch.testing.assert_close(second.effective_inputs[0], torch.tensor([[expected_second_input]]))
     torch.testing.assert_close(codes, torch.ones(1, 2, dtype=torch.long))
+
+
+def _make_tiny_grouped_backbone():
+    model = EasyMagpieBackboneCodebookModel.__new__(EasyMagpieBackboneCodebookModel)
+    nn.Module.__init__(model)
+    model.codebook_start_layer = 0
+    model.num_codebooks = 4
+    model.codebook_layers_per_group = 2
+    model.codebooks_per_group = 2
+    blocks = [_RecordingBlock() for _ in range(4)]
+    model.layers = nn.ModuleList(blocks)
+    model.codebook_output_norms = nn.ModuleList([nn.Identity() for _ in range(4)])
+    model.audio_embeddings = nn.ModuleList([nn.Embedding(3, 1) for _ in range(4)])
+    with torch.no_grad():
+        for embedding in model.audio_embeddings:
+            embedding.weight.zero_()
+        model.audio_embeddings[0].weight[1].fill_(4.0)
+        model.audio_embeddings[1].weight[1].fill_(6.0)
+    model.audio_in_projection = nn.Identity()
+    model.norm_f = _FinalNorm()
+    model._sample_codebook = MethodType(_fixed_code, model)
+    return model, blocks
+
+
+@pytest.mark.parametrize(("predict", "expected_next_group_input"), [(True, 7.0), (False, 2.0)])
+def test_grouped_codes_are_added_only_after_the_group(predict, expected_next_group_input):
+    model, blocks = _make_tiny_grouped_backbone()
+
+    _, codes = EasyMagpieBackboneCodebookModel.forward(
+        model,
+        input_ids=torch.zeros(1, dtype=torch.long),
+        positions=torch.zeros(1, dtype=torch.long),
+        inputs_embeds=torch.tensor([[2.0]]),
+        code_prediction_mask=torch.tensor([predict]),
+        gumbel_noise=torch.zeros(1, 4, 1),
+        temperature=torch.ones(1),
+    )
+
+    torch.testing.assert_close(blocks[1].effective_inputs[0], torch.tensor([[2.0]]))
+    torch.testing.assert_close(blocks[2].effective_inputs[0], torch.tensor([[expected_next_group_input]]))
+    torch.testing.assert_close(codes, torch.ones(1, 4, dtype=torch.long))
