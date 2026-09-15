@@ -36,6 +36,12 @@ Stage 0 supports three `codebook_prediction_mode` values in `config.json`:
   `backbone_codebook_output_projections.*` plus tail block weights. Pipeline
   parallelism is not supported for this experimental mode.
 
+  `backbone_codebook_layers_per_group` and
+  `backbone_codebooks_per_group` generalize the tail. Each group runs the
+  configured number of blocks, predicts its codebooks in parallel, then
+  averages their sampled embeddings into the live stream before the next
+  group. Both values default to one.
+
 The review dummy checkpoints use 32 logical layers and retain the current
 model's first 16 entries verbatim (`MEMEM*EMEMEM*EME`). Their 16-entry tails
 compare attention+FFN, Mamba+FFN, and attention-only codebook blocks. The two
@@ -45,6 +51,11 @@ The corresponding directories are
 `converted_model_roy_fullsize_32khz_backbone_attn_ffn_dummy`,
 `converted_model_roy_fullsize_32khz_backbone_mamba_ffn_dummy`, and
 `converted_model_roy_fullsize_32khz_backbone_attn_dummy`.
+
+`converted_model_roy_fullsize_32khz_backbone_grouped_3x4_attn_ffn_dummy`
+retains all 31 original backbone entries, then runs four groups of three
+attention+dense-FFN blocks. Each group predicts four codebooks in parallel and
+feeds their sampled embeddings into the next group.
 
 The converter currently emits `autoregressive` checkpoints because the NeMo
 training checkpoints contain local-transformer weights.
