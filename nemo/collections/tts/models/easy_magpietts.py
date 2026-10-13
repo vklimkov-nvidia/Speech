@@ -194,6 +194,27 @@ class EasyMagpieTTSModel(EasyMagpieTTSInferenceModel):
             '_utmos_calculator',
         ]
 
+    def prepare_ctc_targets(self, text: torch.Tensor, text_lens: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Compact frame-aligned or padded text into spoken-token CTC targets."""
+        special_ids = {self.pad_id, self.bos_id, self.eos_id}
+        if hasattr(self, "interruption_token_id"):
+            special_ids.add(self.interruption_token_id)
+
+        rows = []
+        for row, length in zip(text, text_lens):
+            tokens = row[: int(length)]
+            keep = torch.ones_like(tokens, dtype=torch.bool)
+            for token_id in special_ids:
+                keep &= tokens.ne(token_id)
+            rows.append(tokens[keep])
+
+        target_lengths = torch.tensor([row.numel() for row in rows], dtype=torch.long, device=text.device)
+        max_length = max(int(target_lengths.max()) if rows else 0, 1)
+        targets = torch.full((text.shape[0], max_length), self.pad_id, dtype=text.dtype, device=text.device)
+        for row_index, tokens in enumerate(rows):
+            targets[row_index, : tokens.numel()] = tokens
+        return targets, target_lengths
+
     def compute_loss(
         self,
         logits,
@@ -1286,13 +1307,15 @@ class EasyMagpieTTSModel(EasyMagpieTTSInferenceModel):
         # and the synthetic acoustic EOS target are deliberately excluded.
         ctc_loss = None
         if self.ctc_head is not None:
-            ctc_target_lengths = (text_lens - 1).clamp_min(0)
+            ctc_target_ids, ctc_target_lengths = self.prepare_ctc_targets(text, text_lens)
             ctc_input_lengths = (audio_codes_lens_target - 1).clamp_min(0)
-            clean_text_embeddings = self.embed_text_tokens(text, text_lens=text_lens).detach()
+            clean_text_embeddings = self.embed_text_tokens(
+                ctc_target_ids, text_lens=ctc_target_lengths.clamp_min(1)
+            ).detach()
             ctc_loss = self.ctc_head.loss(
                 hidden_states=pred_embeddings,
                 input_lengths=ctc_input_lengths,
-                target_ids=text,
+                target_ids=ctc_target_ids,
                 target_lengths=ctc_target_lengths,
                 target_embeddings=clean_text_embeddings,
             )
