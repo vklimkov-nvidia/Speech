@@ -35,7 +35,6 @@ from nemo.collections.common.data.lhotse import get_lhotse_dataloader_from_confi
 from nemo.collections.tts.data.text_to_speech_dataset_lhotse import MagpieTTSLhotseDataset, setup_tokenizers
 from nemo.collections.tts.data.text_to_speech_dataset_lhotse_multiturn import MagpieTTSLhotseMultiturnDataset
 from nemo.collections.tts.models.easy_magpietts_inference import EasyMagpieTTSInferenceModel, TrainingMode
-from nemo.collections.tts.modules.easy_magpietts_ctc import TextConditionedCTCHead
 from nemo.collections.tts.modules.magpietts_modules import (
     LocalTransformerType,
     add_special_tokens,
@@ -74,7 +73,6 @@ class ProcessBatchOutput:
         loss: Total combined loss
         codebook_loss: Cross-entropy loss for parallel audio codebook prediction
         phoneme_loss: Cross-entropy loss for phoneme prediction (None if no phoneme tokenizer)
-        ctc_loss: Auxiliary transcript-token CTC loss (None if disabled)
         local_transformer_loss: Loss from local transformer (None if not used)
         acoustic_codes_predictor_loss: Loss from the acoustic codes predictor (None if not used)
         local_transformer_logits: Logits from local transformer (None if not used)
@@ -92,7 +90,6 @@ class ProcessBatchOutput:
     loss: torch.Tensor
     codebook_loss: torch.Tensor
     phoneme_loss: Optional[torch.Tensor]
-    ctc_loss: Optional[torch.Tensor]
     local_transformer_loss: Optional[torch.Tensor]
     acoustic_codes_predictor_loss: Optional[torch.Tensor]
     local_transformer_logits: Optional[torch.Tensor]
@@ -129,15 +126,6 @@ class EasyMagpieTTSModel(EasyMagpieTTSInferenceModel):
         self.parallel_codebook_loss_scale = cfg.get('parallel_codebook_loss_scale', 1.0)
         self.local_transformer_loss_scale = cfg.get('local_transformer_loss_scale', 1.0)
         self.acoustic_codes_predictor_loss_scale = cfg.get('acoustic_codes_predictor_loss_scale', 1.0)
-        self.ctc_loss_weight = cfg.get('ctc_loss_weight', 0.0)
-        self.ctc_head = None
-        if self.ctc_loss_weight > 0.0:
-            self.ctc_head = TextConditionedCTCHead(
-                hidden_size=cfg.hidden_dim,
-                text_embedding_size=cfg.embedding_dim,
-                bottleneck_size=cfg.get('ctc_bottleneck_size', 256),
-                temperature=cfg.get('ctc_temperature', 0.07),
-            )
 
         self.cross_entropy_loss = nn.CrossEntropyLoss(reduction='none')
 
@@ -1282,22 +1270,6 @@ class EasyMagpieTTSModel(EasyMagpieTTSInferenceModel):
         )
         loss = self.parallel_codebook_loss_scale * codebook_loss
 
-        # CTC uses one causal backbone state per real acoustic frame. Text EOS
-        # and the synthetic acoustic EOS target are deliberately excluded.
-        ctc_loss = None
-        if self.ctc_head is not None:
-            ctc_target_lengths = (text_lens - 1).clamp_min(0)
-            ctc_input_lengths = (audio_codes_lens_target - 1).clamp_min(0)
-            clean_text_embeddings = self.embed_text_tokens(text, text_lens=text_lens).detach()
-            ctc_loss = self.ctc_head.loss(
-                hidden_states=pred_embeddings,
-                input_lengths=ctc_input_lengths,
-                target_ids=text,
-                target_lengths=ctc_target_lengths,
-                target_embeddings=clean_text_embeddings,
-            )
-            loss = loss + self.ctc_loss_weight * ctc_loss
-
         # Compute local transformer loss if applicable
         local_transformer_loss = None
         local_transformer_logits = None
@@ -1380,7 +1352,6 @@ class EasyMagpieTTSModel(EasyMagpieTTSInferenceModel):
             loss=loss,
             codebook_loss=codebook_loss,
             phoneme_loss=phoneme_loss,
-            ctc_loss=ctc_loss,
             local_transformer_loss=local_transformer_loss,
             acoustic_codes_predictor_loss=acoustic_codes_predictor_loss,
             local_transformer_logits=local_transformer_logits,
@@ -1627,9 +1598,6 @@ class EasyMagpieTTSModel(EasyMagpieTTSInferenceModel):
             phoneme_loss = batch_output.phoneme_loss
             self.log('train/phoneme_loss', phoneme_loss, prog_bar=True, sync_dist=True)
 
-        if batch_output.ctc_loss is not None:
-            self.log('train/ctc_loss', batch_output.ctc_loss, prog_bar=True, sync_dist=True)
-
         local_transformer_loss = batch_output.local_transformer_loss
         if local_transformer_loss is not None:
             self.log('train/local_transformer_loss', local_transformer_loss, prog_bar=True, sync_dist=True)
@@ -1757,7 +1725,6 @@ class EasyMagpieTTSModel(EasyMagpieTTSInferenceModel):
             'val_loss': loss,
             'val_codebook_loss': codebook_loss,
             'val_local_transformer_loss': local_transformer_loss,
-            'val_ctc_loss': batch_output.ctc_loss,
         }
 
         if acoustic_codes_predictor_loss is not None:
@@ -2001,10 +1968,6 @@ class EasyMagpieTTSModel(EasyMagpieTTSInferenceModel):
 
         self.log("val_loss", val_loss, prog_bar=True, sync_dist=True)
         self.log("val/codebook_loss", val_codebook_loss, prog_bar=True, sync_dist=True)
-
-        if self.ctc_head is not None:
-            val_ctc_loss = collect("val_ctc_loss")
-            self.log("val/ctc_loss", val_ctc_loss, prog_bar=True, sync_dist=True)
 
         if self.local_transformer_type != LocalTransformerType.NO_LT:
             val_local_transformer_loss = collect("val_local_transformer_loss")
