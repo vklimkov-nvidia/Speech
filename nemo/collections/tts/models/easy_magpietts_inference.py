@@ -401,7 +401,10 @@ class EasyMagpieTTSInferenceModel(ModelPT):
         self.eos_id = base_num_tokens + 1
         self.cfg_unk_token_id = base_num_tokens + 2
         next_special_token_id = base_num_tokens + 3
-        if cfg.get("use_multiturn_dataset", False):
+        self.reserve_interruption_token = cfg.get(
+            "reserve_interruption_token", cfg.get("use_multiturn_dataset", False)
+        )
+        if self.reserve_interruption_token:
             self.interruption_token_id = next_special_token_id
             next_special_token_id += 1
 
@@ -601,7 +604,7 @@ class EasyMagpieTTSInferenceModel(ModelPT):
                     special_vocab[f'<TEXT_PHONEME_{phoneme_token_id}>'] = (
                         self.text_phoneme_token_offset + phoneme_token_id
                     )
-            if cfg.get("use_multiturn_dataset", False):
+            if self.reserve_interruption_token:
                 special_vocab["<INTERRUPTION>"] = self.interruption_token_id
 
             self.cas_encoder = CharAwareSubwordEncoder(

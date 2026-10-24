@@ -626,6 +626,15 @@ def test_process_batch_smoke(model, toy_batch):
     assert output.context_audio_codes.shape[1] == model.num_audio_codebooks
 
 
+def test_single_turn_model_can_reserve_multiturn_checkpoint_token():
+    model = _make_easy_magpie_model(tiny_easy_magpie_cfg({"reserve_interruption_token": True}))
+
+    assert not model.cfg.use_multiturn_dataset
+    assert model.reserve_interruption_token
+    assert model.interruption_token_id == len(model.tokenizer.tokens) + 3
+    assert model.interruption_token_id in model.cas_encoder.subword_id_to_char_ids
+
+
 def test_process_batch_with_multiturn_dataset_enabled():
     _seed_everything()
     model = _make_easy_magpie_model(tiny_easy_magpie_cfg({"use_multiturn_dataset": True}))
