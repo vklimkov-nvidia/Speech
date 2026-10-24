@@ -943,7 +943,7 @@ class EasyMagpieTTSInferenceModel(ModelPT):
             model_cfg=self.cfg,
         )
         if not strict:
-            super().load_state_dict(state_dict, strict=False)
+            return super().load_state_dict(state_dict, strict=False)
         modules_to_skip = self._get_state_dict_keys_to_exclude()
         for name, child in self.named_children():
             if name in modules_to_skip:

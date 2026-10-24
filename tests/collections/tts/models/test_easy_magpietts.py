@@ -290,6 +290,15 @@ def test_state_dict_excludes_codec(model):
     assert any(key.startswith("final_proj.") for key in state)
 
 
+def test_non_strict_state_dict_load_allows_missing_child_module(model):
+    state = model.state_dict()
+    state = {key: value for key, value in state.items() if not key.startswith("audio_in_projection.")}
+
+    incompatible = model.load_state_dict(state, strict=False)
+
+    assert "audio_in_projection.weight" in incompatible.missing_keys
+
+
 def test_audio_and_text_embedding_shapes(model):
     audio_tokens = _toy_codes(model, batch_size=2, num_frames=3)
     audio_tokens[0, :, -1] = model.audio_eos_id
