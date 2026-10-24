@@ -25,6 +25,7 @@ from lhotse.array import Array, TemporalArray
 from lhotse.testing.dummies import dummy_cut, dummy_recording
 from omegaconf import OmegaConf
 
+from nemo.collections.common.data.lhotse.dataloader import resample
 from nemo.collections.tts.data.text_to_speech_dataset_lhotse import MagpieTTSLhotseDataset
 from nemo.collections.tts.data.text_to_speech_dataset_lhotse_multiturn import MagpieTTSLhotseMultiturnDataset
 
@@ -165,6 +166,15 @@ def _text_only_cutset(include_ipa=True):
         custom={"text_only": True},
     )
     return CutSet.from_cuts([cut])
+
+
+def test_resample_preserves_text_only_cut_without_recording():
+    cut = next(iter(_text_only_cutset()))
+
+    resampled = resample(cut, sampling_rate=16000)
+
+    assert resampled is cut
+    assert not resampled.has_recording
 
 
 def _multiturn_cutset():

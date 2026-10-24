@@ -1266,7 +1266,7 @@ def resample(example, sampling_rate):
     from nemo.collections.common.data.lhotse.text_adapters import NeMoMultimodalConversation
 
     if isinstance(example, Cut):
-        return example.resample(sampling_rate)
+        return example.resample(sampling_rate) if example.has_recording else example
     elif isinstance(example, NeMoMultimodalConversation):
         for turn in example.turns:
             if hasattr(turn, "cut"):
