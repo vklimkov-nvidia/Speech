@@ -309,8 +309,6 @@ class TestMagpieTTSLhotseDatasets:
             {
                 "frame_stacking_factor": 2,
                 "phoneme_stacking_factor": 2,
-                "text_only_audio_mask_min_steps": 4,
-                "text_only_audio_mask_max_steps": 4,
                 "text_span_corruption_prob": 1.0,
             }
         )
@@ -329,10 +327,10 @@ class TestMagpieTTSLhotseDatasets:
         assert batch["text_only"].tolist() == [True]
         assert batch["text_span_corrupted"].tolist() == [False]
         assert not batch["text_span_corruption_mask"].any()
-        # Four IPA tokens stack to two phoneme steps; with four mask-tail
-        # steps, five predicted steps map back to ten raw codec frames.
-        assert batch["audio_codes"].shape == (1, NUM_AUDIO_CODEBOOKS, 10)
-        assert batch["audio_codes_lens"].tolist() == [10]
+        # Four IPA tokens stack to two supervised phoneme steps, which
+        # require two raw codec frames when frame_stacking_factor=2.
+        assert batch["audio_codes"].shape == (1, NUM_AUDIO_CODEBOOKS, 2)
+        assert batch["audio_codes_lens"].tolist() == [2]
 
     def test_text_only_cut_supports_on_the_fly_codec_extraction(self):
         _seed_everything()
@@ -342,8 +340,6 @@ class TestMagpieTTSLhotseDatasets:
                 "load_cached_codes_if_available": False,
                 "frame_stacking_factor": 2,
                 "phoneme_stacking_factor": 2,
-                "text_only_audio_mask_min_steps": 4,
-                "text_only_audio_mask_max_steps": 4,
             }
         )
         dataset = MagpieTTSLhotseDataset(**kwargs)
@@ -355,7 +351,7 @@ class TestMagpieTTSLhotseDatasets:
 
         batch = dataset[_text_only_cutset()]
 
-        expected_samples = 10 * kwargs["codec_model_samples_per_frame"]
+        expected_samples = 2 * kwargs["codec_model_samples_per_frame"]
         assert "audio_codes" not in batch
         assert batch["audio"].shape == (1, expected_samples)
         assert batch["audio_lens"].tolist() == [expected_samples]

@@ -2202,8 +2202,6 @@ class EasyMagpieTTSModel(EasyMagpieTTSInferenceModel):
                 add_language_to_context_text=self.add_language_to_context_text,
                 ignore_manifest_context_text=self.ignore_manifest_context_text,
                 frame_stacking_factor=self.frame_stacking_factor,
-                text_only_audio_mask_min_steps=self.cfg.get('text_only_audio_mask_min_steps', 1),
-                text_only_audio_mask_max_steps=self.cfg.get('text_only_audio_mask_max_steps', 32),
                 phoneme_stacking_factor=self.phoneme_stacking_factor,
                 text_span_corruption_prob=self.cfg.get('text_span_corruption_prob', 0.0),
                 text_span_corruption_short_max_tokens=self.cfg.get(
