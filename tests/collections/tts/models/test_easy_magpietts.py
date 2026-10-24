@@ -164,6 +164,19 @@ def _make_easy_magpie_model(cfg=None):
     return model
 
 
+def _enable_fake_phoneme_head(model):
+    model.phoneme_tokenizer = SimpleNamespace(
+        pad=0, bos_token_id=1, eos_token_id=2, unk_token_id=3, vocab_size=16
+    )
+    model.phoneme_stacking_factor = 1
+    model.phoneme_vocab_size = model.phoneme_tokenizer.vocab_size
+    model.phoneme_embeddings = nn.ModuleList(
+        [nn.Embedding(model.phoneme_vocab_size, model.cfg.embedding_dim)]
+    )
+    model.phoneme_final_proj = nn.Linear(model.cfg.hidden_dim, model.phoneme_vocab_size)
+    return model
+
+
 @pytest.fixture()
 def model():
     return _make_easy_magpie_model()
@@ -709,6 +722,48 @@ def test_validation_step_smoke(model, toy_batch, tmp_path):
     assert torch.isfinite(output["val_codebook_loss"])
     assert output["val_local_transformer_loss"] is None
     assert model.validation_step_outputs[-1] == output
+
+
+def test_text_only_batch_trains_phonemes_without_acoustic_or_eos_loss():
+    model = _enable_fake_phoneme_head(
+        _make_easy_magpie_model(
+            tiny_easy_magpie_cfg(
+                {
+                    "acoustic_codes_predictor": True,
+                    "acoustic_codes_predictor_schedule": [8],
+                    "mask_user_on_loss": False,
+                }
+            )
+        )
+    )
+    batch = _toy_batch(model)
+    phoneme_tokens = torch.tensor([[1, 4, 5, 2], [1, 6, 7, 2]], dtype=torch.long)
+    phoneme_tokens_lens = torch.tensor([4, 4], dtype=torch.long)
+
+    output = model.process_batch(
+        text=batch["text"],
+        text_lens=batch["text_lens"],
+        context_text_tokens=batch["context_text_tokens"],
+        context_text_tokens_lens=batch["context_text_tokens_lens"],
+        audio_codes=batch["audio_codes"],
+        audio_codes_lens=batch["audio_codes_lens"],
+        context_audio_codes=batch["context_audio_codes"],
+        context_audio_codes_lens=batch["context_audio_codes_lens"],
+        phoneme_tokens=phoneme_tokens,
+        phoneme_tokens_lens=phoneme_tokens_lens,
+        mode="val",
+        training_mode=model.training_modes[0],
+        text_only_mask=torch.ones(2, dtype=torch.bool),
+    )
+
+    assert output.codebook_loss.item() == 0.0
+    assert output.acoustic_codes_predictor_loss.item() == 0.0
+    assert output.phoneme_loss.item() > 0.0
+    for sample, length in zip(output.audio_codes_target, output.audio_codes_lens_target):
+        valid_targets = sample[:, : int(length.item())]
+        assert valid_targets.eq(model.mask_token_id).all()
+        assert not valid_targets.eq(model.audio_eos_id).any()
+
 
 
 def test_acoustic_codes_predictor_requires_no_local_transformer():

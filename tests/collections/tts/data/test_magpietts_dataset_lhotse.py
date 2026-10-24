@@ -20,7 +20,7 @@ import pytest
 import torch
 from huggingface_hub import snapshot_download
 from huggingface_hub.errors import LocalEntryNotFoundError
-from lhotse import CutSet, SupervisionSegment
+from lhotse import CutSet, MonoCut, SupervisionSegment
 from lhotse.array import Array, TemporalArray
 from lhotse.testing.dummies import dummy_cut, dummy_recording
 from omegaconf import OmegaConf
@@ -59,6 +59,7 @@ class _FakeIPATokenizer:
 class _FakeTextTokenizer:
     tokens = list(range(100))
     pad = 0
+    tokenizer_pad_ids = {BPE_TOKENIZER_NAME: 0}
 
     def encode(self, text, tokenizer_name):
         return [10 + len(text)]
@@ -128,6 +129,36 @@ def _single_turn_cutset():
         "tokenizer_names": [BPE_TOKENIZER_NAME],
         "lang": "en",
     }
+    return CutSet.from_cuts([cut])
+
+
+def _text_only_cutset(include_ipa=True):
+    supervision_custom = {
+        "normalized_text": "the twenty fourth item",
+        "text_only": True,
+    }
+    if include_ipa:
+        supervision_custom["ipa"] = "ðə twɛnti fɔɹθ aɪtəm"
+    cut = MonoCut(
+        id="text-only-cut",
+        start=0.0,
+        duration=1.0,
+        channel=0,
+        recording=None,
+        supervisions=[
+            SupervisionSegment(
+                id="text-only-sup",
+                recording_id="text-only-cut",
+                start=0.0,
+                duration=1.0,
+                text="the 24th item",
+                language="en",
+                speaker="| Language:en Dataset:SyntheticTN Speaker:synthetic |",
+                custom=supervision_custom,
+            )
+        ],
+        custom={"text_only": True},
+    )
     return CutSet.from_cuts([cut])
 
 
@@ -266,6 +297,45 @@ def _multiturn_dataset_kwargs():
 
 
 class TestMagpieTTSLhotseDatasets:
+    def test_text_only_cut_uses_raw_text_ipa_and_dummy_audio_codes(self):
+        _seed_everything()
+        kwargs = _dataset_kwargs()
+        kwargs.update(
+            {
+                "frame_stacking_factor": 2,
+                "text_only_audio_mask_min_steps": 4,
+                "text_only_audio_mask_max_steps": 4,
+            }
+        )
+        dataset = MagpieTTSLhotseDataset(**kwargs)
+        dataset.text_tokenizer = _FakeTextTokenizer()
+        dataset.phoneme_tokenizer = _FakeIPATokenizer()
+        dataset.bos_id = len(dataset.text_tokenizer.tokens)
+        dataset.eos_id = dataset.bos_id + 1
+        dataset.pad_id = dataset.text_tokenizer.pad
+
+        batch = dataset[_text_only_cutset()]
+
+        # The synthetic normalization pair must train raw written text -> IPA.
+        assert batch["raw_texts"] == ["the 24th item"]
+        assert batch["phoneme_tokens"][0, :4].tolist() == [1, 7, 8, 2]
+        assert batch["text_only"].tolist() == [True]
+        # Four IPA steps plus four random mask-tail steps map back to 14 raw
+        # codec frames when frame_stacking_factor=2.
+        assert batch["audio_codes"].shape == (1, NUM_AUDIO_CODEBOOKS, 14)
+        assert batch["audio_codes_lens"].tolist() == [14]
+
+    def test_text_only_cut_requires_ipa(self):
+        dataset = MagpieTTSLhotseDataset(**_dataset_kwargs())
+        dataset.text_tokenizer = _FakeTextTokenizer()
+        dataset.phoneme_tokenizer = _FakeIPATokenizer()
+        dataset.bos_id = len(dataset.text_tokenizer.tokens)
+        dataset.eos_id = dataset.bos_id + 1
+        dataset.pad_id = dataset.text_tokenizer.pad
+
+        with pytest.raises(ValueError, match="requires a non-empty supervision custom.ipa"):
+            dataset[_text_only_cutset(include_ipa=False)]
+
     def test_single_turn_dataset_uses_bpe_and_cached_codes(self):
         _seed_everything()
         dataset = MagpieTTSLhotseDataset(**_dataset_kwargs())

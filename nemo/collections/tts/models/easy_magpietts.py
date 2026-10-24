@@ -635,6 +635,7 @@ class EasyMagpieTTSModel(EasyMagpieTTSInferenceModel):
         speech_eos_mask: Optional[torch.Tensor] = None,
         agent_mask: Optional[torch.Tensor] = None,
         dropout_audio_conditioning: bool = False,
+        text_only_mask: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
         """Prepare the delayed autoregressive audio channel and its targets.
 
@@ -696,6 +697,23 @@ class EasyMagpieTTSModel(EasyMagpieTTSInferenceModel):
             self.frame_stacking_factor,
             self.num_audio_codebooks,
         )
+        # Text-only samples have no duration or acoustic targets. Feed the existing
+        # learned audio MASK embedding for a random-length continuation and avoid
+        # creating an AUDIO_EOS target.
+        if text_only_mask is not None:
+            text_only_mask = text_only_mask.to(device=device, dtype=torch.bool)
+            if text_only_mask.shape != (batch_size,):
+                raise ValueError(
+                    f"text_only_mask has shape {tuple(text_only_mask.shape)}, expected {(batch_size,)}"
+                )
+            positions = torch.arange(audio_codes.size(2), device=device).view(1, 1, -1)
+            valid = positions < audio_codes_lens.view(-1, 1, 1)
+            replace_with_mask = text_only_mask.view(-1, 1, 1) & valid & (positions > 0)
+            audio_codes = torch.where(
+                replace_with_mask,
+                torch.full_like(audio_codes, self.mask_token_id),
+                audio_codes,
+            )
 
         if speech_eos_mask is not None:
             audio_codes_before_speech_eos = audio_codes.clone()
@@ -941,6 +959,7 @@ class EasyMagpieTTSModel(EasyMagpieTTSInferenceModel):
         task: Optional[List[str]] = None,
         agent_mask: Optional[torch.Tensor] = None,
         user_audio_embedded: Optional[torch.Tensor] = None,
+        text_only_mask: Optional[torch.Tensor] = None,
     ) -> ProcessBatchOutput:
         """
         Simplified batch processing using channel-based embedding architecture.
@@ -1100,7 +1119,14 @@ class EasyMagpieTTSModel(EasyMagpieTTSInferenceModel):
             speech_eos_mask=speech_eos_mask,
             agent_mask=agent_mask,
             dropout_audio_conditioning=dropout_audio_conditioning,
+            text_only_mask=text_only_mask,
         )
+
+        acoustic_loss_mask = agent_mask if self.cfg.get("mask_user_on_loss", False) else None
+        if text_only_mask is not None:
+            has_audio = (~text_only_mask.to(device=audio_codes_target.device, dtype=torch.bool)).unsqueeze(1)
+            has_audio = has_audio.expand(-1, audio_codes_target.size(2))
+            acoustic_loss_mask = has_audio if acoustic_loss_mask is None else acoustic_loss_mask & has_audio
 
         # 6. Sum the channel embeddings element-wise
         # First, align all channels to the same length (max of all channel lengths)
@@ -1266,7 +1292,7 @@ class EasyMagpieTTSModel(EasyMagpieTTSInferenceModel):
             logits,
             audio_codes_target,
             audio_codes_lens_target,
-            agent_mask_target=agent_mask if self.cfg.get("mask_user_on_loss", False) else None,
+            agent_mask_target=acoustic_loss_mask,
         )
         loss = self.parallel_codebook_loss_scale * codebook_loss
 
@@ -1288,7 +1314,7 @@ class EasyMagpieTTSModel(EasyMagpieTTSInferenceModel):
                 local_transformer_logits,
                 audio_codes_target,
                 audio_codes_lens_target,
-                agent_mask_target=agent_mask if self.cfg.get("mask_user_on_loss", False) else None,
+                agent_mask_target=acoustic_loss_mask,
             )
 
             loss = loss + self.local_transformer_loss_scale * local_transformer_loss
@@ -1301,7 +1327,7 @@ class EasyMagpieTTSModel(EasyMagpieTTSInferenceModel):
                 audio_codes_target=audio_codes_target,
                 audio_codes_lens_target=audio_codes_lens_target,
                 audio_delay=audio_delay,
-                loss_mask=agent_mask if self.cfg.get("mask_user_on_loss", False) else None,
+                loss_mask=acoustic_loss_mask,
             )
             acoustic_codes_predictor_loss = self.acoustic_codes_predictor.compute_loss(
                 hidden_states=transformer_hidden_states,
@@ -1588,6 +1614,7 @@ class EasyMagpieTTSModel(EasyMagpieTTSInferenceModel):
             task=batch["task"] if self.cfg.get("use_multiturn_dataset", False) else None,
             agent_mask=batch["agent_mask"] if self.cfg.get("use_multiturn_dataset", False) else None,
             user_audio_embedded=user_audio_embedded,
+            text_only_mask=batch.get('text_only'),
         )
         loss = batch_output.loss
         codebook_loss = batch_output.codebook_loss
@@ -1691,6 +1718,7 @@ class EasyMagpieTTSModel(EasyMagpieTTSInferenceModel):
             mode="val",
             task=batch["task"] if "task" in batch else None,
             agent_mask=batch["agent_mask"] if "agent_mask" in batch else None,
+            text_only_mask=batch.get('text_only'),
         )
         # Access ProcessBatchOutput dataclass attributes
         # logits come from the parallel prediction head
@@ -2125,6 +2153,9 @@ class EasyMagpieTTSModel(EasyMagpieTTSInferenceModel):
                 phoneme_text_eop_marker=self.phoneme_text_eop_marker,
                 add_language_to_context_text=self.add_language_to_context_text,
                 ignore_manifest_context_text=self.ignore_manifest_context_text,
+                frame_stacking_factor=self.frame_stacking_factor,
+                text_only_audio_mask_min_steps=self.cfg.get('text_only_audio_mask_min_steps', 1),
+                text_only_audio_mask_max_steps=self.cfg.get('text_only_audio_mask_max_steps', 32),
             )
 
         data_loader = get_lhotse_dataloader_from_config(
