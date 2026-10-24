@@ -334,6 +334,35 @@ class TestMagpieTTSLhotseDatasets:
         assert batch["audio_codes"].shape == (1, NUM_AUDIO_CODEBOOKS, 10)
         assert batch["audio_codes_lens"].tolist() == [10]
 
+    def test_text_only_cut_supports_on_the_fly_codec_extraction(self):
+        _seed_everything()
+        kwargs = _dataset_kwargs()
+        kwargs.update(
+            {
+                "load_cached_codes_if_available": False,
+                "frame_stacking_factor": 2,
+                "phoneme_stacking_factor": 2,
+                "text_only_audio_mask_min_steps": 4,
+                "text_only_audio_mask_max_steps": 4,
+            }
+        )
+        dataset = MagpieTTSLhotseDataset(**kwargs)
+        dataset.text_tokenizer = _FakeTextTokenizer()
+        dataset.phoneme_tokenizer = _FakeIPATokenizer()
+        dataset.bos_id = len(dataset.text_tokenizer.tokens)
+        dataset.eos_id = dataset.bos_id + 1
+        dataset.pad_id = dataset.text_tokenizer.pad
+
+        batch = dataset[_text_only_cutset()]
+
+        expected_samples = 10 * kwargs["codec_model_samples_per_frame"]
+        assert "audio_codes" not in batch
+        assert batch["audio"].shape == (1, expected_samples)
+        assert batch["audio_lens"].tolist() == [expected_samples]
+        assert batch["audio"].eq(0.0).all()
+        assert "context_audio_codes" not in batch
+        assert batch["context_audio"].shape == (1, kwargs["codec_model_samples_per_frame"])
+
     def test_text_only_cut_requires_ipa(self):
         dataset = MagpieTTSLhotseDataset(**_dataset_kwargs())
         dataset.text_tokenizer = _FakeTextTokenizer()

@@ -351,8 +351,6 @@ class MagpieTTSLhotseDataset(torch.utils.data.Dataset):
             )
             text_only_list.append(is_text_only)
             if is_text_only:
-                if not self.load_cached_codes_if_available:
-                    raise ValueError("Text-only EasyMagpie samples require load_cached_codes_if_available=True.")
                 if self.phoneme_tokenizer is None:
                     raise ValueError("Text-only EasyMagpie samples require a phoneme tokenizer.")
                 if not supervision.has_custom("ipa") or not supervision.ipa:
@@ -381,11 +379,17 @@ class MagpieTTSLhotseDataset(torch.utils.data.Dataset):
                 )
                 target_steps = phoneme_steps + mask_tail_steps
                 raw_audio_frames = max(1, (target_steps - 1) * self.frame_stacking_factor)
-                audio_codes = torch.zeros((self.num_audio_codebooks, raw_audio_frames), dtype=torch.int32)
-                audio_codes_len = raw_audio_frames
                 spec_len = target_steps
-                audio_codes_list.append(audio_codes.T)
-                audio_codes_len_list.append(audio_codes_len)
+                if self.load_cached_codes_if_available:
+                    audio_codes = torch.zeros((self.num_audio_codebooks, raw_audio_frames), dtype=torch.int32)
+                    audio_codes_list.append(audio_codes.T)
+                    audio_codes_len_list.append(raw_audio_frames)
+                else:
+                    # The codec output is discarded and replaced by learned mask tokens in
+                    # process_batch; a zero waveform only preserves batch shape/timeline.
+                    audio_len = raw_audio_frames * self.codec_model_samples_per_frame
+                    audio_list.append(torch.zeros(audio_len, dtype=torch.float32))
+                    audio_len_list.append(audio_len)
             elif self.load_cached_codes_if_available and cut.has_custom("target_codes"):
                 # Note that we have segmented the audio according to offset and duration so that the audio codes should
                 # not specify start and duration again when calling TemporalArray.load(start, duration). Ensure start
