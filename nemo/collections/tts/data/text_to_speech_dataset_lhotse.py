@@ -209,6 +209,7 @@ class MagpieTTSLhotseDataset(torch.utils.data.Dataset):
         frame_stacking_factor: int = 1,
         text_only_audio_mask_min_steps: int = 1,
         text_only_audio_mask_max_steps: int = 32,
+        phoneme_stacking_factor: int = 1,
         text_span_corruption_prob: float = 0.0,
         text_span_corruption_short_max_tokens: int = 3,
         text_span_corruption_long_max_tokens: int = 16,
@@ -250,6 +251,7 @@ class MagpieTTSLhotseDataset(torch.utils.data.Dataset):
         self.frame_stacking_factor = frame_stacking_factor
         self.text_only_audio_mask_min_steps = text_only_audio_mask_min_steps
         self.text_only_audio_mask_max_steps = text_only_audio_mask_max_steps
+        self.phoneme_stacking_factor = phoneme_stacking_factor
         self.text_span_corruption_prob = text_span_corruption_prob
         self.text_span_corruption_short_max_tokens = text_span_corruption_short_max_tokens
         self.text_span_corruption_long_max_tokens = text_span_corruption_long_max_tokens
@@ -259,6 +261,8 @@ class MagpieTTSLhotseDataset(torch.utils.data.Dataset):
                 "Expected 0 <= text_only_audio_mask_min_steps <= text_only_audio_mask_max_steps, "
                 f"got {self.text_only_audio_mask_min_steps} and {self.text_only_audio_mask_max_steps}."
             )
+        if self.phoneme_stacking_factor < 1:
+            raise ValueError("phoneme_stacking_factor must be at least 1.")
         if not 0.0 <= self.text_span_corruption_prob <= 1.0:
             raise ValueError("text_span_corruption_prob must be in [0, 1].")
         if not 0.0 <= self.text_span_corruption_long_prob <= 1.0:
@@ -367,7 +371,10 @@ class MagpieTTSLhotseDataset(torch.utils.data.Dataset):
 
             # target audio or target codes
             if is_text_only:
-                phoneme_steps = len(self.phoneme_tokenizer.encode(supervision.ipa)) + 2
+                phoneme_tokens = len(self.phoneme_tokenizer.encode(supervision.ipa)) + 2
+                phoneme_steps = (
+                    phoneme_tokens + self.phoneme_stacking_factor - 1
+                ) // self.phoneme_stacking_factor
                 mask_tail_steps = random.randint(
                     self.text_only_audio_mask_min_steps,
                     self.text_only_audio_mask_max_steps,

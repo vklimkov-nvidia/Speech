@@ -792,6 +792,9 @@ def test_text_only_batch_trains_phonemes_without_acoustic_or_eos_loss():
                     "acoustic_codes_predictor": True,
                     "acoustic_codes_predictor_schedule": [8],
                     "mask_user_on_loss": False,
+                    "dropout_text_input_prob": 1.0,
+                    "cfg_unconditional_prob": 1.0,
+                    "phoneme_corruption_batch_prob": 1.0,
                 }
             )
         )
@@ -811,7 +814,7 @@ def test_text_only_batch_trains_phonemes_without_acoustic_or_eos_loss():
         context_audio_codes_lens=batch["context_audio_codes_lens"],
         phoneme_tokens=phoneme_tokens,
         phoneme_tokens_lens=phoneme_tokens_lens,
-        mode="val",
+        mode="train",
         training_mode=model.training_modes[0],
         text_only_mask=torch.ones(2, dtype=torch.bool),
     )

@@ -1032,12 +1032,18 @@ class EasyMagpieTTSModel(EasyMagpieTTSInferenceModel):
         current_streaming_speech_delay = selected_training_mode.streaming_speech_delay
         current_streaming_phonemes_delay = selected_training_mode.streaming_phonemes_delay
 
+        # Text-only batches have no acoustic target, so their phoneme objective is the
+        # only learning signal. Keep batch-wide augmentations from suppressing it.
+        all_text_only = bool(text_only_mask is not None and text_only_mask.bool().all().item())
+
         # Determine dropout flags
-        dropout_text_input = (random.random() < self.dropout_text_input_prob) if mode == 'train' else False
+        dropout_text_input = (
+            (random.random() < self.dropout_text_input_prob) if mode == 'train' and not all_text_only else False
+        )
 
         # Determine CFG unconditional dropout
         dropout_conditional_input = False
-        if mode == 'train' and self.cfg_unconditional_prob > 0.0:
+        if mode == 'train' and not all_text_only and self.cfg_unconditional_prob > 0.0:
             if torch.rand(1).item() < self.cfg_unconditional_prob:
                 dropout_conditional_input = True
 
@@ -1098,6 +1104,7 @@ class EasyMagpieTTSModel(EasyMagpieTTSInferenceModel):
             # Corrupt phonemes only when text input is not dropped.
             apply_phoneme_corruption = (
                 mode == 'train'
+                and (not all_text_only)
                 and (not dropout_text_input)
                 and (not dropout_conditional_input)
                 and self.phoneme_corruption_type == 'repeat_skip_unk'
@@ -2197,6 +2204,7 @@ class EasyMagpieTTSModel(EasyMagpieTTSInferenceModel):
                 frame_stacking_factor=self.frame_stacking_factor,
                 text_only_audio_mask_min_steps=self.cfg.get('text_only_audio_mask_min_steps', 1),
                 text_only_audio_mask_max_steps=self.cfg.get('text_only_audio_mask_max_steps', 32),
+                phoneme_stacking_factor=self.phoneme_stacking_factor,
                 text_span_corruption_prob=self.cfg.get('text_span_corruption_prob', 0.0),
                 text_span_corruption_short_max_tokens=self.cfg.get(
                     'text_span_corruption_short_max_tokens', 3

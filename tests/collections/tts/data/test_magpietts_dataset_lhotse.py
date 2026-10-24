@@ -308,6 +308,7 @@ class TestMagpieTTSLhotseDatasets:
         kwargs.update(
             {
                 "frame_stacking_factor": 2,
+                "phoneme_stacking_factor": 2,
                 "text_only_audio_mask_min_steps": 4,
                 "text_only_audio_mask_max_steps": 4,
                 "text_span_corruption_prob": 1.0,
@@ -328,10 +329,10 @@ class TestMagpieTTSLhotseDatasets:
         assert batch["text_only"].tolist() == [True]
         assert batch["text_span_corrupted"].tolist() == [False]
         assert not batch["text_span_corruption_mask"].any()
-        # Four IPA steps plus four random mask-tail steps map back to 14 raw
-        # codec frames when frame_stacking_factor=2.
-        assert batch["audio_codes"].shape == (1, NUM_AUDIO_CODEBOOKS, 14)
-        assert batch["audio_codes_lens"].tolist() == [14]
+        # Four IPA tokens stack to two phoneme steps; with four mask-tail
+        # steps, five predicted steps map back to ten raw codec frames.
+        assert batch["audio_codes"].shape == (1, NUM_AUDIO_CODEBOOKS, 10)
+        assert batch["audio_codes_lens"].tolist() == [10]
 
     def test_text_only_cut_requires_ipa(self):
         dataset = MagpieTTSLhotseDataset(**_dataset_kwargs())
