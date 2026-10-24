@@ -139,7 +139,7 @@ def _single_turn_cutset():
 
 def _text_only_cutset(include_ipa=True):
     supervision_custom = {
-        "normalized_text": "the twenty fourth item",
+        "normalized_text_reference": "the twenty fourth item",
         "text_only": True,
     }
     if include_ipa:
