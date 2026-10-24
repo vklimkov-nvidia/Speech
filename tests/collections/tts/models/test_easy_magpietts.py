@@ -724,6 +724,66 @@ def test_validation_step_smoke(model, toy_batch, tmp_path):
     assert model.validation_step_outputs[-1] == output
 
 
+def test_text_span_corruption_zeros_only_selected_embeddings(model, toy_batch):
+    delay = torch.zeros(toy_batch["text"].size(0), dtype=torch.long)
+    corruption_mask = torch.zeros_like(toy_batch["text"], dtype=torch.bool)
+    corruption_mask[0, :2] = True
+
+    clean, _ = model.prepare_text_channel_embeddings(
+        text=toy_batch["text"],
+        text_lens=toy_batch["text_lens"],
+        delay=delay,
+    )
+    corrupted, _ = model.prepare_text_channel_embeddings(
+        text=toy_batch["text"],
+        text_lens=toy_batch["text_lens"],
+        delay=delay,
+        text_span_corruption_mask=corruption_mask,
+    )
+
+    assert corrupted[corruption_mask].eq(0.0).all()
+    torch.testing.assert_close(corrupted[~corruption_mask], clean[~corruption_mask])
+
+
+def test_text_span_corruption_masks_phoneme_loss_per_sample():
+    model = _enable_fake_phoneme_head(
+        _make_easy_magpie_model(tiny_easy_magpie_cfg({"mask_user_on_loss": False}))
+    )
+    batch = _toy_batch(model)
+    phoneme_tokens = torch.tensor([[1, 4, 5, 2], [1, 6, 7, 2]], dtype=torch.long)
+    phoneme_tokens_lens = torch.tensor([4, 4], dtype=torch.long)
+    corruption_mask = torch.zeros_like(batch["text"], dtype=torch.bool)
+    corruption_mask[0, 0] = True
+    corrupted_samples = torch.tensor([True, False])
+
+    output = model.process_batch(
+        text=batch["text"],
+        text_lens=batch["text_lens"],
+        context_text_tokens=batch["context_text_tokens"],
+        context_text_tokens_lens=batch["context_text_tokens_lens"],
+        audio_codes=batch["audio_codes"],
+        audio_codes_lens=batch["audio_codes_lens"],
+        context_audio_codes=batch["context_audio_codes"],
+        context_audio_codes_lens=batch["context_audio_codes_lens"],
+        phoneme_tokens=phoneme_tokens,
+        phoneme_tokens_lens=phoneme_tokens_lens,
+        mode="val",
+        training_mode=model.training_modes[0],
+        text_span_corruption_mask=corruption_mask,
+        text_span_corrupted=corrupted_samples,
+    )
+    expected_mask = (~corrupted_samples).unsqueeze(1).expand(-1, output.phoneme_tokens_target.size(2))
+    expected_loss, _ = model.compute_phoneme_loss(
+        output.phoneme_logits,
+        output.phoneme_tokens_target,
+        output.phoneme_tokens_lens_target,
+        custom_mask=expected_mask,
+    )
+
+    torch.testing.assert_close(output.phoneme_loss, expected_loss)
+    assert output.phoneme_loss.item() > 0.0
+
+
 def test_text_only_batch_trains_phonemes_without_acoustic_or_eos_loss():
     model = _enable_fake_phoneme_head(
         _make_easy_magpie_model(

@@ -65,6 +65,11 @@ class _FakeTextTokenizer:
         return [10 + len(text)]
 
 
+class _ManyTokenTextTokenizer(_FakeTextTokenizer):
+    def encode(self, text, tokenizer_name):
+        return list(range(10, 30))
+
+
 def _seed_everything():
     random.seed(42)
     np.random.seed(42)
@@ -119,7 +124,7 @@ def _single_turn_cutset():
             text="hello",
             language="en",
             speaker="| Language:en Dataset:Unit Speaker:spk |",
-            custom={"context_text": "speaker prompt", "normalized_text": "hello"},
+            custom={"context_text": "speaker prompt", "normalized_text": "hello", "ipa": "həloʊ"},
         )
     ]
     cut.custom = {
@@ -305,6 +310,7 @@ class TestMagpieTTSLhotseDatasets:
                 "frame_stacking_factor": 2,
                 "text_only_audio_mask_min_steps": 4,
                 "text_only_audio_mask_max_steps": 4,
+                "text_span_corruption_prob": 1.0,
             }
         )
         dataset = MagpieTTSLhotseDataset(**kwargs)
@@ -320,6 +326,8 @@ class TestMagpieTTSLhotseDatasets:
         assert batch["raw_texts"] == ["the 24th item"]
         assert batch["phoneme_tokens"][0, :4].tolist() == [1, 7, 8, 2]
         assert batch["text_only"].tolist() == [True]
+        assert batch["text_span_corrupted"].tolist() == [False]
+        assert not batch["text_span_corruption_mask"].any()
         # Four IPA steps plus four random mask-tail steps map back to 14 raw
         # codec frames when frame_stacking_factor=2.
         assert batch["audio_codes"].shape == (1, NUM_AUDIO_CODEBOOKS, 14)
@@ -335,6 +343,57 @@ class TestMagpieTTSLhotseDatasets:
 
         with pytest.raises(ValueError, match="requires a non-empty supervision custom.ipa"):
             dataset[_text_only_cutset(include_ipa=False)]
+
+    def test_text_span_corruption_masks_short_non_eos_span_when_ipa_is_available(self):
+        _seed_everything()
+        kwargs = _dataset_kwargs()
+        kwargs.update(
+            {
+                "text_span_corruption_prob": 1.0,
+                "text_span_corruption_short_max_tokens": 3,
+                "text_span_corruption_long_max_tokens": 8,
+                "text_span_corruption_long_prob": 0.0,
+            }
+        )
+        dataset = MagpieTTSLhotseDataset(**kwargs)
+        dataset.text_tokenizer = _FakeTextTokenizer()
+        dataset.phoneme_tokenizer = _FakeIPATokenizer()
+        dataset.bos_id = len(dataset.text_tokenizer.tokens)
+        dataset.eos_id = dataset.bos_id + 1
+        dataset.pad_id = dataset.text_tokenizer.pad
+
+        batch = dataset[_single_turn_cutset()]
+        corruption_mask = batch["text_span_corruption_mask"][0]
+
+        assert batch["text_span_corrupted"].tolist() == [True]
+        assert corruption_mask.sum().item() == 1
+        assert not corruption_mask[batch["text_lens"][0] - 1]
+
+    def test_text_span_corruption_can_select_longer_span(self):
+        _seed_everything()
+        kwargs = _dataset_kwargs()
+        kwargs.update(
+            {
+                "text_span_corruption_prob": 1.0,
+                "text_span_corruption_short_max_tokens": 3,
+                "text_span_corruption_long_max_tokens": 8,
+                "text_span_corruption_long_prob": 1.0,
+            }
+        )
+        dataset = MagpieTTSLhotseDataset(**kwargs)
+        dataset.text_tokenizer = _ManyTokenTextTokenizer()
+        dataset.phoneme_tokenizer = _FakeIPATokenizer()
+        dataset.bos_id = len(dataset.text_tokenizer.tokens)
+        dataset.eos_id = dataset.bos_id + 1
+        dataset.pad_id = dataset.text_tokenizer.pad
+
+        batch = dataset[_single_turn_cutset()]
+        corruption_mask = batch["text_span_corruption_mask"][0]
+        masked_positions = corruption_mask.nonzero(as_tuple=False).squeeze(1)
+
+        assert 4 <= masked_positions.numel() <= 8
+        assert torch.equal(masked_positions, torch.arange(masked_positions[0], masked_positions[-1] + 1))
+        assert not corruption_mask[batch["text_lens"][0] - 1]
 
     def test_single_turn_dataset_uses_bpe_and_cached_codes(self):
         _seed_everything()

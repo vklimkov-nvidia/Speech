@@ -420,6 +420,7 @@ class EasyMagpieTTSModel(EasyMagpieTTSInferenceModel):
         dropout_text_input: bool = False,
         is_multiturn: bool = False,
         text_pad_id: int = None,
+        text_span_corruption_mask: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Prepare text embeddings as a channel input with delay handling.
@@ -439,6 +440,8 @@ class EasyMagpieTTSModel(EasyMagpieTTSInferenceModel):
                 therefore may contain timeline-aligned text padding tokens.
             text_pad_id: Token ID used for timeline padding in multi-turn text.
                 Required when ``is_multiturn`` is True.
+            text_span_corruption_mask: Optional per-token mask selecting text
+                embeddings to zero, with shape ``(B, L)``.
 
         Returns:
             Tuple of:
@@ -454,6 +457,15 @@ class EasyMagpieTTSModel(EasyMagpieTTSInferenceModel):
         # Handle text dropout - zero out the embeddings
         if dropout_text_input:
             text_embedded = text_embedded * 0.0
+
+        if text_span_corruption_mask is not None:
+            if text_span_corruption_mask.shape != text.shape:
+                raise ValueError(
+                    "text_span_corruption_mask has shape "
+                    f"{tuple(text_span_corruption_mask.shape)}, expected {tuple(text.shape)}"
+                )
+            text_span_corruption_mask = text_span_corruption_mask.to(device=device, dtype=torch.bool)
+            text_embedded = text_embedded.masked_fill(text_span_corruption_mask.unsqueeze(-1), 0.0)
 
         # multiturn dataset returns a special pad text tokens until it matches the audio len, to keep compatible with regular dataset zero-out those values
         if is_multiturn:
@@ -960,6 +972,8 @@ class EasyMagpieTTSModel(EasyMagpieTTSInferenceModel):
         agent_mask: Optional[torch.Tensor] = None,
         user_audio_embedded: Optional[torch.Tensor] = None,
         text_only_mask: Optional[torch.Tensor] = None,
+        text_span_corruption_mask: Optional[torch.Tensor] = None,
+        text_span_corrupted: Optional[torch.Tensor] = None,
     ) -> ProcessBatchOutput:
         """
         Simplified batch processing using channel-based embedding architecture.
@@ -997,6 +1011,11 @@ class EasyMagpieTTSModel(EasyMagpieTTSInferenceModel):
             agent_mask: Optional frame-level mask identifying agent speech.
             user_audio_embedded: Optional timeline-aligned user-audio conditioning
                 embeddings with shape ``(B, T, E)``.
+            text_only_mask: Optional per-sample mask for inputs without audio.
+            text_span_corruption_mask: Optional per-token mask selecting text
+                conditioning embeddings to zero.
+            text_span_corrupted: Optional per-sample indicator used to suppress
+                phoneme loss when its IPA targets were exposed as conditioning.
 
         Returns:
             ProcessBatchOutput: Contains loss values and model predictions
@@ -1065,6 +1084,7 @@ class EasyMagpieTTSModel(EasyMagpieTTSInferenceModel):
             dropout_text_input=dropout_text_input or dropout_conditional_input,
             is_multiturn=self.cfg.get("use_multiturn_dataset", False),
             text_pad_id=self.pad_id,
+            text_span_corruption_mask=text_span_corruption_mask,
         )
 
         # 4. Prepare phoneme channel embeddings (if phoneme tokenizer is configured)
@@ -1366,6 +1386,23 @@ class EasyMagpieTTSModel(EasyMagpieTTSInferenceModel):
                 elif self.cfg.get("mask_user_on_loss", False):
                     custom_mask = agent_mask
 
+                if text_span_corrupted is not None:
+                    text_span_corrupted = text_span_corrupted.to(
+                        device=pb_phoneme_tokens_target.device, dtype=torch.bool
+                    )
+                    if text_span_corrupted.shape != (pb_phoneme_tokens_target.size(0),):
+                        raise ValueError(
+                            "text_span_corrupted has shape "
+                            f"{tuple(text_span_corrupted.shape)}, expected "
+                            f"{(pb_phoneme_tokens_target.size(0),)}"
+                        )
+                    uncorrupted_samples = (~text_span_corrupted).unsqueeze(1).expand(
+                        -1, pb_phoneme_tokens_target.size(2)
+                    )
+                    custom_mask = (
+                        uncorrupted_samples if custom_mask is None else custom_mask & uncorrupted_samples
+                    )
+
                 phoneme_loss, _ = self.compute_phoneme_loss(
                     pb_phoneme_logits, pb_phoneme_tokens_target, pb_phoneme_tokens_lens_target, custom_mask=custom_mask
                 )
@@ -1615,6 +1652,8 @@ class EasyMagpieTTSModel(EasyMagpieTTSInferenceModel):
             agent_mask=batch["agent_mask"] if self.cfg.get("use_multiturn_dataset", False) else None,
             user_audio_embedded=user_audio_embedded,
             text_only_mask=batch.get('text_only'),
+            text_span_corruption_mask=batch.get('text_span_corruption_mask'),
+            text_span_corrupted=batch.get('text_span_corrupted'),
         )
         loss = batch_output.loss
         codebook_loss = batch_output.codebook_loss
@@ -1719,6 +1758,8 @@ class EasyMagpieTTSModel(EasyMagpieTTSInferenceModel):
             task=batch["task"] if "task" in batch else None,
             agent_mask=batch["agent_mask"] if "agent_mask" in batch else None,
             text_only_mask=batch.get('text_only'),
+            text_span_corruption_mask=batch.get('text_span_corruption_mask'),
+            text_span_corrupted=batch.get('text_span_corrupted'),
         )
         # Access ProcessBatchOutput dataclass attributes
         # logits come from the parallel prediction head
@@ -2156,6 +2197,14 @@ class EasyMagpieTTSModel(EasyMagpieTTSInferenceModel):
                 frame_stacking_factor=self.frame_stacking_factor,
                 text_only_audio_mask_min_steps=self.cfg.get('text_only_audio_mask_min_steps', 1),
                 text_only_audio_mask_max_steps=self.cfg.get('text_only_audio_mask_max_steps', 32),
+                text_span_corruption_prob=self.cfg.get('text_span_corruption_prob', 0.0),
+                text_span_corruption_short_max_tokens=self.cfg.get(
+                    'text_span_corruption_short_max_tokens', 3
+                ),
+                text_span_corruption_long_max_tokens=self.cfg.get(
+                    'text_span_corruption_long_max_tokens', 16
+                ),
+                text_span_corruption_long_prob=self.cfg.get('text_span_corruption_long_prob', 0.1),
             )
 
         data_loader = get_lhotse_dataloader_from_config(

@@ -209,6 +209,10 @@ class MagpieTTSLhotseDataset(torch.utils.data.Dataset):
         frame_stacking_factor: int = 1,
         text_only_audio_mask_min_steps: int = 1,
         text_only_audio_mask_max_steps: int = 32,
+        text_span_corruption_prob: float = 0.0,
+        text_span_corruption_short_max_tokens: int = 3,
+        text_span_corruption_long_max_tokens: int = 16,
+        text_span_corruption_long_prob: float = 0.1,
     ):
         super().__init__()
         self.sample_rate = sample_rate
@@ -246,10 +250,23 @@ class MagpieTTSLhotseDataset(torch.utils.data.Dataset):
         self.frame_stacking_factor = frame_stacking_factor
         self.text_only_audio_mask_min_steps = text_only_audio_mask_min_steps
         self.text_only_audio_mask_max_steps = text_only_audio_mask_max_steps
+        self.text_span_corruption_prob = text_span_corruption_prob
+        self.text_span_corruption_short_max_tokens = text_span_corruption_short_max_tokens
+        self.text_span_corruption_long_max_tokens = text_span_corruption_long_max_tokens
+        self.text_span_corruption_long_prob = text_span_corruption_long_prob
         if not 0 <= self.text_only_audio_mask_min_steps <= self.text_only_audio_mask_max_steps:
             raise ValueError(
                 "Expected 0 <= text_only_audio_mask_min_steps <= text_only_audio_mask_max_steps, "
                 f"got {self.text_only_audio_mask_min_steps} and {self.text_only_audio_mask_max_steps}."
+            )
+        if not 0.0 <= self.text_span_corruption_prob <= 1.0:
+            raise ValueError("text_span_corruption_prob must be in [0, 1].")
+        if not 0.0 <= self.text_span_corruption_long_prob <= 1.0:
+            raise ValueError("text_span_corruption_long_prob must be in [0, 1].")
+        if not 1 <= self.text_span_corruption_short_max_tokens <= self.text_span_corruption_long_max_tokens:
+            raise ValueError(
+                "Expected 1 <= text_span_corruption_short_max_tokens <= "
+                "text_span_corruption_long_max_tokens."
             )
 
     def get_num_audio_samples_to_slice(self, duration, sample_rate):
@@ -314,6 +331,8 @@ class MagpieTTSLhotseDataset(torch.utils.data.Dataset):
         phoneme_token_list = []
         phoneme_token_len_list = []
         text_only_list = []
+        text_span_corruption_mask_list = []
+        text_span_corrupted_list = []
 
         def _sample_context_duration_with_available_limit(available_duration_sec: float) -> float:
             effective_duration_max = min(self.context_duration_max, available_duration_sec)
@@ -579,6 +598,34 @@ class MagpieTTSLhotseDataset(torch.utils.data.Dataset):
             token_list.append(tokens)
             token_len_list.append(text_len)
 
+            corruption_mask = torch.zeros(text_len, dtype=torch.bool)
+            text_span_corrupted = False
+            can_corrupt_text = (
+                self.dataset_type == 'train'
+                and not is_text_only
+                and self.phoneme_tokenizer is not None
+                and supervision.has_custom("ipa")
+                and bool(supervision.ipa)
+                and language not in self.ignore_phoneme_languages
+                and self.text_span_corruption_prob > 0.0
+            )
+            num_corruptible_tokens = max(0, text_len - 1)  # Never corrupt text EOS.
+            if can_corrupt_text and num_corruptible_tokens > 0 and random.random() < self.text_span_corruption_prob:
+                short_max = min(self.text_span_corruption_short_max_tokens, num_corruptible_tokens)
+                use_long_span = (
+                    num_corruptible_tokens > short_max and random.random() < self.text_span_corruption_long_prob
+                )
+                if use_long_span:
+                    long_max = min(self.text_span_corruption_long_max_tokens, num_corruptible_tokens)
+                    span_len = random.randint(short_max + 1, long_max)
+                else:
+                    span_len = random.randint(1, short_max)
+                span_start = random.randint(0, num_corruptible_tokens - span_len)
+                corruption_mask[span_start : span_start + span_len] = True
+                text_span_corrupted = True
+            text_span_corruption_mask_list.append(corruption_mask)
+            text_span_corrupted_list.append(text_span_corrupted)
+
             if self.phoneme_tokenizer is not None:
                 # Use IPA text for IPABPETokenizer (required), otherwise use regular text_str
                 if is_text_only:
@@ -628,6 +675,10 @@ class MagpieTTSLhotseDataset(torch.utils.data.Dataset):
             "text": collate_vectors(token_list, padding_value=self.pad_id),  # (B, max_len)
             "text_lens": torch.IntTensor(token_len_list),
             "text_only": torch.BoolTensor(text_only_list),
+            "text_span_corruption_mask": collate_vectors(
+                text_span_corruption_mask_list, padding_value=False
+            ).bool(),
+            "text_span_corrupted": torch.BoolTensor(text_span_corrupted_list),
         }
 
         if self.phoneme_tokenizer is not None:
