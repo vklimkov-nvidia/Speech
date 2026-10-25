@@ -943,6 +943,24 @@ def test_mixed_batch_uses_independent_audio_and_text_only_phoneme_losses():
     torch.testing.assert_close(output.phoneme_loss, 2.0 * expected_audio + 3.0 * expected_text_only)
 
 
+def test_unk_corruption_supports_different_sample_and_timestep_counts():
+    model = _enable_fake_phoneme_head(_make_easy_magpie_model())
+    model.phoneme_corruption_batch_prob = 1.0
+    model.phoneme_corruption_timestep_ratio = 0.5
+    model.phoneme_corruption_unk_mode_prob = 1.0
+    stacked = torch.tensor([[[1, 4, 5, 6, 7, 8, 9, 2]]] * 4, dtype=torch.long)
+    lengths = torch.tensor([8, 8, 8, 8], dtype=torch.long)
+    sample_mask = torch.tensor([True, False, True, False])
+
+    corrupted, mode = model.corrupt_stacked_phoneme_tokens(stacked, lengths, sample_mask=sample_mask)
+
+    assert mode == "unk"
+    torch.testing.assert_close(corrupted[~sample_mask], stacked[~sample_mask])
+    assert corrupted[sample_mask, :, 0].eq(model.phoneme_tokenizer.bos_token_id).all()
+    assert corrupted[sample_mask, :, 7].eq(model.phoneme_tokenizer.eos_token_id).all()
+    assert corrupted[sample_mask].eq(model.phoneme_tokenizer.unk_token_id).sum().item() == 6
+
+
 def test_text_only_phoneme_history_corruption_preserves_targets_and_audio_rows():
     model = _enable_fake_phoneme_head(_make_easy_magpie_model())
     model.text_only_phoneme_corruption_prob = 1.0

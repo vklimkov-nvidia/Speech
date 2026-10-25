@@ -655,7 +655,9 @@ class EasyMagpieTTSModel(EasyMagpieTTSInferenceModel):
         if mode == 'unk':
             if not hasattr(self.phoneme_tokenizer, 'unk_token_id'):
                 raise ValueError("Phoneme tokenizer is missing `unk_token_id` required for UNK corruption.")
-            corrupted[sample_mask, :, corrupt_steps] = self.phoneme_tokenizer.unk_token_id
+            corrupted_samples = corrupted[sample_mask]
+            corrupted_samples[:, :, corrupt_steps] = self.phoneme_tokenizer.unk_token_id
+            corrupted[sample_mask] = corrupted_samples
             return corrupted, mode
 
         # Repeat/skip corruption with a shared remap over [0, min_len).
