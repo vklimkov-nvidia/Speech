@@ -729,6 +729,32 @@ def test_process_batch_with_autoregressive_local_transformer():
     assert output.local_transformer_logits.shape == output.logits.shape
 
 
+def test_training_step_logs_split_phoneme_losses_and_text_only_fraction():
+    model = _enable_fake_phoneme_head(_make_easy_magpie_model(tiny_easy_magpie_cfg({"mask_user_on_loss": False})))
+    batch = _toy_batch(model)
+    batch["phoneme_tokens"] = torch.tensor([[1, 4, 5, 2], [1, 6, 7, 2]], dtype=torch.long)
+    batch["phoneme_tokens_lens"] = torch.tensor([4, 4], dtype=torch.long)
+    batch["text_only"] = torch.tensor([False, True])
+    logged = {}
+
+    def capture_log(name, value, **_kwargs):
+        logged[name] = value
+
+    with (
+        patch.object(model, "log", capture_log),
+        patch.object(model, "log_dict", lambda *args, **kwargs: None),
+    ):
+        loss = model.training_step(batch, batch_idx=0)
+
+    assert torch.isfinite(loss)
+    assert {
+        "train/phoneme_loss_audio",
+        "train/phoneme_loss_text_only",
+        "train/text_only_batch_fraction",
+    }.issubset(logged)
+    torch.testing.assert_close(logged["train/text_only_batch_fraction"], torch.tensor(0.5))
+
+
 def test_training_step_smoke(model, toy_batch):
     _seed_everything()
     model.train()
@@ -866,6 +892,72 @@ def test_text_only_batch_trains_phonemes_without_acoustic_or_eos_loss():
         assert valid_targets.eq(model.mask_token_id).all()
         assert not valid_targets.eq(model.audio_eos_id).any()
 
+
+def test_mixed_batch_uses_independent_audio_and_text_only_phoneme_losses():
+    model = _enable_fake_phoneme_head(
+        _make_easy_magpie_model(
+            tiny_easy_magpie_cfg(
+                {"mask_user_on_loss": False, "phoneme_loss_weight": 2.0, "text_only_phoneme_loss_weight": 3.0}
+            )
+        )
+    )
+    batch = _toy_batch(model)
+    phoneme_tokens = torch.tensor([[1, 4, 5, 2], [1, 6, 7, 2]], dtype=torch.long)
+    phoneme_tokens_lens = torch.tensor([4, 4], dtype=torch.long)
+    text_only_mask = torch.tensor([False, True])
+
+    output = model.process_batch(
+        text=batch["text"],
+        text_lens=batch["text_lens"],
+        context_text_tokens=batch["context_text_tokens"],
+        context_text_tokens_lens=batch["context_text_tokens_lens"],
+        audio_codes=batch["audio_codes"],
+        audio_codes_lens=batch["audio_codes_lens"],
+        context_audio_codes=batch["context_audio_codes"],
+        context_audio_codes_lens=batch["context_audio_codes_lens"],
+        phoneme_tokens=phoneme_tokens,
+        phoneme_tokens_lens=phoneme_tokens_lens,
+        mode="val",
+        training_mode=model.training_modes[0],
+        text_only_mask=text_only_mask,
+    )
+
+    num_steps = output.phoneme_tokens_target.size(2)
+    audio_mask = (~text_only_mask).unsqueeze(1).expand(-1, num_steps)
+    text_only_loss_mask = text_only_mask.unsqueeze(1).expand(-1, num_steps)
+    expected_audio, _ = model.compute_phoneme_loss(
+        output.phoneme_logits,
+        output.phoneme_tokens_target,
+        output.phoneme_tokens_lens_target,
+        custom_mask=audio_mask,
+    )
+    expected_text_only, _ = model.compute_phoneme_loss(
+        output.phoneme_logits,
+        output.phoneme_tokens_target,
+        output.phoneme_tokens_lens_target,
+        custom_mask=text_only_loss_mask,
+    )
+
+    torch.testing.assert_close(output.phoneme_loss_audio, expected_audio)
+    torch.testing.assert_close(output.phoneme_loss_text_only, expected_text_only)
+    torch.testing.assert_close(output.phoneme_loss, 2.0 * expected_audio + 3.0 * expected_text_only)
+
+
+def test_text_only_phoneme_history_corruption_preserves_targets_and_audio_rows():
+    model = _enable_fake_phoneme_head(_make_easy_magpie_model())
+    model.text_only_phoneme_corruption_prob = 1.0
+    model.text_only_phoneme_corruption_timestep_ratio = 1.0
+    stacked = torch.tensor([[[1, 4, 5, 6, 2]], [[1, 7, 8, 9, 2]]], dtype=torch.long)
+    lengths = torch.tensor([5, 5], dtype=torch.long)
+    text_only_mask = torch.tensor([False, True])
+
+    corrupted = model.corrupt_text_only_phoneme_history(stacked, lengths, text_only_mask)
+
+    torch.testing.assert_close(corrupted[0], stacked[0])
+    assert corrupted[1, 0, 0].item() == model.phoneme_tokenizer.bos_token_id
+    assert corrupted[1, 0, 4].item() == model.phoneme_tokenizer.eos_token_id
+    assert corrupted[1, 0, 1:4].eq(model.phoneme_tokenizer.unk_token_id).all()
+    torch.testing.assert_close(stacked[1, 0], torch.tensor([1, 7, 8, 9, 2]))
 
 
 def test_acoustic_codes_predictor_requires_no_local_transformer():

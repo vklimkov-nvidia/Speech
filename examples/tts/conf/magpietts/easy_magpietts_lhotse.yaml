@@ -76,6 +76,7 @@ model:
   # Below args are only relevant if use_local_transformer is autoregressive
   local_transformer_loss_scale: 1.0
   phoneme_loss_weight: 1.0
+  text_only_phoneme_loss_weight: 1.0 # Independent multiplier for the text-only phoneme loss.
   local_transformer_n_layers: 3
   local_transformer_n_heads: 12
   local_transformer_hidden_dim: 1536
@@ -97,6 +98,8 @@ model:
   phoneme_corruption_unk_mode_prob: 0.5
   phoneme_corruption_type: "repeat_skip_unk" # "repeat_skip_unk" or "complete_channel"
   enable_phoneme_text_input: false # Enable inline IPA spans in text as <bop>...<eop>; requires phoneme_tokenizer.
+  text_only_phoneme_corruption_prob: 0.0 # Per-sample probability of UNK-corrupting text-only IPA history.
+  text_only_phoneme_corruption_timestep_ratio: 0.0 # Fraction of eligible history timesteps to corrupt.
   partial_phoneme_text_prob: 0.0 # Training-only probability of using precomputed IPA alignments.
   partial_phoneme_portion_min: 0.25 # Minimum portion of aligned words to phonemize in a selected sample.
   partial_phoneme_portion_max: 0.75 # Maximum portion of aligned words to phonemize in a selected sample.

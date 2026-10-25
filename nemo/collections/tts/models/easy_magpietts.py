@@ -73,6 +73,8 @@ class ProcessBatchOutput:
         loss: Total combined loss
         codebook_loss: Cross-entropy loss for parallel audio codebook prediction
         phoneme_loss: Cross-entropy loss for phoneme prediction (None if no phoneme tokenizer)
+        phoneme_loss_audio: Phoneme loss for samples with target audio
+        phoneme_loss_text_only: Phoneme loss for text-only samples
         local_transformer_loss: Loss from local transformer (None if not used)
         acoustic_codes_predictor_loss: Loss from the acoustic codes predictor (None if not used)
         local_transformer_logits: Logits from local transformer (None if not used)
@@ -90,6 +92,8 @@ class ProcessBatchOutput:
     loss: torch.Tensor
     codebook_loss: torch.Tensor
     phoneme_loss: Optional[torch.Tensor]
+    phoneme_loss_audio: Optional[torch.Tensor]
+    phoneme_loss_text_only: Optional[torch.Tensor]
     local_transformer_loss: Optional[torch.Tensor]
     acoustic_codes_predictor_loss: Optional[torch.Tensor]
     local_transformer_logits: Optional[torch.Tensor]
@@ -123,6 +127,9 @@ class EasyMagpieTTSModel(EasyMagpieTTSInferenceModel):
         self.phoneme_corruption_unk_mode_prob = cfg.get('phoneme_corruption_unk_mode_prob', 0.5)
         self.phoneme_corruption_type = cfg.get('phoneme_corruption_type', 'repeat_skip_unk')
         self.phoneme_loss_weight = cfg.get('phoneme_loss_weight', 1.0)
+        self.text_only_phoneme_loss_weight = cfg.get('text_only_phoneme_loss_weight', 1.0)
+        self.text_only_phoneme_corruption_prob = cfg.get('text_only_phoneme_corruption_prob', 0.0)
+        self.text_only_phoneme_corruption_timestep_ratio = cfg.get('text_only_phoneme_corruption_timestep_ratio', 0.0)
         self.parallel_codebook_loss_scale = cfg.get('parallel_codebook_loss_scale', 1.0)
         self.local_transformer_loss_scale = cfg.get('local_transformer_loss_scale', 1.0)
         self.acoustic_codes_predictor_loss_scale = cfg.get('acoustic_codes_predictor_loss_scale', 1.0)
@@ -489,6 +496,9 @@ class EasyMagpieTTSModel(EasyMagpieTTSInferenceModel):
         phoneme_tokens_lens: torch.Tensor,
         delay: torch.Tensor,
         apply_corruption: bool = False,
+        corruption_sample_mask: Optional[torch.Tensor] = None,
+        text_only_mask: Optional[torch.Tensor] = None,
+        apply_text_only_corruption: bool = False,
         dropout_complete_phoneme_channel: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Optional[str]]:
         """
@@ -504,6 +514,9 @@ class EasyMagpieTTSModel(EasyMagpieTTSInferenceModel):
             delay: Number of zero positions to prepend for each batch item (B,).
                    This is typically context_lens + phoneme_delay.
             apply_corruption: If True, apply phoneme-token corruption before embedding.
+            corruption_sample_mask: Optional samples eligible for standard phoneme corruption.
+            text_only_mask: Optional samples eligible for text-only history corruption.
+            apply_text_only_corruption: Whether to corrupt selected text-only phoneme histories.
             dropout_complete_phoneme_channel: If True, zero-out the whole phoneme channel embedding.
 
         Returns:
@@ -535,6 +548,14 @@ class EasyMagpieTTSModel(EasyMagpieTTSInferenceModel):
             phoneme_tokens_stacked, phoneme_corruption_mode = self.corrupt_stacked_phoneme_tokens(
                 phoneme_tokens_stacked=phoneme_tokens_stacked,
                 phoneme_tokens_lens_stacked=phoneme_tokens_lens_stacked,
+                sample_mask=corruption_sample_mask,
+            )
+
+        if apply_text_only_corruption:
+            phoneme_tokens_stacked = self.corrupt_text_only_phoneme_history(
+                phoneme_tokens_stacked=phoneme_tokens_stacked,
+                phoneme_tokens_lens_stacked=phoneme_tokens_lens_stacked,
+                text_only_mask=text_only_mask,
             )
 
         # Embed phoneme tokens
@@ -577,6 +598,7 @@ class EasyMagpieTTSModel(EasyMagpieTTSInferenceModel):
         self,
         phoneme_tokens_stacked: torch.Tensor,
         phoneme_tokens_lens_stacked: torch.Tensor,
+        sample_mask: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Optional[str]]:
         """
         Corrupt stacked phoneme tokens for robustness to phoneme prediction errors.
@@ -594,7 +616,20 @@ class EasyMagpieTTSModel(EasyMagpieTTSInferenceModel):
         if torch.rand(1).item() >= self.phoneme_corruption_batch_prob:
             return phoneme_tokens_stacked, None
 
-        min_len = int(phoneme_tokens_lens_stacked.min().item())
+        if sample_mask is None:
+            sample_mask = torch.ones(
+                phoneme_tokens_stacked.size(0), device=phoneme_tokens_stacked.device, dtype=torch.bool
+            )
+        else:
+            sample_mask = sample_mask.to(device=phoneme_tokens_stacked.device, dtype=torch.bool)
+            if sample_mask.shape != (phoneme_tokens_stacked.size(0),):
+                raise ValueError(
+                    f"sample_mask has shape {tuple(sample_mask.shape)}, expected {(phoneme_tokens_stacked.size(0),)}"
+                )
+        if not sample_mask.any():
+            return phoneme_tokens_stacked, None
+
+        min_len = int(phoneme_tokens_lens_stacked[sample_mask].min().item())
         # Need room for BOS and EOS plus at least one interior timestep.
         if min_len <= 2:
             return phoneme_tokens_stacked, None
@@ -620,7 +655,7 @@ class EasyMagpieTTSModel(EasyMagpieTTSInferenceModel):
         if mode == 'unk':
             if not hasattr(self.phoneme_tokenizer, 'unk_token_id'):
                 raise ValueError("Phoneme tokenizer is missing `unk_token_id` required for UNK corruption.")
-            corrupted[:, :, corrupt_steps] = self.phoneme_tokenizer.unk_token_id
+            corrupted[sample_mask, :, corrupt_steps] = self.phoneme_tokenizer.unk_token_id
             return corrupted, mode
 
         # Repeat/skip corruption with a shared remap over [0, min_len).
@@ -635,9 +670,56 @@ class EasyMagpieTTSModel(EasyMagpieTTSInferenceModel):
         source_index[0] = 0
         source_index[-1] = min_len - 1
 
-        corrupted_prefix = phoneme_tokens_stacked[:, :, :min_len].index_select(dim=2, index=source_index)
-        corrupted[:, :, :min_len] = corrupted_prefix
+        corrupted_prefix = phoneme_tokens_stacked[sample_mask, :, :min_len].index_select(dim=2, index=source_index)
+        corrupted[sample_mask, :, :min_len] = corrupted_prefix
         return corrupted, mode
+
+    def corrupt_text_only_phoneme_history(
+        self,
+        phoneme_tokens_stacked: torch.Tensor,
+        phoneme_tokens_lens_stacked: torch.Tensor,
+        text_only_mask: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """Replace IPA history tokens with UNK for independently selected text-only samples.
+
+        The clean next-token targets are kept unchanged. UNK replacement preserves the
+        timeline, unlike repeat/skip corruption, so phoneme loss remains valid.
+        """
+        if text_only_mask is None:
+            return phoneme_tokens_stacked
+        if self.text_only_phoneme_corruption_prob <= 0.0:
+            return phoneme_tokens_stacked
+        if self.text_only_phoneme_corruption_timestep_ratio <= 0.0:
+            return phoneme_tokens_stacked
+        if not hasattr(self.phoneme_tokenizer, 'unk_token_id'):
+            raise ValueError("Phoneme tokenizer is missing `unk_token_id` required for text-only corruption.")
+
+        batch_size = phoneme_tokens_stacked.size(0)
+        text_only_mask = text_only_mask.to(device=phoneme_tokens_stacked.device, dtype=torch.bool)
+        if text_only_mask.shape != (batch_size,):
+            raise ValueError(f"text_only_mask has shape {tuple(text_only_mask.shape)}, expected {(batch_size,)}")
+
+        selected = text_only_mask & (
+            torch.rand(batch_size, device=phoneme_tokens_stacked.device) < self.text_only_phoneme_corruption_prob
+        )
+        if not selected.any():
+            return phoneme_tokens_stacked
+
+        corrupted = phoneme_tokens_stacked.clone()
+        for sample_idx in selected.nonzero(as_tuple=False).flatten().tolist():
+            valid_len = int(phoneme_tokens_lens_stacked[sample_idx].item())
+            # Preserve BOS and EOS; only corrupt tokens that can appear in the autoregressive history.
+            num_valid_steps = max(0, valid_len - 2)
+            if num_valid_steps == 0:
+                continue
+            num_corrupt_steps = int(round(num_valid_steps * self.text_only_phoneme_corruption_timestep_ratio))
+            num_corrupt_steps = max(1, min(num_valid_steps, num_corrupt_steps))
+            corrupt_steps = (
+                1 + torch.randperm(num_valid_steps, device=phoneme_tokens_stacked.device)[:num_corrupt_steps]
+            )
+            corrupted[sample_idx, :, corrupt_steps] = self.phoneme_tokenizer.unk_token_id
+
+        return corrupted
 
     def prepare_audio_channel_embeddings(
         self,
@@ -1129,6 +1211,9 @@ class EasyMagpieTTSModel(EasyMagpieTTSInferenceModel):
                 phoneme_tokens_lens=phoneme_tokens_lens,
                 delay=phoneme_delay,
                 apply_corruption=apply_phoneme_corruption,
+                corruption_sample_mask=(None if text_only_mask is None else ~text_only_mask.to(dtype=torch.bool)),
+                text_only_mask=text_only_mask,
+                apply_text_only_corruption=mode == 'train',
                 dropout_complete_phoneme_channel=dropout_complete_phoneme_channel,
             )
 
@@ -1368,6 +1453,8 @@ class EasyMagpieTTSModel(EasyMagpieTTSInferenceModel):
 
         # Compute phoneme loss if applicable
         phoneme_loss = None
+        phoneme_loss_audio = None
+        phoneme_loss_text_only = None
         pb_phoneme_logits = None
         pb_phoneme_tokens_target = None
         pb_phoneme_tokens_lens_target = None
@@ -1382,7 +1469,7 @@ class EasyMagpieTTSModel(EasyMagpieTTSInferenceModel):
             pb_phoneme_tokens_target = phoneme_tokens_stacked_clean[:, :, 1:].long()
             pb_phoneme_tokens_lens_target = phoneme_tokens_lens_stacked - 1
 
-            if (phoneme_corruption_mode != 'repeat_skip') and not (
+            if not (
                 dropout_complete_phoneme_channel
                 or (phoneme_turn_dropout is not None and phoneme_turn_dropout.any())
                 or dropout_conditional_input
@@ -1411,18 +1498,56 @@ class EasyMagpieTTSModel(EasyMagpieTTSInferenceModel):
                         uncorrupted_samples if custom_mask is None else custom_mask & uncorrupted_samples
                     )
 
-                phoneme_loss, _ = self.compute_phoneme_loss(
-                    pb_phoneme_logits, pb_phoneme_tokens_target, pb_phoneme_tokens_lens_target, custom_mask=custom_mask
+                batch_size = pb_phoneme_tokens_target.size(0)
+                text_only_samples = torch.zeros(batch_size, device=pb_phoneme_tokens_target.device, dtype=torch.bool)
+                if text_only_mask is not None:
+                    text_only_samples = text_only_mask.to(device=pb_phoneme_tokens_target.device, dtype=torch.bool)
+                    if text_only_samples.shape != (batch_size,):
+                        raise ValueError(
+                            f"text_only_mask has shape {tuple(text_only_samples.shape)}, expected {(batch_size,)}"
+                        )
+
+                audio_samples = ~text_only_samples
+                if phoneme_corruption_mode == 'repeat_skip':
+                    audio_samples = torch.zeros_like(audio_samples)
+
+                num_target_steps = pb_phoneme_tokens_target.size(2)
+                audio_loss_mask = audio_samples.unsqueeze(1).expand(-1, num_target_steps)
+                text_only_loss_mask = text_only_samples.unsqueeze(1).expand(-1, num_target_steps)
+                if custom_mask is not None:
+                    audio_loss_mask = audio_loss_mask & custom_mask
+                    text_only_loss_mask = text_only_loss_mask & custom_mask
+
+                phoneme_loss_audio, _ = self.compute_phoneme_loss(
+                    pb_phoneme_logits,
+                    pb_phoneme_tokens_target,
+                    pb_phoneme_tokens_lens_target,
+                    custom_mask=audio_loss_mask,
+                )
+                phoneme_loss_text_only, _ = self.compute_phoneme_loss(
+                    pb_phoneme_logits,
+                    pb_phoneme_tokens_target,
+                    pb_phoneme_tokens_lens_target,
+                    custom_mask=text_only_loss_mask,
+                )
+                phoneme_loss = (
+                    self.phoneme_loss_weight * phoneme_loss_audio
+                    + self.text_only_phoneme_loss_weight * phoneme_loss_text_only
                 )
             else:
-                phoneme_loss = torch.tensor(0.0, device=logits.device)
+                zero_loss = torch.tensor(0.0, device=logits.device)
+                phoneme_loss_audio = zero_loss
+                phoneme_loss_text_only = zero_loss
+                phoneme_loss = zero_loss
 
-            loss = loss + self.phoneme_loss_weight * phoneme_loss
+            loss = loss + phoneme_loss
 
         return ProcessBatchOutput(
             loss=loss,
             codebook_loss=codebook_loss,
             phoneme_loss=phoneme_loss,
+            phoneme_loss_audio=phoneme_loss_audio,
+            phoneme_loss_text_only=phoneme_loss_text_only,
             local_transformer_loss=local_transformer_loss,
             acoustic_codes_predictor_loss=acoustic_codes_predictor_loss,
             local_transformer_logits=local_transformer_logits,
@@ -1671,6 +1796,10 @@ class EasyMagpieTTSModel(EasyMagpieTTSInferenceModel):
         if self.phoneme_tokenizer is not None:
             phoneme_loss = batch_output.phoneme_loss
             self.log('train/phoneme_loss', phoneme_loss, prog_bar=True, sync_dist=True)
+            self.log('train/phoneme_loss_audio', batch_output.phoneme_loss_audio, sync_dist=True)
+            self.log(
+                'train/phoneme_loss_text_only', batch_output.phoneme_loss_text_only, prog_bar=True, sync_dist=True
+            )
 
         local_transformer_loss = batch_output.local_transformer_loss
         if local_transformer_loss is not None:
@@ -1689,6 +1818,13 @@ class EasyMagpieTTSModel(EasyMagpieTTSInferenceModel):
 
         # Log batch info
         batch_size, text_token_max_len = batch["text"].shape
+        text_only_mask = batch.get("text_only")
+        text_only_batch_fraction = (
+            text_only_mask.to(device=loss.device, dtype=torch.float32).mean()
+            if text_only_mask is not None
+            else loss.new_tensor(0.0)
+        )
+        self.log('train/text_only_batch_fraction', text_only_batch_fraction, sync_dist=True)
         text_token_total_num = batch["text_lens"].sum()
         batch_info_dict = {
             "train/batch_size": batch_size,
