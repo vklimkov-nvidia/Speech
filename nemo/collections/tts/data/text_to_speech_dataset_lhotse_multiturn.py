@@ -75,6 +75,21 @@ def _get_supervision_ipa_text(supervision) -> str:
     return ""
 
 
+def _is_text_only(cut: Cut) -> bool:
+    return bool(
+        (cut.has_custom("text_only") and cut.text_only)
+        or any(s.has_custom("text_only") and s.text_only for s in cut.supervisions)
+    )
+
+
+def _get_cut_sampling_rate(cut: Cut, fallback: int = None) -> int:
+    if cut.has_recording:
+        return cut.sampling_rate
+    if fallback is None:
+        raise ValueError(f"Recording-less cut {cut.id} requires a fallback sample rate.")
+    return fallback
+
+
 class MagpieTTSLhotseMultiturnDataset(torch.utils.data.Dataset):
     """
     A PyTorch Dataset for loading and processing Text-to-Speech data for
@@ -133,6 +148,11 @@ class MagpieTTSLhotseMultiturnDataset(torch.utils.data.Dataset):
         ignore_manifest_context_text (bool): If True, the cut's ``context_text`` is ignored, so the cut is treated
             as a pure audio-context sample and the placeholder context text is used instead (the language tag if
             `add_language_to_context_text` is True). Defaults to False.
+        text_span_corruption_prob (float): Probability of masking one text-token span on an audio-backed TTS
+            sample with IPA. Text-only and dialogue samples are excluded. Defaults to 0.0.
+        text_span_corruption_short_max_tokens (int): Maximum short-span length. Defaults to 3.
+        text_span_corruption_long_max_tokens (int): Maximum occasional long-span length. Defaults to 16.
+        text_span_corruption_long_prob (float): Conditional probability of sampling a long span. Defaults to 0.1.
     """
 
     def __init__(
@@ -173,6 +193,10 @@ class MagpieTTSLhotseMultiturnDataset(torch.utils.data.Dataset):
         phoneme_turn_dropout_turn_prob: float = 0.0,
         phoneme_turn_max_words_to_drop: int = 2,
         ignore_manifest_context_text: bool = False,
+        text_span_corruption_prob: float = 0.0,
+        text_span_corruption_short_max_tokens: int = 3,
+        text_span_corruption_long_max_tokens: int = 16,
+        text_span_corruption_long_prob: float = 0.1,
     ):
         super().__init__()
         self.sample_rate = sample_rate
@@ -207,6 +231,19 @@ class MagpieTTSLhotseMultiturnDataset(torch.utils.data.Dataset):
         self.phoneme_text_eop_marker = phoneme_text_eop_marker
         self.add_language_to_context_text = add_language_to_context_text
         self.ignore_manifest_context_text = ignore_manifest_context_text
+        self.text_span_corruption_prob = text_span_corruption_prob
+        self.text_span_corruption_short_max_tokens = text_span_corruption_short_max_tokens
+        self.text_span_corruption_long_max_tokens = text_span_corruption_long_max_tokens
+        self.text_span_corruption_long_prob = text_span_corruption_long_prob
+        if not 0.0 <= self.text_span_corruption_prob <= 1.0:
+            raise ValueError("text_span_corruption_prob must be in [0, 1].")
+        if not 0.0 <= self.text_span_corruption_long_prob <= 1.0:
+            raise ValueError("text_span_corruption_long_prob must be in [0, 1].")
+        if not 1 <= self.text_span_corruption_short_max_tokens <= self.text_span_corruption_long_max_tokens:
+            raise ValueError(
+                "Expected 1 <= text_span_corruption_short_max_tokens <= "
+                "text_span_corruption_long_max_tokens."
+            )
 
         self.source_sample_rate = source_sample_rate
         self.input_roles = set(ifnone(input_roles, ["user"]))
@@ -270,17 +307,45 @@ class MagpieTTSLhotseMultiturnDataset(torch.utils.data.Dataset):
 
     def _collate_audio_channels(self, cuts: CutSet) -> Dict[str, torch.Tensor]:
         with fp32_precision():
-            target_audio, target_audio_lens = collate_audio(
-                cuts.resample(self.sample_rate, recording_field="target_audio"), recording_field="target_audio"
-            )
+            cut_list = list(cuts)
+            text_only_mask = [_is_text_only(cut) for cut in cut_list]
+            audio_backed_cuts = [cut for cut, is_text_only in zip(cut_list, text_only_mask) if not is_text_only]
+
+            loaded_audio = []
+            loaded_audio_lens = []
+            if audio_backed_cuts:
+                loaded_audio_batch, loaded_audio_lens_tensor = collate_audio(
+                    CutSet.from_cuts(audio_backed_cuts).resample(
+                        self.sample_rate, recording_field="target_audio"
+                    ),
+                    recording_field="target_audio",
+                )
+                loaded_audio = [
+                    loaded_audio_batch[i, :audio_len].numpy()
+                    for i, audio_len in enumerate(loaded_audio_lens_tensor.tolist())
+                ]
+                loaded_audio_lens = loaded_audio_lens_tensor.tolist()
+
             target_audio_list = []
             source_audio_list = []
-            # normalize volume and apply audio the removal of user turn if needed
+            loaded_index = 0
+            for cut, is_text_only in zip(cut_list, text_only_mask):
+                if is_text_only:
+                    if self.phoneme_tokenizer is None:
+                        raise ValueError("Text-only EasyMagpie samples require a phoneme tokenizer.")
+                    if not any(_get_supervision_ipa_text(sup).strip() for sup in cut.supervisions):
+                        raise ValueError(f"Text-only cut {cut.id} requires a non-empty supervision custom.ipa field.")
+                    raw_audio_frames = max(
+                        1,
+                        int(cut.duration * self.sample_rate / self.codec_model_samples_per_frame),
+                    )
+                    audio_len = raw_audio_frames * self.codec_model_samples_per_frame
+                    t_audio = np.zeros(audio_len, dtype=np.float32)
+                else:
+                    t_audio = loaded_audio[loaded_index]
+                    assert len(t_audio) == loaded_audio_lens[loaded_index]
+                    loaded_index += 1
 
-            for i, cut in enumerate(cuts):
-
-                # Extract the raw, unpadded 1D numpy array for this specific cut
-                t_audio = target_audio[i, : target_audio_lens[i]].numpy()
                 # For tts/single-turn cuts, source audio should be zeros like target audio
                 # For multi-turn cuts, keep loading source audio from the cut recording.
                 if str(getattr(cut, "task", "tts")).lower() == "tts":
@@ -289,7 +354,6 @@ class MagpieTTSLhotseMultiturnDataset(torch.utils.data.Dataset):
                 else:
                     s_audio = cut.resample(self.source_sample_rate).load_audio().squeeze(0)
 
-                # Apply volume norm locally (so we only normalize the stitched audio, saving math ops)
                 if self.volume_norm:
                     t_audio = normalize_volume(t_audio)
                     s_audio = normalize_volume(s_audio)
@@ -297,7 +361,6 @@ class MagpieTTSLhotseMultiturnDataset(torch.utils.data.Dataset):
                 target_audio_list.append(torch.from_numpy(t_audio))
                 source_audio_list.append(torch.from_numpy(s_audio))
 
-            # 3. Re-pad the newly stitched arrays to the batch's new maximum length
             target_audio = collate_vectors(target_audio_list, padding_value=0.0)
             target_audio_lens = torch.tensor([len(a) for a in target_audio_list], dtype=torch.long)
 
@@ -306,7 +369,7 @@ class MagpieTTSLhotseMultiturnDataset(torch.utils.data.Dataset):
 
             user_audio_turn_splitted, user_audio_turn_splitted_lens, user_audio_turn_splitted_indices = (
                 extract_turn_audio_channel(
-                    cuts=cuts,
+                    cuts=CutSet.from_cuts(cut_list),
                     source_audio_list=source_audio_list,
                     source_sample_rate=self.source_sample_rate,
                     roles=self.input_roles,
@@ -346,6 +409,7 @@ class MagpieTTSLhotseMultiturnDataset(torch.utils.data.Dataset):
             phoneme_text_eop_marker=self.phoneme_text_eop_marker,
             ignore_phoneme_languages=self.ignore_phoneme_languages,
             apply_partial_phoneme_text=self.dataset_type == 'train',
+            sample_rate=self.sample_rate,
         )
         source_tokens, source_token_lens = collate_token_channel(
             cuts,
@@ -358,14 +422,68 @@ class MagpieTTSLhotseMultiturnDataset(torch.utils.data.Dataset):
             eos_id=self.eos_id,
             bos_id=self.bos_id,
             interruption_token_id=self.interruption_token_id,
+            sample_rate=self.sample_rate,
         )
 
+        text_span_corruption_mask, text_span_corrupted = self._apply_text_span_corruption(
+            cuts, target_text_tokens
+        )
         return {
             "target_text_tokens": target_text_tokens,
             "target_token_lens": target_token_lens,
             "source_tokens": source_tokens,
             "source_token_lens": source_token_lens,
+            "text_span_corruption_mask": text_span_corruption_mask,
+            "text_span_corrupted": text_span_corrupted,
         }
+
+    def _apply_text_span_corruption(
+        self, cuts: CutSet, target_text_tokens: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        corruption_mask = torch.zeros_like(target_text_tokens, dtype=torch.bool)
+        corrupted = torch.zeros(target_text_tokens.shape[0], dtype=torch.bool)
+
+        for index, cut in enumerate(cuts):
+            language = self._get_language(cut)
+            has_ipa = any(
+                supervision.speaker in self.output_roles and bool(_get_supervision_ipa_text(supervision).strip())
+                for supervision in cut.supervisions
+            )
+            can_corrupt_text = (
+                self.dataset_type == "train"
+                and str(getattr(cut, "task", "tts")).lower() == "tts"
+                and not _is_text_only(cut)
+                and self.phoneme_tokenizer is not None
+                and has_ipa
+                and language not in self.ignore_phoneme_languages
+                and self.text_span_corruption_prob > 0.0
+            )
+            if not can_corrupt_text or random.random() >= self.text_span_corruption_prob:
+                continue
+
+            row = target_text_tokens[index]
+            candidates = (
+                (row != self.pad_id)
+                & (row != self.eos_id)
+                & (row != self.bos_id)
+                & (row != self.interruption_token_id)
+            ).nonzero(as_tuple=False).flatten()
+            num_candidates = candidates.numel()
+            if num_candidates == 0:
+                continue
+
+            short_max = min(self.text_span_corruption_short_max_tokens, num_candidates)
+            use_long_span = num_candidates > short_max and random.random() < self.text_span_corruption_long_prob
+            if use_long_span:
+                long_max = min(self.text_span_corruption_long_max_tokens, num_candidates)
+                span_len = random.randint(short_max + 1, long_max)
+            else:
+                span_len = random.randint(1, short_max)
+            span_start = random.randint(0, num_candidates - span_len)
+            corruption_mask[index, candidates[span_start : span_start + span_len]] = True
+            corrupted[index] = True
+
+        return corruption_mask, corrupted
 
     def _collate_phoneme_tokens(self, cuts: CutSet) -> Dict[str, Union[torch.Tensor, None]]:
         if self.phoneme_tokenizer is not None:
@@ -382,6 +500,7 @@ class MagpieTTSLhotseMultiturnDataset(torch.utils.data.Dataset):
                 phoneme_turn_dropout_turn_prob=self.phoneme_turn_dropout_turn_prob,
                 phoneme_turn_max_words_to_drop=self.phoneme_turn_max_words_to_drop,
                 apply_turn_dropout=self.dataset_type == 'train',
+                sample_rate=self.sample_rate,
             )
         else:
             target_phoneme_tokens, target_phoneme_lens, phoneme_turn_dropout = None, None, None
@@ -471,6 +590,13 @@ class MagpieTTSLhotseMultiturnDataset(torch.utils.data.Dataset):
     def _load_fallback_context(
         self, cut: Cut, context_text: Union[str, None]
     ) -> tuple[Union[torch.Tensor, None], Union[torch.Tensor, None]]:
+        if _is_text_only(cut):
+            if self.load_cached_codes_if_available:
+                context_audio_codes = torch.zeros([0, self.num_audio_codebooks], dtype=torch.int32)
+                return None, context_audio_codes
+            context_audio = torch.zeros(self.codec_model_samples_per_frame, dtype=torch.float32)
+            return context_audio, None
+
         matching_supervisions = [s for s in cut.supervisions if s.speaker in self.output_roles]
 
         if self.load_cached_codes_if_available:
@@ -636,6 +762,12 @@ class MagpieTTSLhotseMultiturnDataset(torch.utils.data.Dataset):
             )
 
             target_codes, source_codes = self._load_cached_codes(cut)
+            if target_codes is None and _is_text_only(cut) and self.load_cached_codes_if_available:
+                raw_audio_frames = max(
+                    1,
+                    int(target_audio_lens[i].item() / self.codec_model_samples_per_frame),
+                )
+                target_codes = torch.zeros((raw_audio_frames, self.num_audio_codebooks), dtype=torch.int32)
             if target_codes is not None:
                 features["target_codes"].append(target_codes)
             if source_codes is not None:
@@ -649,7 +781,7 @@ class MagpieTTSLhotseMultiturnDataset(torch.utils.data.Dataset):
                 features["context_audio_codes"].append(context_audio_codes)
                 features["context_audio_codes_lens"].append(context_audio_codes.shape[0])
 
-            if self.load_16khz_audio:
+            if self.load_16khz_audio and not _is_text_only(cut):
                 audio_16khz = self._load_audio_16khz(cut)
                 features["audio_16khz"].append(audio_16khz)
                 features["audio_lens_16khz"].append(audio_16khz.shape[0])
@@ -753,6 +885,9 @@ class MagpieTTSLhotseMultiturnDataset(torch.utils.data.Dataset):
             "source_token_lens": text_data["source_token_lens"],
             "text": text_data["target_text_tokens"],
             "text_lens": text_data["target_token_lens"],
+            "text_only": torch.BoolTensor([_is_text_only(cut) for cut in cuts]),
+            "text_span_corruption_mask": text_data["text_span_corruption_mask"],
+            "text_span_corrupted": text_data["text_span_corrupted"],
             "raw_texts": [
                 " ".join(s.text for s in cut.supervisions if s.speaker in self.output_roles) for cut in cuts
             ],
@@ -768,12 +903,14 @@ class MagpieTTSLhotseMultiturnDataset(torch.utils.data.Dataset):
             cuts,
             self.frame_length,
             self.output_roles,
+            sample_rate=self.sample_rate,
         )
 
         user_mask, user_mask_lens = collate_speaker_mask_channel(
             cuts,
             self.frame_length,
             self.input_roles,
+            sample_rate=self.sample_rate,
         )
 
         batch_dict["agent_mask"] = agent_mask
@@ -815,6 +952,7 @@ def collate_token_channel(
     phoneme_text_eop_marker: str = "<eop>",
     ignore_phoneme_languages: list[str] = None,
     apply_partial_phoneme_text: bool = False,
+    sample_rate: int = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Build and collate token channels aligned to the audio frame grid."""
     tokens = []
@@ -843,6 +981,7 @@ def collate_token_channel(
                 phoneme_text_eop_marker,
                 ignore_phoneme_languages,
                 apply_partial_phoneme_text,
+                sample_rate,
             )
         )
     token_lens = torch.tensor([len(tt) for tt in tokens])
@@ -853,13 +992,15 @@ def build_speaker_mask_channel(
     cut: Cut,
     frame_length: Seconds,
     output_roles: set[str],
+    sample_rate: int = None,
 ) -> torch.Tensor:
-    total = compute_num_frames(cut.duration, frame_length, cut.sampling_rate)
+    cut_sampling_rate = _get_cut_sampling_rate(cut, sample_rate)
+    total = compute_num_frames(cut.duration, frame_length, cut_sampling_rate)
     mask = torch.zeros(total, dtype=torch.float32)
 
     for supervision in cut.supervisions:
-        start = compute_num_frames(supervision.start, frame_length, cut.sampling_rate)
-        end = compute_num_frames(supervision.end, frame_length, cut.sampling_rate)
+        start = compute_num_frames(supervision.start, frame_length, cut_sampling_rate)
+        end = compute_num_frames(supervision.end, frame_length, cut_sampling_rate)
 
         if supervision.speaker in output_roles:
             mask[start:end] = 1.0
@@ -871,8 +1012,9 @@ def collate_speaker_mask_channel(
     cuts: CutSet,
     frame_length: Seconds,
     output_roles: set[str],
+    sample_rate: int = None,
 ):
-    masks = [build_speaker_mask_channel(cut, frame_length, output_roles) for cut in cuts]
+    masks = [build_speaker_mask_channel(cut, frame_length, output_roles, sample_rate) for cut in cuts]
     mask_lens = torch.tensor([len(m) for m in masks])
     return collate_vectors(masks, padding_value=0.0), mask_lens
 
@@ -898,16 +1040,22 @@ def build_token_channel(
     phoneme_text_eop_marker: str = "<eop>",
     ignore_phoneme_languages: list[str] = None,
     apply_partial_phoneme_text: bool = False,
+    sample_rate: int = None,
 ) -> torch.Tensor:
 
-    total = compute_num_frames(cut.duration, frame_length, cut.sampling_rate)
+    cut_sampling_rate = _get_cut_sampling_rate(cut, sample_rate)
+    total = compute_num_frames(cut.duration, frame_length, cut_sampling_rate)
     tokens = torch.ones(total, dtype=torch.long) * pad_id
 
     for supervision in cut.supervisions:
         if supervision.speaker in roles:
-            # TODO: Current multi-turn datasets do not contain the normalized_text field so check will always default to the else branch. Will need to evaluate whether it makes sense to keep this in future.
-            # This code path is used for both multi-turn and single-turn datasets.
-            text = supervision.normalized_text if supervision.has_custom("normalized_text") else supervision.text
+            # Text-only examples deliberately train normalization from the raw written form.
+            # Audio-backed examples preserve the existing normalized-text behavior.
+            text = (
+                supervision.text
+                if _is_text_only(cut)
+                else supervision.normalized_text if supervision.has_custom("normalized_text") else supervision.text
+            )
             text_for_tokens = text
             language = cut.lang if cut.has_custom("lang") else supervision.language
             if (
@@ -952,7 +1100,7 @@ def build_token_channel(
             else:
                 text_ids = torch.as_tensor(raw_ids + [eos_id])
 
-            pos = compute_num_frames(supervision.start, frame_length, cut.sampling_rate)
+            pos = compute_num_frames(supervision.start, frame_length, cut_sampling_rate)
             if pos >= len(tokens):
                 continue
 
@@ -962,7 +1110,7 @@ def build_token_channel(
             tokens[pos : pos + len(text_ids)] = text_ids
 
             # add interruption token, used for add speech eos and interrupt the model
-            interruption_pos = compute_num_frames(supervision.end, frame_length, cut.sampling_rate)
+            interruption_pos = compute_num_frames(supervision.end, frame_length, cut_sampling_rate)
             if interruption_pos < len(tokens):
                 tokens[interruption_pos] = interruption_token_id
 
@@ -1041,6 +1189,7 @@ def collate_phoneme_channel(
     phoneme_turn_dropout_turn_prob: float = 0.0,
     phoneme_turn_max_words_to_drop: int = 2,
     apply_turn_dropout: bool = False,
+    sample_rate: int = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     tokens = []
     dropout_flags = []
@@ -1058,6 +1207,7 @@ def collate_phoneme_channel(
             phoneme_turn_dropout_turn_prob=phoneme_turn_dropout_turn_prob,
             phoneme_turn_max_words_to_drop=phoneme_turn_max_words_to_drop,
             apply_turn_dropout=apply_turn_dropout,
+            sample_rate=sample_rate,
         )
         tokens.append(token)
         dropout_flags.append(dropout_applied)
@@ -1078,6 +1228,7 @@ def build_phoneme_channel(
     phoneme_turn_dropout_turn_prob: float = 0.0,
     phoneme_turn_max_words_to_drop: int = 2,
     apply_turn_dropout: bool = False,
+    sample_rate: int = None,
 ) -> tuple[torch.Tensor, bool]:
     language = (
         cut.lang
@@ -1085,7 +1236,8 @@ def build_phoneme_channel(
         else next((sup.language for sup in cut.supervisions if sup.has_custom("language")), "en")
     )
 
-    total = compute_num_frames(cut.duration, frame_length, cut.sampling_rate)
+    cut_sampling_rate = _get_cut_sampling_rate(cut, sample_rate)
+    total = compute_num_frames(cut.duration, frame_length, cut_sampling_rate)
     tokens = torch.ones(total, dtype=torch.long) * pad_id
     dropout_applied = False
     apply_dropout = (
@@ -1114,7 +1266,7 @@ def build_phoneme_channel(
             phoneme_ids = phoneme_tokenizer.encode(ipa_text)
             phoneme_ids = [bos_id] + phoneme_ids + [eos_id]
             phoneme_ids = torch.as_tensor(phoneme_ids, dtype=torch.long)
-            pos = compute_num_frames(supervision.start, frame_length, cut.sampling_rate)
+            pos = compute_num_frames(supervision.start, frame_length, cut_sampling_rate)
             if pos >= len(tokens):
                 continue
 

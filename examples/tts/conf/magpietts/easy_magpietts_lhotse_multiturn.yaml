@@ -100,6 +100,10 @@ model:
   phoneme_text_bop_marker: "<bop>"
   phoneme_text_eop_marker: "<eop>"
   ignore_phoneme_languages: [] # Languages for which missing IPA phoneme fields are allowed during training.
+  text_span_corruption_prob: 0.12 # Audio+IPA TTS samples only; slightly above phoneme corruption probability.
+  text_span_corruption_short_max_tokens: 3 # Most selected spans contain 1-3 text tokens.
+  text_span_corruption_long_max_tokens: 16 # Occasional longer spans cover items such as phone numbers.
+  text_span_corruption_long_prob: 0.1 # Conditional probability of selecting the longer span range.
   add_language_to_context_text: false # Prefix context text with language metadata for multilingual conditioning.
   phoneme_turn_dropout_batch_prob: 0.0  # prob of applying turn dropout to a sample
   phoneme_turn_dropout_turn_prob: 0.0  # prob of dropping each phoneme turn within a sample

@@ -380,6 +380,70 @@ class TestMagpieTTSLhotseDatasets:
         with pytest.raises(ValueError, match="requires a non-empty supervision custom.ipa"):
             dataset[_text_only_cutset(include_ipa=False)]
 
+    def test_multiturn_dataset_supports_recordingless_text_only_cut(self):
+        _seed_everything()
+        kwargs = _multiturn_dataset_kwargs()
+        kwargs.update(
+            {
+                "output_roles": ["assistant", "agent"],
+                "load_cached_codes_if_available": False,
+                "text_span_corruption_prob": 1.0,
+            }
+        )
+        dataset = MagpieTTSLhotseMultiturnDataset(**kwargs)
+        dataset.text_tokenizer = _FakeTextTokenizer()
+        dataset.phoneme_tokenizer = _FakeIPATokenizer()
+        dataset.bos_id = len(dataset.text_tokenizer.tokens)
+        dataset.eos_id = dataset.bos_id + 1
+        dataset.cfg_unk_token_id = dataset.bos_id + 2
+        dataset.interruption_token_id = dataset.bos_id + 3
+        dataset.pad_id = dataset.text_tokenizer.pad
+
+        cuts = _text_only_cutset()
+        next(iter(cuts)).context_audio = dummy_recording(20, duration=0.2, with_data=True, sampling_rate=SAMPLE_RATE)
+        batch = dataset[cuts]
+
+        assert batch["raw_texts"] == ["the 24th item"]
+        assert batch["text_only"].tolist() == [True]
+        assert batch["text_span_corrupted"].tolist() == [False]
+        assert not batch["text_span_corruption_mask"].any()
+        assert batch["audio_lens"].tolist() == [SAMPLE_RATE]
+        assert batch["audio"].eq(0.0).all()
+        assert batch["source_audio"].eq(0.0).all()
+        assert batch["context_audio_lens"].tolist() == [int(0.04 * SAMPLE_RATE)]
+        non_padding_phonemes = batch["phoneme_tokens"][0]
+        non_padding_phonemes = non_padding_phonemes[non_padding_phonemes != dataset.phoneme_tokenizer.pad]
+        assert non_padding_phonemes.tolist() == [1, 7, 8, 2]
+
+    def test_multiturn_dataset_text_span_corruption_masks_audio_backed_tts_cut(self):
+        _seed_everything()
+        kwargs = _multiturn_dataset_kwargs()
+        kwargs.update(
+            {
+                "output_roles": ["assistant", "agent"],
+                "text_span_corruption_prob": 1.0,
+                "text_span_corruption_short_max_tokens": 3,
+                "text_span_corruption_long_max_tokens": 8,
+                "text_span_corruption_long_prob": 0.0,
+            }
+        )
+        dataset = MagpieTTSLhotseMultiturnDataset(**kwargs)
+        dataset.text_tokenizer = _FakeTextTokenizer()
+        dataset.phoneme_tokenizer = _FakeIPATokenizer()
+        dataset.bos_id = len(dataset.text_tokenizer.tokens)
+        dataset.eos_id = dataset.bos_id + 1
+        dataset.cfg_unk_token_id = dataset.bos_id + 2
+        dataset.interruption_token_id = dataset.bos_id + 3
+        dataset.pad_id = dataset.text_tokenizer.pad
+
+        batch = dataset[_single_turn_cutset()]
+        corruption_mask = batch["text_span_corruption_mask"][0]
+
+        assert batch["text_only"].tolist() == [False]
+        assert batch["text_span_corrupted"].tolist() == [True]
+        assert corruption_mask.sum().item() == 1
+        assert not corruption_mask[batch["text"][0].eq(dataset.eos_id)].any()
+
     def test_text_span_corruption_masks_short_non_eos_span_when_ipa_is_available(self):
         _seed_everything()
         kwargs = _dataset_kwargs()

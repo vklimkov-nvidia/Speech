@@ -2173,6 +2173,14 @@ class EasyMagpieTTSModel(EasyMagpieTTSInferenceModel):
                 phoneme_turn_dropout_batch_prob=self.cfg.get("phoneme_turn_dropout_batch_prob", 0.0),
                 phoneme_turn_dropout_turn_prob=self.cfg.get("phoneme_turn_dropout_turn_prob", 0.0),
                 phoneme_turn_max_words_to_drop=self.cfg.get("phoneme_turn_max_words_to_drop", 2),
+                text_span_corruption_prob=self.cfg.get("text_span_corruption_prob", 0.0),
+                text_span_corruption_short_max_tokens=self.cfg.get(
+                    "text_span_corruption_short_max_tokens", 3
+                ),
+                text_span_corruption_long_max_tokens=self.cfg.get(
+                    "text_span_corruption_long_max_tokens", 16
+                ),
+                text_span_corruption_long_prob=self.cfg.get("text_span_corruption_long_prob", 0.1),
             )
             dataset = FallbackDataset(dataset)
         else:
