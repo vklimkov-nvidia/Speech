@@ -1056,6 +1056,7 @@ class EasyMagpieTTSModel(EasyMagpieTTSInferenceModel):
                 context_audio_codes_lens=context_audio_codes_lens,
                 training_mode=selected_training_mode,
                 dropout_conditional_input=dropout_conditional_input,
+                context_audio_stop_gradient_mask=text_only_mask,
             )
         )
 

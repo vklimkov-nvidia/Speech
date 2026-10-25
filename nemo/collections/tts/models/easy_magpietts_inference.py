@@ -1480,6 +1480,7 @@ class EasyMagpieTTSInferenceModel(ModelPT):
         context_audio_lens: Optional[torch.Tensor] = None,
         training_mode: Optional[TrainingMode] = None,
         dropout_conditional_input: bool = False,
+        context_audio_stop_gradient_mask: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Prepare context tensors (without text) for the simplified process_batch.
@@ -1500,6 +1501,8 @@ class EasyMagpieTTSInferenceModel(ModelPT):
             training_mode: Optional TrainingMode object specifying the mode to use.
                 If None, uses the first mode from training_modes as default.
             dropout_conditional_input: If True, replace context with CFG unconditional token.
+            context_audio_stop_gradient_mask: Optional per-sample mask preventing gradients
+                through context-audio conditioning for selected rows.
 
         Returns:
             Tuple of:
@@ -1561,6 +1564,23 @@ class EasyMagpieTTSInferenceModel(ModelPT):
                 context_audio_embedded = self.encode_context_audio_embeddings(
                     context_audio_embedded=context_audio_embedded, context_audio_lens=context_audio_codes_lens
                 )
+
+        if context_audio_stop_gradient_mask is not None:
+            context_audio_stop_gradient_mask = context_audio_stop_gradient_mask.to(
+                device=context_audio_embedded.device, dtype=torch.bool
+            )
+            if context_audio_stop_gradient_mask.shape != (batch_size,):
+                raise ValueError(
+                    "context_audio_stop_gradient_mask has shape "
+                    f"{tuple(context_audio_stop_gradient_mask.shape)}, expected {(batch_size,)}"
+                )
+            # Text-only rows use unrelated prompt audio and have no acoustic target tying it to a speaker.
+            # Detach only those rows so phoneme-only loss cannot distort the speaker-conditioning path.
+            context_audio_embedded = torch.where(
+                context_audio_stop_gradient_mask.view(-1, 1, 1),
+                context_audio_embedded.detach(),
+                context_audio_embedded,
+            )
 
         # Context Text
         context_text_lens = context_text_tokens_lens

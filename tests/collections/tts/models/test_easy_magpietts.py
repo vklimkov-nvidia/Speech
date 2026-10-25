@@ -299,6 +299,27 @@ def test_non_strict_state_dict_load_allows_missing_child_module(model):
     assert "audio_in_projection.weight" in incompatible.missing_keys
 
 
+def test_context_audio_stop_gradient_mask_detaches_selected_rows(model):
+    context_audio_codes = torch.empty(2, model.num_audio_codebooks, 2, dtype=torch.long)
+    context_audio_codes[0].fill_(3)
+    context_audio_codes[1].fill_(7)
+    context_audio_codes_lens = torch.tensor([2, 2], dtype=torch.long)
+    context_text_tokens, context_text_tokens_lens = _padded_token_tensor(model, ["a", "b"])
+
+    context_embedding, _, _, _ = model.prepare_context_tensors(
+        context_text_tokens=context_text_tokens,
+        context_text_tokens_lens=context_text_tokens_lens,
+        context_audio_codes=context_audio_codes,
+        context_audio_codes_lens=context_audio_codes_lens,
+        context_audio_stop_gradient_mask=torch.tensor([True, False]),
+    )
+    context_embedding.sum().backward()
+
+    for embedding in model.audio_embeddings:
+        assert embedding.weight.grad[3].abs().sum().item() == 0.0
+        assert embedding.weight.grad[7].abs().sum().item() > 0.0
+
+
 def test_audio_and_text_embedding_shapes(model):
     audio_tokens = _toy_codes(model, batch_size=2, num_frames=3)
     audio_tokens[0, :, -1] = model.audio_eos_id
